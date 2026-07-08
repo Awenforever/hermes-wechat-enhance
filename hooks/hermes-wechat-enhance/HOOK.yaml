@@ -1,0 +1,6 @@
+name: hermes-wechat-enhance
+description: WeChat enhancement hooks - lifecycle notification and message capture
+events:
+  - gateway:startup
+  - agent:start
+  - agent:end
