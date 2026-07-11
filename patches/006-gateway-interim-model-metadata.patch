@@ -1,0 +1,72 @@
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -16993,6 +16993,60 @@
+                 except Exception as _sc_err:
+                     logger.debug("Could not set up stream consumer: %s", _sc_err)
+ 
++            def _current_turn_model_metadata(base_metadata=None):
++                # HERMES_WECHAT_INTERIM_MODEL_METADATA_V1
++                #
++                # Interim assistant commentary is model-generated user-visible text.
++                # It must carry the same model metadata contract as the final reply
++                # so platform footers do not fall back to the system label. This
++                # intentionally does NOT change tool/status/startup/control metadata.
++                _metadata = dict(base_metadata or {})
++                _model = ""
++                try:
++                    _turn_route = turn_route
++                except Exception:
++                    _turn_route = {}
++                try:
++                    _last_models = getattr(self, "_last_resolved_model", None)
++                except Exception:
++                    _last_models = None
++
++                _candidates = []
++                try:
++                    if agent_holder and agent_holder[0] is not None:
++                        _candidates.append(getattr(agent_holder[0], "model", None))
++                except Exception:
++                    pass
++                if isinstance(_turn_route, dict):
++                    _candidates.append(_turn_route.get("model"))
++                _candidates.extend([
++                    getattr(event, "resolved_model", None),
++                    getattr(event, "model_name", None),
++                    getattr(source, "resolved_model", None),
++                    getattr(source, "model_name", None),
++                ])
++                if isinstance(_last_models, dict):
++                    _candidates.append(_last_models.get(session_key or ""))
++                    _candidates.append(_last_models.get("*"))
++                try:
++                    _candidates.append(_resolve_gateway_model())
++                except Exception:
++                    pass
++
++                for _candidate in _candidates:
++                    _candidate = str(_candidate or "").strip()
++                    if _candidate:
++                        _model = _candidate
++                        break
++
++                if _model:
++                    _metadata["model_name"] = _model
++                    _metadata["resolved_model"] = _model
++                    _metadata["model"] = _model
++                    _metadata.setdefault("actor", "agent")
++                    _metadata.setdefault("message_origin", "model")
++                return _metadata
++
+             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                 if not _run_still_current():
+                     return
+@@ -17008,7 +17062,7 @@
+                     _status_adapter.send(
+                         _status_chat_id,
+                         text,
+-                        metadata=_status_thread_metadata,
++                        metadata=_current_turn_model_metadata(_status_thread_metadata),
+                     ),
+                     _loop_for_step,
+                     logger=logger,

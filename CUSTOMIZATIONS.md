@@ -133,8 +133,8 @@ If desired, these can be added as additional patches. Code exists in v0.17 produ
 | Component | Purpose | Required |
 |-----------|---------|----------|
 | `--accept-hooks` flag | Load hooks on gateway startup | YES |
-| `hermes-wechat-enhance` hook | Startup notification and JSONL message capture | YES |
-| `hermes-alive` hook | Proactive companion watcher | Only if proactive behavior is enabled |
+| `hermes-alive` hook | Startup notification ("✨ Gateway online — Hermes is back and ready.") | YES |
+| `hermes-wechat-enhance` hook | JSONL message capture (optional) | No |
 | `HERMES_WEIXIN_STARTUP_READY_NOTIFY=1` | Enable startup notification | Default |
 
 ---

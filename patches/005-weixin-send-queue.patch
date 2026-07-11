@@ -1,0 +1,344 @@
+diff --git a/gateway/platforms/weixin.py b/gateway/platforms/weixin.py
+index 91c0115..09aa426 100644
+--- a/gateway/platforms/weixin.py
++++ b/gateway/platforms/weixin.py
+@@ -315,6 +315,205 @@ class ContextTokenStore:
+             logger.warning("weixin: failed to persist context tokens for %s: %s", _safe_id(account_id), exc)
+ 
+ 
++def _is_system_meta(metadata: Optional[Dict[str, Any]]) -> bool:
++    if not isinstance(metadata, dict):
++        return False
++    if metadata.get("is_system") is True:
++        return True
++    for key in ("actor", "source", "message_origin", "origin"):
++        value = str(metadata.get(key) or "").strip().lower()
++        if value in {"system", "gateway", "status", "command", "lifecycle"}:
++            return True
++    return False
++
++
++def _footer_model_name(metadata: Optional[Dict[str, Any]]) -> str:
++    footer_metadata = metadata if isinstance(metadata, dict) else {}
++    if _is_system_meta(footer_metadata):
++        return "hermes"
++    return str(
++        os.environ.get("HERMES_WECHAT_FOOTER_MODEL_NAME")
++        or footer_metadata.get("model_name")
++        or footer_metadata.get("resolved_model")
++        or footer_metadata.get("routed_model")
++        or footer_metadata.get("model")
++        or "hermes"
++    ).strip() or "hermes"
++
++
++class ReplyBudgetStore:
++    """Persistent token-count budget per (account, user).
++
++    HERMES_V017_WEIXIN_REPLY_BUDGET_AND_FOOTER_PARITY_V1
++    Ported from the v0.10 Weixin enhancement so each Weixin bubble gets a
++    stable badge and model footer, and queued replies can resume after /continue.
++    """
++
++    _TOKEN_TTL_SECONDS: float = 24 * 3600.0
++    _MAX_BUBBLES_PER_TOKEN: int = 10
++
++    def __init__(self, hermes_home: str):
++        self._root = _account_dir(hermes_home)
++        self._cache: Dict[str, Dict[str, Any]] = {}
++
++    def _path(self, account_id: str) -> Path:
++        return self._root / f"{account_id}.reply-budget.json"
++
++    def _key(self, account_id: str, user_id: str) -> str:
++        return f"{account_id}:{user_id}"
++
++    def restore(self, account_id: str) -> None:
++        path = self._path(account_id)
++        if not path.exists():
++            return
++        try:
++            data = json.loads(path.read_text(encoding="utf-8"))
++        except Exception as exc:
++            logger.warning("weixin: failed to restore reply budget for %s: %s", _safe_id(account_id), exc)
++            return
++        restored = 0
++        now = time.time()
++        for uid, entry in data.items():
++            if not isinstance(entry, dict):
++                continue
++            token = entry.get("token")
++            if not isinstance(token, str) or not token:
++                continue
++            count = entry.get("count", 0)
++            updated_at = entry.get("updated_at", now)
++            if not isinstance(count, (int, float)) or count < 0:
++                count = 0
++            self._cache[self._key(account_id, uid)] = {
++                "token": token,
++                "count": int(count),
++                "updated_at": float(updated_at),
++            }
++            restored += 1
++        if restored:
++            logger.info("weixin: restored %d reply budget(s) for %s", restored, _safe_id(account_id))
++
++    def update_token(self, account_id: str, user_id: str, token: str) -> None:
++        self._cache[self._key(account_id, user_id)] = {
++            "token": token,
++            "count": 0,
++            "updated_at": time.time(),
++        }
++        self._persist(account_id)
++
++    def get_valid_token(self, account_id: str, user_id: str) -> Optional[str]:
++        entry = self._cache.get(self._key(account_id, user_id))
++        if not entry:
++            return None
++        if time.time() - entry["updated_at"] >= self._TOKEN_TTL_SECONDS:
++            return None
++        return entry["token"]
++
++    def increment_and_get(self, account_id: str, user_id: str) -> int:
++        key = self._key(account_id, user_id)
++        entry = self._cache.get(key)
++        if not entry:
++            self._cache[key] = {"token": "", "count": 1, "updated_at": time.time()}
++        else:
++            entry["count"] = entry.get("count", 0) + 1
++        self._persist(account_id)
++        return self._cache[key]["count"]
++
++    def get_count(self, account_id: str, user_id: str) -> int:
++        entry = self._cache.get(self._key(account_id, user_id))
++        if not entry:
++            return 0
++        return int(entry.get("count", 0) or 0)
++
++    def remaining(self, account_id: str, user_id: str) -> int:
++        return max(0, self._MAX_BUBBLES_PER_TOKEN - self.get_count(account_id, user_id))
++
++    def is_exhausted(self, account_id: str, user_id: str) -> bool:
++        return self.get_count(account_id, user_id) >= self._MAX_BUBBLES_PER_TOKEN
++
++    def _persist(self, account_id: str) -> None:
++        prefix = f"{account_id}:"
++        payload = {
++            key[len(prefix) :]: value
++            for key, value in self._cache.items()
++            if key.startswith(prefix)
++        }
++        try:
++            atomic_json_write(self._path(account_id), payload)
++        except Exception as exc:
++            logger.warning("weixin: failed to persist reply budget for %s: %s", _safe_id(account_id), exc)
++
++
++class MessageSendQueue:
++    """In-memory FIFO queue of pending outbound Weixin text chunks."""
++
++    _Item = Tuple[str, str, Optional[str], Optional[Dict[str, Any]]]
++
++    def __init__(self):
++        self._queues: Dict[str, List[MessageSendQueue._Item]] = {}
++
++    def _key(self, account_id: str, chat_id: str) -> str:
++        return f"{account_id}:{chat_id}"
++
++    def enqueue(
++        self,
++        account_id: str,
++        user_id: str,
++        content: str,
++        chat_id: str,
++        reply_to: Optional[str],
++        metadata: Optional[Dict[str, Any]],
++    ) -> None:
++        key = self._key(account_id, user_id)
++        self._queues.setdefault(key, []).append((content, chat_id, reply_to, metadata))
++
++    def dequeue(self, account_id: str, user_id: str) -> Optional[_Item]:
++        key = self._key(account_id, user_id)
++        queue = self._queues.get(key)
++        if not queue:
++            return None
++        return queue.pop(0)
++
++    def has_pending(self, account_id: str, user_id: str) -> bool:
++        key = self._key(account_id, user_id)
++        queue = self._queues.get(key)
++        return bool(queue)
++
++    def pending_count(self, account_id: str, user_id: str) -> int:
++        key = self._key(account_id, user_id)
++        queue = self._queues.get(key)
++        return len(queue) if queue else 0
++
++
+ class TypingTicketCache:
+     """Short-lived typing ticket cache from ``getconfig``."""
+ 
+@@ -1153,6 +1352,8 @@ class WeixinAdapter(BasePlatformAdapter):
+         hermes_home = str(get_hermes_home())
+         self._hermes_home = hermes_home
+         self._token_store = ContextTokenStore(hermes_home)
++        self._budget_store = ReplyBudgetStore(hermes_home)
++        self._send_queue = MessageSendQueue()
+         self._typing_cache = TypingTicketCache()
+         self._poll_session: Optional[aiohttp.ClientSession] = None
+         self._send_session: Optional[aiohttp.ClientSession] = None
+@@ -1292,6 +1493,7 @@ class WeixinAdapter(BasePlatformAdapter):
+         _no_aiohttp_timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_connect=None, sock_read=None)
+         self._send_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector(), timeout=_no_aiohttp_timeout)
+         self._token_store.restore(self._account_id)
++        self._budget_store.restore(self._account_id)
+         self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
+         self._mark_connected()
+         _LIVE_ADAPTERS[self._token] = self
+@@ -1435,6 +1637,7 @@ class WeixinAdapter(BasePlatformAdapter):
+         context_token = str(message.get("context_token") or "").strip()
+         if context_token:
+             self._token_store.set(self._account_id, sender_id, context_token)
++            self._budget_store.update_token(self._account_id, sender_id, context_token)
+         asyncio.create_task(self._maybe_fetch_typing_ticket(sender_id, context_token or None))
+ 
+         media_paths: List[str] = []
+@@ -1847,8 +2050,8 @@ class WeixinAdapter(BasePlatformAdapter):
+     ) -> SendResult:
+         if not self._send_session or not self._token:
+             return SendResult(success=False, error="Not connected")
+-        context_token = self._token_store.get(self._account_id, chat_id)
+-        last_message_id: Optional[str] = None
++        if isinstance(metadata, dict) and metadata.get("_continue_drain"):
++            return await self._drain_pending(chat_id)
+ 
+         # Extract MEDIA: tags and bare local file paths before text delivery.
+         media_files, cleaned_content = self.extract_media(content)
+@@ -1888,65 +2091,78 @@ class WeixinAdapter(BasePlatformAdapter):
+                     logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, exc)
+ 
+             # Deliver text content.
+-            footer_metadata = dict(metadata or {})
+-            footer_config_model_name = ""
+-            if footer_metadata.get("is_system") is not True:
+-                try:
+-                    footer_config_path = Path(os.environ.get("HERMES_HOME") or "/opt/data") / "config.yaml"
+-                    if footer_config_path.exists():
+-                        try:
+-                            import yaml  # type: ignore[import-untyped]
+-
+-                            footer_config = yaml.safe_load(footer_config_path.read_text(encoding="utf-8")) or {}
+-                            footer_model_config = (
+-                                footer_config.get("model") if isinstance(footer_config, dict) else None
+-                            )
+-                            if isinstance(footer_model_config, dict):
+-                                footer_config_model_name = str(footer_model_config.get("default") or "").strip()
+-                        except ImportError:
+-                            in_model_block = False
+-                            for raw_line in footer_config_path.read_text(encoding="utf-8").splitlines():
+-                                line = raw_line.split("#", 1)[0].rstrip()
+-                                stripped = line.strip()
+-                                if not stripped:
+-                                    continue
+-                                if line == stripped:
+-                                    in_model_block = stripped == "model:"
+-                                    continue
+-                                if in_model_block and stripped.startswith("default:"):
+-                                    footer_config_model_name = stripped.split(":", 1)[1].strip().strip("'\"")
+-                                    break
+-                except Exception as exc:
+-                    logger.debug("[%s] failed to read footer model from config: %s", self.name, exc)
+-            if footer_metadata.get("is_system") is True:
+-                footer_model_name = "hermes"
+-            else:
+-                footer_model_name = str(
+-                    os.environ.get("HERMES_WECHAT_FOOTER_MODEL_NAME")
+-                    or footer_metadata.get("model_name")
+-                    or footer_metadata.get("resolved_model")
+-                    or footer_metadata.get("routed_model")
+-                    or footer_metadata.get("model")
+-                    or footer_config_model_name
+-                    or "hermes"
+-                ).strip() or "hermes"
+-            if final_content and final_content.strip():
+-                final_content = f"{final_content}\n\n---\n\n`{footer_model_name}`"
+             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
+-            for idx, chunk in enumerate(chunks):
++            for chunk in chunks:
++                self._send_queue.enqueue(
++                    self._account_id,
++                    chat_id,
++                    chunk,
++                    chat_id,
++                    reply_to,
++                    dict(metadata or {}),
++                )
++            if chunks:
++                return await self._drain_pending(chat_id)
++            return SendResult(success=True, message_id=None)
++        except Exception as exc:
++            logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
++            return SendResult(success=False, error=str(exc))
++
++    async def _drain_pending(self, chat_id: str) -> SendResult:
++        """Send queued Weixin text chunks while the context_token budget permits."""
++        last_message_id: Optional[str] = None
++        sent_any = False
++        try:
++            while self._send_queue.has_pending(self._account_id, chat_id):
++                if self._budget_store.is_exhausted(self._account_id, chat_id):
++                    pending = self._send_queue.pending_count(self._account_id, chat_id)
++                    logger.info(
++                        "[%s] context_token exhausted for %s; %d message(s) remain queued",
++                        self.name,
++                        _safe_id(chat_id),
++                        pending,
++                    )
++                    break
++
++                item = self._send_queue.dequeue(self._account_id, chat_id)
++                if item is None:
++                    break
++
++                chunk, _queued_chat_id, _reply_to, queued_metadata = item
++                footer_metadata = queued_metadata if isinstance(queued_metadata, dict) else {}
++                model_name = _footer_model_name(footer_metadata)
++
++                count = self._budget_store.increment_and_get(self._account_id, chat_id)
++                chunk_with_footer = f"{chunk}\n\n---\n\n`{count}` `{model_name}`"
++                context_token = self._budget_store.get_valid_token(
++                    self._account_id,
++                    chat_id,
++                ) or self._token_store.get(self._account_id, chat_id)
+                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
++                logger.info(
++                    "[%s] Weixin queued send count=%s model=%r to=%s",
++                    self.name,
++                    count,
++                    model_name,
++                    _safe_id(chat_id),
++                )
+                 await self._send_text_chunk(
+                     chat_id=chat_id,
+-                    chunk=chunk,
++                    chunk=chunk_with_footer,
+                     context_token=context_token,
+                     client_id=client_id,
+                 )
+                 last_message_id = client_id
+-                if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
++                sent_any = True
++
++                if self._send_chunk_delay_seconds > 0 and self._send_queue.has_pending(self._account_id, chat_id):
+                     await asyncio.sleep(self._send_chunk_delay_seconds)
+-            return SendResult(success=True, message_id=last_message_id)
++
++            if sent_any:
++                return SendResult(success=True, message_id=last_message_id)
++            return SendResult(success=True, message_id=None)
+         except Exception as exc:
+-            logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
++            logger.error("[%s] send/drain failed to=%s: %s", self.name, _safe_id(chat_id), exc)
+             return SendResult(success=False, error=str(exc))
+ 
+     async def _ensure_typing_ticket(self, chat_id: str) -> Optional[str]:

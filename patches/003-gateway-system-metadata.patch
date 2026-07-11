@@ -1,0 +1,314 @@
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -219,11 +219,11 @@
+     *,
+     platform: Any = None,
+ ) -> Optional[Dict[str, Any]]:
+-    """Mark Discord lifecycle/status sends without changing other platforms."""
+-    if _gateway_platform_value(platform) != "discord":
+-        return metadata
++    """Mark lifecycle/status sends as system-origin for outbound hooks."""
+     merged = dict(metadata or {})
+-    merged["non_conversational"] = True
++    merged["is_system"] = True
++    if _gateway_platform_value(platform) == "discord":
++        merged["non_conversational"] = True
+     return merged
+ 
+ 
+@@ -4912,7 +4912,7 @@
+                     and event.source.thread_id
+                     else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                 ),
+-                metadata=thread_meta,
++                metadata=_non_conversational_metadata(thread_meta, platform=event.source.platform),
+             )
+             return True
+ 
+@@ -4981,7 +4981,10 @@
+                                 chat_id=event.source.chat_id,
+                                 content=_text,
+                                 reply_to=_anchor,
+-                                metadata=self._thread_metadata_for_source(event.source, _anchor),
++                                metadata=_non_conversational_metadata(
++                                    self._thread_metadata_for_source(event.source, _anchor),
++                                    platform=event.source.platform,
++                                ),
+                             )
+                     return True
+         except Exception:
+@@ -5224,7 +5227,7 @@
+                     and event.source.thread_id
+                     else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                 ),
+-                metadata=thread_meta,
++                metadata=_non_conversational_metadata(thread_meta, platform=event.source.platform),
+             )
+         except Exception as e:
+             logger.debug("Failed to send busy-ack: %s", e)
+@@ -5354,13 +5357,16 @@
+                     except Exception:
+                         pass
+ 
+-                metadata = self._thread_metadata_for_target(
+-                    platform,
+-                    chat_id,
+-                    thread_id,
+-                    chat_type=getattr(source, "chat_type", None) if source is not None else None,
+-                    reply_to_message_id=reply_to_message_id,
+-                    adapter=adapter,
++                metadata = _non_conversational_metadata(
++                    self._thread_metadata_for_target(
++                        platform,
++                        chat_id,
++                        thread_id,
++                        chat_type=getattr(source, "chat_type", None) if source is not None else None,
++                        reply_to_message_id=reply_to_message_id,
++                        adapter=adapter,
++                    ),
++                    platform=platform,
+                 )
+ 
+                 result = await adapter.send(chat_id, msg, metadata=metadata)
+@@ -5437,11 +5443,14 @@
+                 continue
+ 
+             try:
+-                metadata = self._thread_metadata_for_target(
+-                    platform,
+-                    home.chat_id,
+-                    home.thread_id,
+-                    adapter=adapter,
++                metadata = _non_conversational_metadata(
++                    self._thread_metadata_for_target(
++                        platform,
++                        home.chat_id,
++                        home.thread_id,
++                        adapter=adapter,
++                    ),
++                    platform=platform,
+                 )
+                 if metadata:
+                     result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
+@@ -8342,7 +8351,10 @@
+         if config and hasattr(config, "get_notice_delivery"):
+             notice_delivery = config.get_notice_delivery(source.platform)
+ 
+-        metadata = self._thread_metadata_for_source(source)
++        metadata = _non_conversational_metadata(
++            self._thread_metadata_for_source(source),
++            platform=source.platform,
++        )
+         if notice_delivery == "private" and getattr(source, "user_id", None):
+             try:
+                 result = await adapter.send_private_notice(
+@@ -8495,7 +8507,11 @@
+                             f"Hi~ I don't recognize you yet!\n\n"
+                             f"Here's your pairing code: `{code}`\n\n"
+                             f"Ask the bot owner to run:\n"
+-                            f"`hermes pairing approve {platform_name} {code}`"
++                            f"`hermes pairing approve {platform_name} {code}`",
++                            metadata=_non_conversational_metadata(
++                                self._thread_metadata_for_source(source),
++                                platform=source.platform,
++                            ),
+                         )
+                 else:
+                     adapter = self._adapter_for_source(source)
+@@ -8503,7 +8519,11 @@
+                         await adapter.send(
+                             source.chat_id,
+                             "Too many pairing requests right now~ "
+-                            "Please try again later!"
++                            "Please try again later!",
++                            metadata=_non_conversational_metadata(
++                                self._thread_metadata_for_source(source),
++                                platform=source.platform,
++                            ),
+                         )
+                     # Record rate limit so subsequent messages are silently ignored
+                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
+@@ -9278,7 +9298,10 @@
+             try:
+                 adapter = self.adapters.get(source.platform)
+                 if adapter:
+-                    _ack_meta = self._thread_metadata_for_source(source)
++                    _ack_meta = _non_conversational_metadata(
++                        self._thread_metadata_for_source(source),
++                        platform=source.platform,
++                    )
+                     await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
+             except Exception:
+                 logger.debug("learn ack send failed", exc_info=True)
+@@ -9332,7 +9355,10 @@
+                     try:
+                         adapter = self.adapters.get(source.platform)
+                         if adapter:
+-                            _ack_meta = self._thread_metadata_for_source(source)
++                            _ack_meta = _non_conversational_metadata(
++                                self._thread_metadata_for_source(source),
++                                platform=source.platform,
++                            )
+                             await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
+                     except Exception:
+                         logger.debug("blueprint ack send failed", exc_info=True)
+@@ -9898,7 +9924,10 @@
+                 # in real-time and see the raw whisper output verbatim.
+                 if _successful_transcripts:
+                     _echo_adapter = self.adapters.get(source.platform)
+-                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
++                    _echo_meta = _non_conversational_metadata(
++                        self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
++                        platform=source.platform,
++                    )
+                     if _echo_adapter:
+                         for _tx in _successful_transcripts:
+                             try:
+@@ -10076,6 +10105,10 @@
+                         await _adapter.send(
+                             source.chat_id,
+                             "\n".join(_ctx_result.warnings) or "Context injection refused.",
++                            metadata=_non_conversational_metadata(
++                                self._thread_metadata_for_source(source),
++                                platform=source.platform,
++                            ),
+                         )
+                     return None
+                 if _ctx_result.expanded:
+@@ -10330,7 +10363,10 @@
+                             pass
+                         await adapter.send(
+                             source.chat_id, notice,
+-                            metadata=self._thread_metadata_for_source(source),
++                            metadata=_non_conversational_metadata(
++                                self._thread_metadata_for_source(source),
++                                platform=source.platform,
++                            ),
+                         )
+             except Exception as e:
+                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
+@@ -10695,7 +10731,11 @@
+                                         try:
+                                             _adapter = self.adapters.get(source.platform)
+                                             if _adapter and source.chat_id:
+-                                                await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
++                                                await _adapter.send(
++                                                    source.chat_id,
++                                                    _warn_msg,
++                                                    metadata=_non_conversational_metadata(_hyg_meta, platform=source.platform),
++                                                )
+                                         except Exception as _werr:
+                                             logger.warning(
+                                                 "Failed to deliver compression-failure warning to user: %s",
+@@ -10719,7 +10759,11 @@
+                                         try:
+                                             _adapter = self.adapters.get(source.platform)
+                                             if _adapter and source.chat_id:
+-                                                await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
++                                                await _adapter.send(
++                                                    source.chat_id,
++                                                    _aux_msg,
++                                                    metadata=_non_conversational_metadata(_hyg_meta, platform=source.platform),
++                                                )
+                                         except Exception as _werr:
+                                             logger.warning(
+                                                 "Failed to deliver aux-model-fallback notice to user: %s",
+@@ -11953,7 +11997,11 @@
+         except Exception:
+             metadata = None
+ 
+-        result = await adapter.send(source.chat_id, message, metadata=metadata)
++        result = await adapter.send(
++            source.chat_id,
++            message,
++            metadata=_non_conversational_metadata(metadata, platform=source.platform),
++        )
+         if result is not None and not getattr(result, "success", True):
+             logger.warning(
+                 "goal continuation: status send failed: %s",
+@@ -12808,7 +12856,7 @@
+             send_result = await adapter.send(
+                 source.chat_id,
+                 "System topic for Hermes commands and status.",
+-                metadata={"thread_id": str(thread_id)},
++                metadata=_non_conversational_metadata({"thread_id": str(thread_id)}, platform=source.platform),
+             )
+             message_id = getattr(send_result, "message_id", None)
+         except Exception:
+@@ -12841,7 +12889,10 @@
+                 chat_id=source.chat_id,
+                 image_path=str(image_path),
+                 caption="BotFather → Bot Settings → Threads Settings",
+-                metadata={"thread_id": str(source.thread_id)} if source.thread_id else None,
++                metadata=_non_conversational_metadata(
++                    {"thread_id": str(source.thread_id)} if source.thread_id else None,
++                    platform=source.platform,
++                ),
+             )
+         except Exception:
+             logger.debug("Failed to send Telegram topic setup image", exc_info=True)
+@@ -14058,11 +14109,14 @@
+                 continue
+ 
+             try:
+-                metadata = self._thread_metadata_for_target(
+-                    platform,
+-                    home.chat_id,
+-                    home.thread_id,
+-                    adapter=adapter,
++                metadata = _non_conversational_metadata(
++                    self._thread_metadata_for_target(
++                        platform,
++                        home.chat_id,
++                        home.thread_id,
++                        adapter=adapter,
++                    ),
++                    platform=platform,
+                 )
+                 if metadata:
+                     result = await adapter.send(
+@@ -14426,7 +14480,7 @@
+                             await echo_adapter.send(
+                                 source.chat_id,
+                                 f'🎙️ "{tx}"',
+-                                metadata=echo_meta,
++                                metadata=_non_conversational_metadata(echo_meta, platform=source.platform),
+                             )
+                         except Exception as echo_exc:
+                             logger.debug(
+@@ -17426,7 +17480,7 @@
+                         _status_adapter.send(
+                             _status_chat_id,
+                             msg,
+-                            metadata=_status_thread_metadata,
++                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                         ),
+                         _loop_for_step,
+                         logger=logger,
+@@ -18017,7 +18071,7 @@
+                                                     await _adapter.send(
+                                                         source.chat_id,
+                                                         f'🎙️ "{_tx}"',
+-                                                        metadata=_echo_meta,
++                                                        metadata=_non_conversational_metadata(_echo_meta, platform=source.platform),
+                                                     )
+                                                 except Exception as _echo_exc:
+                                                     logger.debug(
+@@ -18254,7 +18308,7 @@
+                                     f"If the agent does not respond soon, it will "
+                                     f"be timed out in {_remaining_mins} min. "
+                                     f"You can continue waiting or use /reset.",
+-                                    metadata=_status_thread_metadata,
++                                    metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                                 )
+                             except Exception as _warn_err:
+                                 logger.debug("Inactivity warning send error: %s", _warn_err)
+@@ -18437,7 +18491,7 @@
+                                         await adapter.send(
+                                             source.chat_id,
+                                             f'🎙️ "{_tx}"',
+-                                            metadata=_echo_meta,
++                                            metadata=_non_conversational_metadata(_echo_meta, platform=source.platform),
+                                         )
+                                     except Exception as _echo_exc:
+                                         logger.debug(

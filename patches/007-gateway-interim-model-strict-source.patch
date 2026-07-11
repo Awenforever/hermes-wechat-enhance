@@ -1,0 +1,90 @@
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -16995,13 +16995,19 @@
+ 
+             def _current_turn_model_metadata(base_metadata=None):
+                 # HERMES_WECHAT_INTERIM_MODEL_METADATA_V1
++                # HERMES_WECHAT_INTERIM_MODEL_METADATA_STRICT_SOURCE_V2
+                 #
+                 # Interim assistant commentary is model-generated user-visible text.
+                 # It must carry the same model metadata contract as the final reply
+                 # so platform footers do not fall back to the system label. This
+                 # intentionally does NOT change tool/status/startup/control metadata.
++                #
++                # Strict rule: do not use config/default model fallback here. Footer
++                # model names must come from the current runtime turn, the event/source
++                # resolved metadata, or the last resolved model recorded for this session.
+                 _metadata = dict(base_metadata or {})
+                 _model = ""
++                _model_source = ""
+                 try:
+                     _turn_route = turn_route
+                 except Exception:
+@@ -17012,31 +17018,34 @@
+                     _last_models = None
+ 
+                 _candidates = []
++
++                def _add_candidate(_source_name, _value):
++                    try:
++                        _value = str(_value or "").strip()
++                    except Exception:
++                        _value = ""
++                    if _value:
++                        _candidates.append((_source_name, _value))
++
+                 try:
+                     if agent_holder and agent_holder[0] is not None:
+-                        _candidates.append(getattr(agent_holder[0], "model", None))
++                        _add_candidate("agent.model", getattr(agent_holder[0], "model", None))
+                 except Exception:
+                     pass
+                 if isinstance(_turn_route, dict):
+-                    _candidates.append(_turn_route.get("model"))
+-                _candidates.extend([
+-                    getattr(event, "resolved_model", None),
+-                    getattr(event, "model_name", None),
+-                    getattr(source, "resolved_model", None),
+-                    getattr(source, "model_name", None),
+-                ])
++                    _add_candidate("turn_route.model", _turn_route.get("model"))
++                _add_candidate("event.resolved_model", getattr(event, "resolved_model", None))
++                _add_candidate("event.model_name", getattr(event, "model_name", None))
++                _add_candidate("source.resolved_model", getattr(source, "resolved_model", None))
++                _add_candidate("source.model_name", getattr(source, "model_name", None))
+                 if isinstance(_last_models, dict):
+-                    _candidates.append(_last_models.get(session_key or ""))
+-                    _candidates.append(_last_models.get("*"))
+-                try:
+-                    _candidates.append(_resolve_gateway_model())
+-                except Exception:
+-                    pass
+-
+-                for _candidate in _candidates:
+-                    _candidate = str(_candidate or "").strip()
++                    _add_candidate("last_resolved_model.session", _last_models.get(session_key or ""))
++                    _add_candidate("last_resolved_model.global", _last_models.get("*"))
++
++                for _candidate_source, _candidate in _candidates:
+                     if _candidate:
+                         _model = _candidate
++                        _model_source = _candidate_source
+                         break
+ 
+                 if _model:
+@@ -17045,6 +17054,15 @@
+                     _metadata["model"] = _model
+                     _metadata.setdefault("actor", "agent")
+                     _metadata.setdefault("message_origin", "model")
++                    _metadata.setdefault("model_source", _model_source)
++                try:
++                    logger.info(
++                        "wechat interim assistant model metadata source=%s has_model=%s",
++                        _model_source or "missing",
++                        bool(_model),
++                    )
++                except Exception:
++                    pass
+                 return _metadata
+ 
+             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:

@@ -1,0 +1,28 @@
+diff --git a/gateway/platforms/weixin.py b/gateway/platforms/weixin.py
+index 0000000..0000000 100755
+--- a/gateway/platforms/weixin.py
++++ b/gateway/platforms/weixin.py
+@@ -1672,6 +1672,23 @@
+ 
+         # HERMES_V017_WEIXIN_CONTINUE_DRAIN_PARITY_V1
+         if text and text.strip() == "/continue":
++            # Before drain, emit hook for command:continue.
++            # Hook can return {"action": "skip_drain"} to suppress local drain.
++            if self._hooks:
++                hook_ctx = {
++                    "platform": "weixin",
++                    "user_id": sender_id,
++                    "chat_id": effective_chat_id or sender_id,
++                    "session_id": getattr(self, "_current_session_id", ""),
++                    "message": text[:500],
++                    "command": "/continue",
++                }
++                results = await self._hooks.emit_collect("command:continue", hook_ctx)
++                if any(
++                    isinstance(r, dict) and r.get("action") == "skip_drain"
++                    for r in (results or [])
++                ):
++                    return
+             drained = await self._drain_pending(sender_id)
+             if drained.message_id is not None:
+                 logger.info("[%s] /continue drained backlog for %s", self.name, _safe_id(sender_id))

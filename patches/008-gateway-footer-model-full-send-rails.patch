@@ -1,0 +1,149 @@
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -7191,6 +7191,36 @@
+         send_metadata: Dict[str, Any] = {}
+         if effective_thread_id:
+             send_metadata["thread_id"] = effective_thread_id
++        # HERMES_WECHAT_HANDOFF_MODEL_METADATA_V3
++        # _handle_message(synthetic_event) populates synthetic_event model fields
++        # through the normal agent_result propagation path. Reuse those runtime
++        # fields for the final handoff message; do not fall back to config.
++        try:
++            _handoff_model = ""
++            _handoff_model_source = ""
++            for _holder_name, _holder in (
++                ("synthetic_event", synthetic_event),
++                ("dest_source", dest_source),
++            ):
++                if _holder is None:
++                    continue
++                for _attr in ("resolved_model", "model_name", "routed_model", "model"):
++                    _candidate = str(getattr(_holder, _attr, "") or "").strip()
++                    if _candidate:
++                        _handoff_model = _candidate
++                        _handoff_model_source = f"{_holder_name}.{_attr}"
++                        break
++                if _handoff_model:
++                    break
++            if _handoff_model:
++                send_metadata["model_name"] = _handoff_model
++                send_metadata["resolved_model"] = _handoff_model
++                send_metadata["model"] = _handoff_model
++                send_metadata.setdefault("actor", "agent")
++                send_metadata.setdefault("message_origin", "model")
++                send_metadata.setdefault("model_source", _handoff_model_source)
++        except Exception:
++            pass
+         try:
+             result = await adapter.send(
+                 chat_id=str(home.chat_id),
+@@ -11001,8 +11031,10 @@
+                     _last_models = getattr(self, "_last_resolved_model", None)
+                     if isinstance(_last_models, dict):
+                         _result_model = str(_last_models.get(session_key) or "").strip()
+-                if not _result_model:
+-                    _result_model = str(_resolve_gateway_model() or "").strip()
++                # HERMES_WECHAT_FINAL_MODEL_STRICT_SOURCE_V3
++                # Do not use config/default model fallback for footer metadata.
++                # If the runtime did not produce a model identity, leave it empty
++                # and let the platform footer fall back to the system label.
+                 if _result_model:
+                     setattr(event, "model_name", _result_model)
+                     setattr(event, "resolved_model", _result_model)
+@@ -17326,6 +17358,7 @@
+                     _status_adapter.send(
+                         _status_chat_id,
+                         message,
++                        # HERMES_WECHAT_BACKGROUND_REVIEW_SYSTEM_METADATA_V3B
+                         metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                     ),
+                     _loop_for_step,
+@@ -17456,6 +17489,15 @@
+             agent.thinking_progress = _thinking_enabled
+             # Store agent reference for interrupt support
+             agent_holder[0] = agent
++            # HERMES_WECHAT_STREAM_CONSUMER_MODEL_METADATA_V3
++            # Stream chunks/commentary are model-generated user-visible text.
++            # The consumer was constructed before turn_route/agent were available,
++            # so refresh its metadata here with strict runtime model sources.
++            try:
++                if _stream_consumer is not None:
++                    _stream_consumer.metadata = _current_turn_model_metadata(_status_thread_metadata)
++            except Exception as _stream_meta_err:
++                logger.debug("stream consumer model metadata refresh failed: %s", _stream_meta_err)
+             # Capture the full tool definitions for transcript logging
+             tools_holder[0] = agent.tools if hasattr(agent, 'tools') else None
+             
+@@ -18714,10 +18756,71 @@
+                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                                 session_key or "?",
+                             )
++                            # HERMES_WECHAT_QUEUED_FIRST_RESPONSE_MODEL_METADATA_V3
++                            _queued_meta = dict(_status_thread_metadata or {})
++                            _queued_model = ""
++                            _queued_model_source = ""
++                            _queued_candidates = []
++
++                            def _queued_add(_source_name, _value):
++                                try:
++                                    _value = str(_value or "").strip()
++                                except Exception:
++                                    _value = ""
++                                if _value:
++                                    _queued_candidates.append((_source_name, _value))
++
++                            if isinstance(result, dict):
++                                for _key in ("model_name", "resolved_model", "routed_model", "model"):
++                                    _queued_add(f"result.{_key}", result.get(_key))
++                            try:
++                                _queued_agent = agent_holder[0]
++                                if _queued_agent is not None:
++                                    _queued_add("agent.model", getattr(_queued_agent, "model", None))
++                            except Exception:
++                                pass
++                            for _holder_name, _holder in (
++                                ("event", event),
++                                ("event.source", getattr(event, "source", None)),
++                                ("source", source),
++                            ):
++                                if _holder is None:
++                                    continue
++                                for _attr in ("resolved_model", "model_name", "routed_model", "model"):
++                                    _queued_add(f"{_holder_name}.{_attr}", getattr(_holder, _attr, None))
++                            try:
++                                _last_models = getattr(self, "_last_resolved_model", None)
++                            except Exception:
++                                _last_models = None
++                            if isinstance(_last_models, dict):
++                                _queued_add("last_resolved_model.session", _last_models.get(session_key or ""))
++                                _queued_add("last_resolved_model.global", _last_models.get("*"))
++
++                            for _candidate_source, _candidate in _queued_candidates:
++                                if _candidate:
++                                    _queued_model = _candidate
++                                    _queued_model_source = _candidate_source
++                                    break
++
++                            if _queued_model:
++                                _queued_meta["model_name"] = _queued_model
++                                _queued_meta["resolved_model"] = _queued_model
++                                _queued_meta["model"] = _queued_model
++                                _queued_meta.setdefault("actor", "agent")
++                                _queued_meta.setdefault("message_origin", "model")
++                                _queued_meta.setdefault("model_source", _queued_model_source)
++                            try:
++                                logger.info(
++                                    "wechat queued first_response model metadata source=%s has_model=%s",
++                                    _queued_model_source or "missing",
++                                    bool(_queued_model),
++                                )
++                            except Exception:
++                                pass
+                             await adapter.send(
+                                 source.chat_id,
+                                 first_response,
+-                                metadata=_status_thread_metadata,
++                                metadata=_queued_meta,
+                             )
+                         except Exception as e:
+                             logger.warning("Failed to send first response before queued message: %s", e)

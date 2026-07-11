@@ -1,0 +1,16 @@
+--- a/gateway/platforms/weixin.py
++++ b/gateway/platforms/weixin.py
+@@ -1640,6 +1640,13 @@
+             self._budget_store.update_token(self._account_id, sender_id, context_token)
+         asyncio.create_task(self._maybe_fetch_typing_ticket(sender_id, context_token or None))
+ 
++        # /continue: drain pending replies, never route to agent or gateway
++        if text and text.strip() == "/continue":
++            drained = await self._drain_pending(sender_id)
++            if drained.message_id is not None:
++                logger.info("[%s] /continue drained backlog for %s", self.name, _safe_id(sender_id))
++            return
++
+         media_paths: List[str] = []
+         media_types: List[str] = []
+ 

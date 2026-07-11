@@ -1,0 +1,81 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 1025964..1eb82a7 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -4947,6 +4947,25 @@ class BasePlatformAdapter(ABC):
+                 # the existing notify=True marker. Clone once so typing/status
+                 # metadata stays unmarked and progress bubbles remain
+                 # thread-strict.
++                # Propagate resolved model from event to thread metadata for platform footer.
++                # _thread_metadata_for_source() returns None on unthreaded platforms
++                # such as Weixin DMs, so create a metadata dict before injecting.
++                try:
++                    if _thread_metadata is None:
++                        _thread_metadata = {}
++                    _model_from_event = ""
++                    for _attr in ("resolved_model", "model_name"):
++                        _candidate = str(getattr(event, _attr, "") or "").strip()
++                        if _candidate:
++                            _model_from_event = _candidate
++                            break
++                    if _model_from_event:
++                        _thread_metadata["model_name"] = _model_from_event
++                        _thread_metadata["resolved_model"] = _model_from_event
++                        _thread_metadata["model"] = _model_from_event
++                        _thread_metadata.setdefault("actor", "agent")
++                except Exception:
++                    pass
+                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+ 
+                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
+diff --git a/gateway/run.py b/gateway/run.py
+index d270957..c693cd3 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -10975,6 +10975,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
+                 return None
+ 
++            # Propagate resolved model to event for platform footer metadata.
++            # Prefer the agent_result value populated by _run_agent_inner from
++            # AIAgent.model, but keep fallbacks for proxy/early-return paths.
++            try:
++                _result_model = ""
++                if isinstance(agent_result, dict):
++                    for _key in ("model_name", "resolved_model", "routed_model", "model"):
++                        _candidate = str(agent_result.get(_key) or "").strip()
++                        if _candidate:
++                            _result_model = _candidate
++                            break
++                if not _result_model:
++                    for _holder in (event, getattr(event, "source", None), source):
++                        if _holder is None:
++                            continue
++                        for _attr in ("resolved_model", "model_name", "routed_model", "model"):
++                            _candidate = str(getattr(_holder, _attr, "") or "").strip()
++                            if _candidate:
++                                _result_model = _candidate
++                                break
++                        if _result_model:
++                            break
++                if not _result_model and session_key:
++                    _last_models = getattr(self, "_last_resolved_model", None)
++                    if isinstance(_last_models, dict):
++                        _result_model = str(_last_models.get(session_key) or "").strip()
++                if not _result_model:
++                    _result_model = str(_resolve_gateway_model() or "").strip()
++                if _result_model:
++                    setattr(event, "model_name", _result_model)
++                    setattr(event, "resolved_model", _result_model)
++                    setattr(event, "message_origin", "model")
++                    try:
++                        setattr(event.source, "model_name", _result_model)
++                        setattr(event.source, "resolved_model", _result_model)
++                    except Exception:
++                        pass
++            except Exception:
++                pass
++
+             response = agent_result.get("final_response") or ""
+             try:
+                 from gateway.response_filters import is_intentional_silence_agent_result

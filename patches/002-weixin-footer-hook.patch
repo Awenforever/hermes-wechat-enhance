@@ -1,0 +1,55 @@
+diff --git a/gateway/platforms/weixin.py b/gateway/platforms/weixin.py
+index 187078a..91c0115 100644
+--- a/gateway/platforms/weixin.py
++++ b/gateway/platforms/weixin.py
+@@ -1888,6 +1888,50 @@ class WeixinAdapter(BasePlatformAdapter):
+                     logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, exc)
+ 
+             # Deliver text content.
++            footer_metadata = dict(metadata or {})
++            footer_config_model_name = ""
++            if footer_metadata.get("is_system") is not True:
++                try:
++                    footer_config_path = Path(os.environ.get("HERMES_HOME") or "/opt/data") / "config.yaml"
++                    if footer_config_path.exists():
++                        try:
++                            import yaml  # type: ignore[import-untyped]
++
++                            footer_config = yaml.safe_load(footer_config_path.read_text(encoding="utf-8")) or {}
++                            footer_model_config = (
++                                footer_config.get("model") if isinstance(footer_config, dict) else None
++                            )
++                            if isinstance(footer_model_config, dict):
++                                footer_config_model_name = str(footer_model_config.get("default") or "").strip()
++                        except ImportError:
++                            in_model_block = False
++                            for raw_line in footer_config_path.read_text(encoding="utf-8").splitlines():
++                                line = raw_line.split("#", 1)[0].rstrip()
++                                stripped = line.strip()
++                                if not stripped:
++                                    continue
++                                if line == stripped:
++                                    in_model_block = stripped == "model:"
++                                    continue
++                                if in_model_block and stripped.startswith("default:"):
++                                    footer_config_model_name = stripped.split(":", 1)[1].strip().strip("'\"")
++                                    break
++                except Exception as exc:
++                    logger.debug("[%s] failed to read footer model from config: %s", self.name, exc)
++            if footer_metadata.get("is_system") is True:
++                footer_model_name = "hermes"
++            else:
++                footer_model_name = str(
++                    os.environ.get("HERMES_WECHAT_FOOTER_MODEL_NAME")
++                    or footer_metadata.get("model_name")
++                    or footer_metadata.get("resolved_model")
++                    or footer_metadata.get("routed_model")
++                    or footer_metadata.get("model")
++                    or footer_config_model_name
++                    or "hermes"
++                ).strip() or "hermes"
++            if final_content and final_content.strip():
++                final_content = f"{final_content}\n\n---\n\n`{footer_model_name}`"
+             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
+             for idx, chunk in enumerate(chunks):
+                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"

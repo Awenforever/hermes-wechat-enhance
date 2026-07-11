@@ -1,0 +1,28 @@
+diff --git a/gateway/platforms/weixin.py b/gateway/platforms/weixin.py
+index 0000000..0000000 100755
+--- a/gateway/platforms/weixin.py
++++ b/gateway/platforms/weixin.py
+@@ -2144,6 +2144,23 @@
+         if not self._send_session or not self._token:
+             return SendResult(success=False, error="Not connected")
+ 
++        # Allow hooks to adjust outgoing metadata before footer resolution.
++        if self._hooks:
++            hook_ctx = {
++                "platform": "weixin",
++                "user_id": chat_id,
++                "chat_id": chat_id,
++                "content_preview": content[:200],
++                "metadata": metadata or {},
++            }
++            results = await self._hooks.emit_collect("message:send", hook_ctx)
++            for result in (results or []):
++                if not isinstance(result, dict):
++                    continue
++                metadata_update = result.get("metadata")
++                if isinstance(metadata_update, dict):
++                    metadata = {**(metadata or {}), **metadata_update}
++
+         model_name, footer_metadata = self._resolve_model_name_for_footer(content, metadata)
+         context_token = self._budget_store.get_valid_token(
+             self._account_id, chat_id,
