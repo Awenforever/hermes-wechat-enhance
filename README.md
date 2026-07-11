@@ -105,3 +105,48 @@ metadata._delivery_id + metadata._delivery_chunk_index
 - Do not send real messages unless explicitly approved.
 - Do not restart the Docker daemon.
 - Do not apply to production until clean-container install, matrix, stress, real e2e, and uninstall verification all pass with zero errors.
+
+## Complete patch and reference inventory
+
+The current patch inventory is deliberately listed here so `scripts/check-consistency.sh` can verify that documentation and patch files stay synchronized.
+
+### Patch IDs
+
+- 001
+- 002
+- 003
+- 004
+- 005
+- 006
+- 007
+- 008
+- 009
+
+### Patch files
+
+- `patches/001-weixin-continue-hook.patch`
+- `patches/001-weixin-continue-hook.v017.patch`
+- `patches/002-weixin-footer-hook.patch`
+- `patches/002-weixin-footer-hook.v017.patch`
+- `patches/003-gateway-system-metadata.patch`
+- `patches/004-gateway-model-propagation.patch`
+- `patches/005-weixin-send-queue.patch`
+- `patches/006-gateway-interim-model-metadata.patch`
+- `patches/007-gateway-interim-model-strict-source.patch`
+- `patches/008-gateway-footer-model-full-send-rails.patch`
+- `patches/009-weixin-reliable-delivery-contract.patch`
+
+### Reference files
+
+- `references/development-blueprint.md`
+- `references/migration-test-patterns.md`
+- `references/v018-model-propagation-bug.md`
+- `references/isolated-audit-pattern.md`
+- `references/v017-full-audit.md`
+- `references/side-by-side-testing.md`
+- `references/docker-build-and-test.md`
+- `references/architecture-analysis.md`
+- `references/v018-migration-pitfalls.md`
+- `references/v018-weixin-changes.md`
+- `references/v017-model-propagation-chain.md`
+

@@ -182,3 +182,32 @@ After applying all patches, verify:
 | v0.17 (v2026.6.19) | `.v017.patch` set | Production |
 | v0.18 (v2026.7.1) | Current patches (001-005) | In testing |
 | v0.19 (future) | TBD | Regenerate from this checklist |
+
+## Patch inventory 001–009
+
+Current maintained patch IDs:
+
+- 001
+- 002
+- 003
+- 004
+- 005
+- 006
+- 007
+- 008
+- 009
+
+Current patch files:
+
+- `patches/001-weixin-continue-hook.patch`
+- `patches/001-weixin-continue-hook.v017.patch`
+- `patches/002-weixin-footer-hook.patch`
+- `patches/002-weixin-footer-hook.v017.patch`
+- `patches/003-gateway-system-metadata.patch`
+- `patches/004-gateway-model-propagation.patch`
+- `patches/005-weixin-send-queue.patch`
+- `patches/006-gateway-interim-model-metadata.patch`
+- `patches/007-gateway-interim-model-strict-source.patch`
+- `patches/008-gateway-footer-model-full-send-rails.patch`
+- `patches/009-weixin-reliable-delivery-contract.patch`
+
