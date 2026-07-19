@@ -1,0 +1,317 @@
+name: Candidate Validation
+
+on:
+  push:
+    branches:
+      - main
+      - wechat-enhance-v2c-sync-v4-docs-20260712-020736
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-validation:
+    name: Static validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify required files and executable modes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          required = {
+              "README.md",
+              "README_CN.md",
+              "SKILL.md",
+              "CUSTOMIZATIONS.md",
+              "CANDIDATE_BASE.txt",
+              "docs/PERSISTENCE_CONTRACT.md",
+              "docs/MAINTAINER_REFERENCE.md",
+              "scripts/check-consistency.sh",
+              "scripts/install.sh",
+              "scripts/manage-install-state.py",
+              "scripts/test-context-token-kernel-contract.py",
+              "scripts/test-install-state-git-preservation.py",
+              "scripts/test-install-state-source-path.py",
+              "scripts/test-reliable-delivery-contract.py",
+              "scripts/uninstall.sh",
+              "scripts/update.sh",
+              "scripts/verify-persistence.py",
+              "scripts/verify-self-install.py",
+              ".github/workflows/candidate-validation.yml",
+          }
+
+          expected_executable = {
+              "scripts/check-consistency.sh",
+              "scripts/install.sh",
+              "scripts/manage-install-state.py",
+              "scripts/test-context-token-kernel-contract.py",
+              "scripts/test-install-state-git-preservation.py",
+              "scripts/test-install-state-source-path.py",
+              "scripts/uninstall.sh",
+              "scripts/update.sh",
+              "scripts/verify-self-install.py",
+          }
+
+          missing = sorted(path for path in required if not Path(path).is_file())
+
+          stage_output = subprocess.check_output(
+              ["git", "ls-files", "--stage"],
+              text=True,
+          )
+          modes = {}
+          for line in stage_output.splitlines():
+              metadata, path = line.split("\t", 1)
+              mode, object_id, stage = metadata.split()
+              if stage == "0":
+                  modes[path] = mode
+
+          executable = {
+              path for path, mode in modes.items()
+              if mode == "100755"
+          }
+          unexpected_executable = sorted(executable - expected_executable)
+          missing_executable = sorted(expected_executable - executable)
+
+          workflow_mode = modes.get(
+              ".github/workflows/candidate-validation.yml",
+              "",
+          )
+
+          print(f"missing_required_count={len(missing)}")
+          print("missing_required=" + ",".join(missing))
+          print(f"expected_executable_count={len(expected_executable)}")
+          print(f"actual_executable_count={len(executable)}")
+          print(
+              "unexpected_executable_count="
+              + str(len(unexpected_executable))
+          )
+          print(
+              "unexpected_executable="
+              + ",".join(unexpected_executable)
+          )
+          print(
+              "missing_executable_count="
+              + str(len(missing_executable))
+          )
+          print(
+              "missing_executable="
+              + ",".join(missing_executable)
+          )
+          print(f"workflow_mode={workflow_mode}")
+
+          if (
+              missing
+              or unexpected_executable
+              or missing_executable
+              or workflow_mode != "100644"
+          ):
+              raise SystemExit(2)
+
+          print("REQUIRED_FILES_AND_EXECUTABLE_MODES_OK")
+          PY
+
+      - name: Repository consistency
+        run: bash scripts/check-consistency.sh
+
+      - name: Bash syntax
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          find . \
+            -type f \
+            -name '*.sh' \
+            -not -path './.git/*' \
+            -print0 |
+          while IFS= read -r -d '' file; do
+            bash -n "$file"
+          done
+
+      - name: Python AST syntax
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import ast
+
+          count = 0
+          for path in sorted(Path(".").rglob("*.py")):
+              if ".git" in path.parts or "__pycache__" in path.parts:
+                  continue
+              ast.parse(
+                  path.read_text(encoding="utf-8"),
+                  filename=str(path),
+              )
+              count += 1
+
+          print(f"python_ast_file_count={count}")
+          if count != 12:
+              raise SystemExit(2)
+
+          print("PYTHON_AST_ALL_FILES_OK")
+          PY
+
+      - name: Tracked-source secret and residue scan
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+
+          raw = subprocess.check_output(["git", "ls-files", "-z"])
+          tracked = [
+              item.decode("utf-8", "surrogateescape")
+              for item in raw.split(b"\0")
+              if item
+          ]
+
+          patterns = {
+              "github_token": re.compile(
+                  rb"gh[pousr]_[A-Za-z0-9_]{20,}"
+              ),
+              "openai_key": re.compile(
+                  rb"sk-[A-Za-z0-9_-]{20,}"
+              ),
+              "bearer_token": re.compile(
+                  rb"Bearer\s+[A-Za-z0-9._~+/=-]{20,}",
+                  re.I,
+              ),
+              "private_key": re.compile(
+                  rb"BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY"
+              ),
+              "weixin_qr": re.compile(
+                  rb"https://liteapp\.weixin\.qq\.com/q/[^\s]+",
+                  re.I,
+              ),
+              "private_weixin_id": re.compile(
+                  rb"\bo9[A-Za-z0-9_-]{4,}(?:@im\.wechat)?\b"
+              ),
+              "credential_assignment": re.compile(
+                  rb"(?im)^\s*(?:api[_-]?key|access[_-]?token|"
+                  rb"refresh[_-]?token|password|passwd|secret|cookie)"
+                  rb"\s*[:=]\s*[\"']?[A-Za-z0-9._~+/=-]{16,}"
+              ),
+          }
+
+          forbidden_parts = {
+              "__pycache__",
+              ".pytest_cache",
+              ".mypy_cache",
+              ".ruff_cache",
+              "sessions",
+              "accounts",
+              "logs",
+              "credentials",
+              "runtime",
+          }
+          forbidden_suffixes = {
+              ".pyc",
+              ".pyo",
+              ".log",
+              ".db",
+              ".sqlite",
+              ".tar",
+              ".gz",
+              ".zip",
+              ".7z",
+          }
+
+          hits = []
+          residue = []
+          missing = []
+
+          for rel_text in tracked:
+              path = Path(rel_text)
+              if not path.is_file():
+                  missing.append(rel_text)
+                  continue
+
+              if (
+                  any(part in forbidden_parts for part in path.parts)
+                  or path.suffix.lower() in forbidden_suffixes
+                  or path.name == ".env"
+              ):
+                  residue.append(rel_text)
+
+              data = path.read_bytes()
+              for kind, pattern in patterns.items():
+                  if pattern.search(data):
+                      hits.append(f"{kind}:{rel_text}")
+
+          print("scan_scope=git_tracked_files_only")
+          print(f"tracked_file_count={len(tracked)}")
+          print(f"secret_hit_count={len(hits)}")
+          print("secret_hits=" + ",".join(hits))
+          print(f"runtime_residue_count={len(residue)}")
+          print("runtime_residue_paths=" + ",".join(residue))
+          print(f"missing_tracked_file_count={len(missing)}")
+
+          if hits or residue or missing:
+              raise SystemExit(2)
+
+          print("TRACKED_SOURCE_SECRET_AND_RESIDUE_SCAN_OK")
+          PY
+
+  self-contained-contracts:
+    name: Self-contained contracts · Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          check-latest: false
+
+      - name: Create private test directories
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p \
+            "$RUNNER_TEMP/home" \
+            "$RUNNER_TEMP/hermes-data/skills" \
+            "$RUNNER_TEMP/hermes-data/hooks"
+
+      - name: Run self-contained install-state contracts
+        env:
+          HOME: ${{ runner.temp }}/home
+          HERMES_HOME: ${{ runner.temp }}/hermes-data
+          HERMES_SKILLS_DIR: ${{ runner.temp }}/hermes-data/skills
+          HERMES_HOOKS_DIR: ${{ runner.temp }}/hermes-data/hooks
+          HERMES_GATEWAY_SRC: ${{ runner.temp }}/nonexistent-gateway
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONUTF8: "1"
+        run: |
+          set -Eeuo pipefail
+          python scripts/test-install-state-source-path.py
+          python scripts/test-install-state-git-preservation.py
