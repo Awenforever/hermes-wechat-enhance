@@ -52,3 +52,15 @@ python3 scripts/verify-persistence.py
 ```
 
 In Docker, this verifies that `HERMES_HOME` exists and that `/opt/data` looks like a mounted persistent data root. In bare WSL/Linux, it only verifies local paths and reports that Docker persistence is not required.
+
+## Transactional installation state
+
+The installer stores a management snapshot under:
+
+```text
+$HERMES_HOME/.hermes/wechat-enhance/install-state
+```
+
+It contains pre-install gateway/hook backups and hashes, not Weixin account
+credentials. Failed installation rolls back. Safe uninstall restores the
+pre-install state and refuses to overwrite divergent source.

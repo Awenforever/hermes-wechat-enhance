@@ -415,6 +415,451 @@ else
          "Consider adding a CHANGELOG.md to track patch version history"
 fi
 
+
+# ── 8. Consolidated v0.18 Weixin patch contract ──────────────────────────────
+header "Consolidated v0.18 Weixin patch contract"
+
+EXPECTED_SERIES=$'003\n004\n006\n007\n008\n011'
+ACTUAL_SERIES="$(grep -v '^[[:space:]]*#' "$PATCHES_DIR/series" | sed '/^[[:space:]]*$/d')"
+if [[ "$ACTUAL_SERIES" == "$EXPECTED_SERIES" ]]; then
+    pass
+else
+    fail "v0.18 patch series is not deterministic" "Expected 003 004 006 007 008 011"
+fi
+
+CONSOLIDATED_PATCH="$PATCHES_DIR/011-weixin-v018-consolidated.patch"
+if [[ -f "$CONSOLIDATED_PATCH" ]]; then pass; else
+    fail "Patch 011 is missing" "Restore the consolidated v0.18 Weixin patch"
+fi
+
+for marker in \
+    HERMES_WECHAT_V018_CONSOLIDATED_PATCH_V1 \
+    HERMES_WECHAT_SLASH_COMMAND_CONTENT_DEDUP_EXEMPTION_V1 \
+    HERMES_WECHAT_CONTEXT_TOKEN_REFRESH_BEFORE_CONTENT_DEDUP_V1 \
+    HERMES_WECHAT_CONTEXT_DELIVERY_SERIALIZATION_V1 \
+    HERMES_WECHAT_CONTEXT_TOKEN_GENERATION_FENCE_V1 \
+    HERMES_WECHAT_CONTEXT_BUDGET_RECONCILIATION_V1 \
+    HERMES_WECHAT_MEDIA_CONTEXT_BUDGET_V1 \
+    HERMES_WECHAT_ORDINARY_REPLY_APPEND_THEN_DRAIN_V1 \
+    WECHAT_ENHANCE_RELIABLE_DELIVERY_V2 \
+    WECHAT_ENHANCE_REPLY_BUDGET_COMMIT_AFTER_ACK_V2 \
+    WECHAT_ENHANCE_QUEUE_PEEK_COMMIT_V2 \
+    WECHAT_ENHANCE_DELIVERY_ID_DEDUPE_V2
+do
+    if grep -q "$marker" "$CONSOLIDATED_PATCH"; then
+        pass
+    else
+        fail "Patch 011 lacks $marker" "Regenerate patch 011 from official v0.18"
+    fi
+done
+
+for required in \
+    "$SKILL_DIR/scripts/manage-install-state.py" \
+    "$SKILL_DIR/scripts/test-context-token-kernel-contract.py"
+do
+    if [[ -f "$required" ]]; then pass; else
+        fail "Required file missing: $required" "Restore the file"
+    fi
+done
+
+if grep -qi "slash command" "$README" && grep -qi "slash command" "$SKILL"; then
+    pass
+else
+    fail "README/SKILL do not document slash-command exemption" "Update docs"
+fi
+
+# ── 9. Deterministic patch variant dispatch ──────────────────────────────────
+header "Deterministic patch variant dispatch"
+
+if grep -q "HERMES_WECHAT_PATCH_VARIANT_DISPATCH_V1" "$SKILL_DIR/scripts/install.sh"; then
+    pass
+else
+    fail "Installer lacks patch variant dispatch marker" "Restore v0.18 dispatch"
+fi
+
+if grep -q 'v2026.7.1' "$SKILL_DIR/scripts/install.sh" \
+   && grep -q 'v017.patch' "$SKILL_DIR/scripts/install.sh"; then
+    pass
+else
+    fail "Installer does not explicitly separate v0.18 from v0.17 variants" \
+         "Restore patch_matches_version"
+fi
+
+
+# ── 10. Portable hook import bootstrap ───────────────────────────────────────
+header "Portable hook import bootstrap"
+
+HOOK_HANDLER="$SKILL_DIR/hooks/hermes-wechat-enhance/handler.py"
+
+if grep -q "WECHAT_ENHANCE_IMPORT_BOOTSTRAP_V2" "$HOOK_HANDLER"; then
+    pass
+else
+    fail "Hook lacks portable import bootstrap marker" \
+         "Restore WECHAT_ENHANCE_IMPORT_BOOTSTRAP_V2"
+fi
+
+for token in \
+    HERMES_WECHAT_ENHANCE_SOURCE_DIR \
+    HERMES_SKILLS_DIR \
+    HERMES_HOME
+do
+    if grep -q "$token" "$HOOK_HANDLER"; then
+        pass
+    else
+        fail "Hook bootstrap lacks $token support" \
+             "Restore portable path resolution"
+    fi
+done
+
+if grep -q 'Path(__file__).resolve().parents\[2\]' "$HOOK_HANDLER"; then
+    pass
+else
+    fail "Hook bootstrap lacks path-derived fallback" \
+         "Restore hook-relative skill discovery"
+fi
+
+
+# ── 11. Contract harness runtime initialization ───────────────────────────────
+header "Contract harness runtime initialization"
+
+KERNEL_TEST="$SKILL_DIR/scripts/test-context-token-kernel-contract.py"
+
+if grep -q "TEST_WEIXIN_ADAPTER_REAL_INIT_V1" "$KERNEL_TEST"; then
+    pass
+else
+    fail "Kernel test does not use real WeixinAdapter initialization" \
+         "Restore TEST_WEIXIN_ADAPTER_REAL_INIT_V1"
+fi
+
+if grep -q "SYNTHETIC_ADAPTER_RUNTIME_INIT_OK" "$KERNEL_TEST"; then
+    pass
+else
+    fail "Kernel test lacks adapter initialization preflight" \
+         "Restore SYNTHETIC_ADAPTER_RUNTIME_INIT_OK"
+fi
+
+
+# ── 12. Idempotent hook deployment without residue ────────────────────────────
+header "Idempotent hook deployment without residue"
+
+INSTALLER="$SKILL_DIR/scripts/install.sh"
+STATE_MANAGER="$SKILL_DIR/scripts/manage-install-state.py"
+
+if grep -q "WECHAT_ENHANCE_HOOK_IDEMPOTENT_NO_BACKUP_RESIDUE_V1" "$INSTALLER"; then
+    pass
+else
+    fail "Installer lacks no-backup-residue hook marker" \
+         "Restore deterministic hook deployment"
+fi
+
+if grep -q "normalized_tree_hash" "$INSTALLER"; then
+    pass
+else
+    fail "Installer lacks normalized hook comparison" \
+         "Restore normalized_tree_hash"
+fi
+
+if grep -q "before-install-" "$INSTALLER"; then
+    fail "Installer still creates untracked timestamped hook backups" \
+         "Use install-state snapshot as the only rollback source"
+else
+    pass
+fi
+
+if grep -q "TRANSIENT_TREE_PARTS" "$STATE_MANAGER" \
+   && grep -q "__pycache__" "$STATE_MANAGER" \
+   && grep -q "\\.pyc" "$STATE_MANAGER"; then
+    pass
+else
+    fail "Install-state hook hash does not ignore runtime caches" \
+         "Restore transient tree filtering"
+fi
+
+
+# ── 13. Pristine and legacy v0.18 source profiles ─────────────────────────────
+header "Pristine and legacy v0.18 source profiles"
+
+INSTALLER="$SKILL_DIR/scripts/install.sh"
+
+if grep -q "HERMES_WECHAT_V018_SOURCE_PROFILE_DISPATCH_V1" "$INSTALLER"; then
+    pass
+else
+    fail "Installer lacks v0.18 source-profile marker" \
+         "Restore source-profile dispatch"
+fi
+
+for series in \
+    series.pristine-v018 \
+    series.legacy-v018 \
+    series.hardened-v018
+do
+    if [[ -f "$PATCHES_DIR/$series" ]]; then
+        pass
+    else
+        fail "Missing profile series: $series" \
+             "Restore profile-specific series files"
+    fi
+done
+
+if grep -qx '011' "$PATCHES_DIR/series.pristine-v018" \
+   && grep -qx '012' "$PATCHES_DIR/series.legacy-v018"; then
+    pass
+else
+    fail "Pristine/legacy Weixin patch routing is incorrect" \
+         "Route pristine to 011 and legacy to 012"
+fi
+
+if [[ -f "$PATCHES_DIR/012-weixin-v018-legacy-upgrade.patch" ]]; then
+    pass
+else
+    fail "Legacy upgrade patch 012 is missing" \
+         "Restore patch 012"
+fi
+
+for marker in \
+    HERMES_WECHAT_V018_SOURCE_PROFILE_DISPATCH_V1 \
+    HERMES_WECHAT_V018_CONSOLIDATED_PATCH_V1 \
+    HERMES_WECHAT_SLASH_COMMAND_CONTENT_DEDUP_EXEMPTION_V1 \
+    HERMES_WECHAT_ORDINARY_REPLY_APPEND_THEN_DRAIN_V1
+do
+    if grep -q "$marker" "$PATCHES_DIR/012-weixin-v018-legacy-upgrade.patch"; then
+        pass
+    else
+        fail "Patch 012 lacks $marker" "Regenerate legacy upgrade patch"
+    fi
+done
+
+
+# ── 14. Version resolution from verified source profile ───────────────────────
+header "Version resolution from verified source profile"
+
+INSTALLER="$SKILL_DIR/scripts/install.sh"
+
+if grep -q "HERMES_WECHAT_VERSION_FROM_VERIFIED_SOURCE_PROFILE_V1" "$INSTALLER"; then
+    pass
+else
+    fail "Installer lacks verified source-profile version fallback" \
+         "Restore version inference marker"
+fi
+
+if grep -q 'detect_version "$source_profile"' "$INSTALLER"; then
+    pass
+else
+    fail "Installer resolves version before source profile" \
+         "Detect source profile first"
+fi
+
+if grep -q "VERSION_SOURCE=verified-source-profile" "$INSTALLER" \
+   && grep -q "VERSION_SOURCE=external-metadata" "$INSTALLER"; then
+    pass
+else
+    fail "Installer does not report version provenance" \
+         "Restore VERSION_SOURCE logging"
+fi
+
+if grep -q 'pristine-v018|legacy-v018|hardened-v018' "$INSTALLER"; then
+    pass
+else
+    fail "Version fallback is not restricted to verified v0.18 profiles" \
+         "Restrict version inference"
+fi
+
+
+# ── 15. Hermes v0.18 version-family normalization ─────────────────────────────
+header "Hermes v0.18 version-family normalization"
+
+INSTALLER="$SKILL_DIR/scripts/install.sh"
+
+if grep -q "HERMES_WECHAT_V018_VERSION_FAMILY_NORMALIZATION_V1" "$INSTALLER"; then
+    pass
+else
+    fail "Installer lacks v0.18 version-family marker" \
+         "Restore version-family normalization"
+fi
+
+if grep -q "normalize_version_family" "$INSTALLER"; then
+    pass
+else
+    fail "Installer lacks normalize_version_family" \
+         "Restore version alias mapping"
+fi
+
+for alias in \
+    v2026.7.1 \
+    v0.18.0 \
+    v0.18
+do
+    if grep -q "$alias" "$INSTALLER"; then
+        pass
+    else
+        fail "Installer lacks accepted version alias $alias" \
+             "Restore v0.18 alias mapping"
+    fi
+done
+
+if grep -q 'apply_patches "$patch_dir" "$version_family" "$source_profile"' "$INSTALLER"; then
+    pass
+else
+    fail "Patch selection does not use normalized version family" \
+         "Route patch selection through version_family"
+fi
+
+
+# ── 16. Transactional source state and fault injection ────────────────────────
+header "Transactional source state and fault injection"
+
+INSTALLER="$SKILL_DIR/scripts/install.sh"
+UNINSTALLER="$SKILL_DIR/scripts/uninstall.sh"
+STATE_MANAGER="$SKILL_DIR/scripts/manage-install-state.py"
+
+for marker in \
+    HERMES_WECHAT_TRANSACTIONAL_SOURCE_STATE_V1 \
+    HERMES_WECHAT_FAULT_INJECTION_TEST_V1
+do
+    if grep -q "$marker" "$INSTALLER"; then
+        pass
+    else
+        fail "Installer lacks $marker" "Restore transaction contract"
+    fi
+done
+
+if grep -q "before-source-install-" "$INSTALLER"; then
+    fail "Installer still creates timestamped source backups" \
+         "Use source snapshot only"
+else
+    pass
+fi
+
+if grep -q 'fault_inject after-source-install' "$INSTALLER" \
+   && grep -q 'fault_inject after-gateway-patches' "$INSTALLER" \
+   && grep -q 'fault_inject after-hook-install' "$INSTALLER"; then
+    pass
+else
+    fail "Installer lacks deterministic fault stages" \
+         "Restore fault injection points"
+fi
+
+if grep -q 'git config user\.' "$INSTALLER"; then
+    fail "Installer mutates persistent Git identity" \
+         "Use per-command git -c identity"
+else
+    pass
+fi
+
+if grep -q -- '--source "$CANONICAL_SOURCE_DIR"' "$INSTALLER" \
+   && grep -q -- '--source "$CANONICAL_SOURCE_DIR"' "$UNINSTALLER"; then
+    pass
+else
+    fail "Installer/uninstaller lack canonical source state" \
+         "Restore --source integration"
+fi
+
+for token in \
+    source_pre_hash \
+    source_installed_hash \
+    'divergences.append("source")' \
+    'backups" / "source'
+do
+    if grep -q "$token" "$STATE_MANAGER"; then
+        pass
+    else
+        fail "State manager lacks token: $token" \
+             "Restore source snapshot/restore/divergence handling"
+    fi
+done
+
+if grep -q 'rm -rf "$CANONICAL_SOURCE_DIR"' "$UNINSTALLER"; then
+    fail "Uninstaller deletes restored canonical source" \
+         "Let state manager own source restoration"
+else
+    pass
+fi
+
+# ── 17. Install-state canonical source path ────────────────────────────────────
+header "Install-state canonical source path"
+
+STATE_MANAGER="$SKILL_DIR/scripts/manage-install-state.py"
+SOURCE_PATH_TEST="$SKILL_DIR/scripts/test-install-state-source-path.py"
+
+if grep -q "HERMES_WECHAT_TRANSACTION_SNAPSHOT_SOURCE_PATH_V2" "$STATE_MANAGER"; then
+    pass
+else
+    fail "State manager lacks source-path shadowing fix marker" \
+         "Restore snapshot source-path v2"
+fi
+
+if grep -q "gateway_file = gateway / relative" "$STATE_MANAGER"; then
+    pass
+else
+    fail "Gateway loop lacks dedicated gateway_file variable" \
+         "Do not reuse canonical source parameter"
+fi
+
+if grep -q "source = gateway / relative" "$STATE_MANAGER"; then
+    fail "Canonical source parameter is still shadowed" \
+         "Rename loop variable to gateway_file"
+else
+    pass
+fi
+
+if [[ -x "$SOURCE_PATH_TEST" ]] \
+   && grep -q "INSTALL_STATE_SOURCE_PATH_REGRESSION_OK" "$SOURCE_PATH_TEST"; then
+    pass
+else
+    fail "Source-path regression test is missing" \
+         "Restore test-install-state-source-path.py"
+fi
+
+
+# ── 18. Git metadata and dirty working-tree preservation ───────────────────────
+header "Git metadata and dirty working-tree preservation"
+
+INSTALLER="$SKILL_DIR/scripts/install.sh"
+STATE_MANAGER="$SKILL_DIR/scripts/manage-install-state.py"
+GIT_TEST="$SKILL_DIR/scripts/test-install-state-git-preservation.py"
+
+for marker in \
+    HERMES_WECHAT_GIT_METADATA_PRESERVATION_V1 \
+    HERMES_WECHAT_EXACT_FILE_BACKUP_RESTORE_V1
+do
+    if grep -q "$marker" "$INSTALLER" \
+       && grep -q "$marker" "$STATE_MANAGER"; then
+        pass
+    else
+        fail "Missing Git preservation marker: $marker" \
+             "Restore non-mutating Git transaction"
+    fi
+done
+
+for forbidden in \
+    'git add -A' \
+    'git reset --hard' \
+    'git config user\.'
+do
+    if grep -q "$forbidden" "$INSTALLER" \
+       || grep -q "$forbidden" "$STATE_MANAGER"; then
+        fail "Transaction still contains forbidden Git mutation: $forbidden" \
+             "Use exact file snapshots without Git metadata mutation"
+    else
+        pass
+    fi
+done
+
+if grep -q 'run_git(gateway, "reset"' "$STATE_MANAGER"; then
+    fail "State manager still restores through git reset" \
+         "Always restore byte snapshots"
+else
+    pass
+fi
+
+if [[ -x "$GIT_TEST" ]] \
+   && grep -q "INSTALL_STATE_GIT_WORKTREE_PRESERVATION_OK" "$GIT_TEST"; then
+    pass
+else
+    fail "Git preservation regression test is missing" \
+         "Restore test-install-state-git-preservation.py"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 summary
 

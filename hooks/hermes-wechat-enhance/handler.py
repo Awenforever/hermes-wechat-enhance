@@ -1,8 +1,45 @@
 # WECHAT_ENHANCE_IMPORT_BOOTSTRAP_V1
+# WECHAT_ENHANCE_IMPORT_BOOTSTRAP_V2
+import os
 import sys
 from pathlib import Path
-_SKILL_DIR = Path("/opt/data/skills/hermes-wechat-enhance")
-if str(_SKILL_DIR) not in sys.path: sys.path.insert(0, str(_SKILL_DIR))
+
+
+def _resolve_skill_dir() -> Path:
+    explicit = os.getenv(
+        "HERMES_WECHAT_ENHANCE_SOURCE_DIR",
+        "",
+    ).strip()
+    if explicit:
+        return Path(explicit).expanduser()
+
+    skills_root = os.getenv("HERMES_SKILLS_DIR", "").strip()
+    if skills_root:
+        return Path(skills_root).expanduser() / "hermes-wechat-enhance"
+
+    hermes_home = os.getenv("HERMES_HOME", "").strip()
+    if hermes_home:
+        return (
+            Path(hermes_home).expanduser()
+            / "skills"
+            / "hermes-wechat-enhance"
+        )
+
+    try:
+        hook_home = Path(__file__).resolve().parents[2]
+        derived = hook_home / "skills" / "hermes-wechat-enhance"
+        if derived.exists():
+            return derived
+    except IndexError:
+        pass
+
+    return Path("/opt/data/skills/hermes-wechat-enhance")
+
+
+_SKILL_DIR = _resolve_skill_dir().resolve()
+if str(_SKILL_DIR) not in sys.path:
+    sys.path.insert(0, str(_SKILL_DIR))
+
 from hermes_wechat_enhance.store import MessageStore
 _store = MessageStore()
 async def handle(event_type, context):

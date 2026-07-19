@@ -6,12 +6,15 @@ import importlib.util
 import json
 import os
 import py_compile
+import subprocess
+import sys
 from pathlib import Path
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
 HOME = Path(os.environ.get("HOME", str(HERMES_HOME / ".hermes-home")))
 HOOK_DIR = Path(os.environ.get("HERMES_HOOKS_DIR", str(HERMES_HOME / "hooks"))) / "hermes-wechat-enhance"
 GATEWAY_SRC = Path(os.environ.get("HERMES_GATEWAY_SRC", "/opt/hermes"))
+SKILL_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_READY = "♻️ Gateway online — Hermes is back and ready."
 _ready_env = os.environ.get("HERMES_WEIXIN_STARTUP_READY_NOTIFY", "").strip()
 # VERIFY_READY_ENV_BOOL_CONTRACT_V1: the runtime treats empty or "1" as "use default".
@@ -40,6 +43,103 @@ require("agent:end" in hook_text, "HOOK.yaml lacks agent:end")
 
 handler_text = read(handler_py)
 require("WECHAT_ENHANCE_IMPORT_BOOTSTRAP_V1" in handler_text, "handler lacks import bootstrap")
+require("WECHAT_ENHANCE_IMPORT_BOOTSTRAP_V2" in handler_text, "handler lacks portable import bootstrap")
+install_text = Path(__file__).with_name("install.sh").read_text(
+    encoding="utf-8"
+)
+require(
+    "WECHAT_ENHANCE_HOOK_IDEMPOTENT_NO_BACKUP_RESIDUE_V1"
+    in install_text,
+    "installer lacks no-backup-residue hook marker",
+)
+require(
+    "normalized_tree_hash" in install_text,
+    "installer lacks normalized hook comparison",
+)
+require(
+    ".before-install-" not in install_text,
+    "installer still creates timestamped hook backup residue",
+)
+require(
+    "detect_source_profile" in install_text,
+    "installer lacks source-profile detection",
+)
+require(
+    "series_for_profile" in install_text,
+    "installer lacks profile-specific series selection",
+)
+require(
+    "HERMES_WECHAT_VERSION_FROM_VERIFIED_SOURCE_PROFILE_V1" in install_text,
+    "installer lacks verified source-profile version fallback",
+)
+require(
+    'detect_version "$source_profile"' in install_text,
+    "installer does not resolve version after source-profile detection",
+)
+require(
+    "VERSION_SOURCE=verified-source-profile" in install_text,
+    "installer does not expose inferred version provenance",
+)
+require(
+    "HERMES_WECHAT_V018_VERSION_FAMILY_NORMALIZATION_V1" in install_text,
+    "installer lacks v0.18 version-family normalization",
+)
+require(
+    "normalize_version_family" in install_text,
+    "installer lacks normalize_version_family",
+)
+for accepted_alias in (
+    "v2026.7.1",
+    "v0.18.0",
+    "v0.18",
+):
+    require(
+        accepted_alias in install_text,
+        f"installer lacks accepted version alias {accepted_alias}",
+    )
+require(
+    'apply_patches "$patch_dir" "$version_family" "$source_profile"'
+    in install_text,
+    "installer does not apply patches by normalized version family",
+)
+require(
+    "HERMES_WECHAT_TRANSACTIONAL_SOURCE_STATE_V1" in install_text,
+    "installer lacks transactional source-state marker",
+)
+require(
+    "HERMES_WECHAT_FAULT_INJECTION_TEST_V1" in install_text,
+    "installer lacks deterministic fault-injection marker",
+)
+require(
+    "--source" in install_text,
+    "installer does not pass canonical source to state manager",
+)
+require(
+    "before-source-install-" not in install_text,
+    "installer still creates source backup residue",
+)
+require(
+    "fault_inject after-source-install" in install_text
+    and "fault_inject after-hook-install" in install_text,
+    "installer lacks required fault-injection stages",
+)
+require(
+    "git config user." not in install_text,
+    "installer still mutates persistent Git identity",
+)
+require(
+    "git add -A" not in install_text,
+    "installer still mutates the Git index",
+)
+require(
+    "commit -m" not in install_text,
+    "installer still creates Git commits",
+)
+require(
+    "HERMES_WECHAT_GIT_METADATA_PRESERVATION_V1"
+    in install_text,
+    "installer lacks Git metadata preservation marker",
+)
 require("WECHAT_ENHANCE_STARTUP_READY_OWNER_V1" in handler_text, "handler lacks startup ready owner marker")
 require("WECHAT_ENHANCE_STARTUP_READY_ACK_V2" in handler_text, "handler lacks startup ready ack marker")
 require("Hermes WeChat Enhance: startup ready notification sent" in handler_text, "handler lacks ready sent log")
@@ -53,7 +153,13 @@ assert spec.loader is not None
 spec.loader.exec_module(mod)
 require(hasattr(mod, "handle"), "handler has no handle()")
 require(hasattr(mod, "_send_startup_ready"), "handler has no _send_startup_ready()")
+require(hasattr(mod, "_SKILL_DIR"), "handler has no resolved skill directory")
+require(
+    Path(mod._SKILL_DIR).resolve() == SKILL_ROOT.resolve(),
+    f"portable bootstrap resolved {mod._SKILL_DIR}, expected {SKILL_ROOT}",
+)
 print("IMPORT_OK")
+print("IMPORT_BOOTSTRAP_PORTABLE_OK")
 
 class FakeResult:
     def __init__(self, success=True, error=None):
@@ -135,6 +241,15 @@ if wx.exists():
     require("/continue: drain pending" in wx_text, "weixin.py lacks /continue drain marker")
     require("def _footer_model_name" in wx_text, "weixin.py lacks _footer_model_name")
     require("def _is_system_meta" in wx_text, "weixin.py lacks _is_system_meta")
+    require("HERMES_WECHAT_SLASH_COMMAND_CONTENT_DEDUP_EXEMPTION_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_SLASH_COMMAND_CONTENT_DEDUP_EXEMPTION_V1")
+    require("HERMES_WECHAT_CONTEXT_TOKEN_REFRESH_BEFORE_CONTENT_DEDUP_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_TOKEN_REFRESH_BEFORE_CONTENT_DEDUP_V1")
+    require("HERMES_WECHAT_CONTEXT_DELIVERY_SERIALIZATION_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_DELIVERY_SERIALIZATION_V1")
+    require("HERMES_WECHAT_CONTEXT_TOKEN_GENERATION_FENCE_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_TOKEN_GENERATION_FENCE_V1")
+    require("HERMES_WECHAT_CONTEXT_BUDGET_RECONCILIATION_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_BUDGET_RECONCILIATION_V1")
+    require("HERMES_WECHAT_MEDIA_CONTEXT_BUDGET_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_MEDIA_CONTEXT_BUDGET_V1")
+    require("HERMES_WECHAT_ORDINARY_REPLY_APPEND_THEN_DRAIN_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_ORDINARY_REPLY_APPEND_THEN_DRAIN_V1")
+    require("HERMES_WECHAT_V018_SOURCE_PROFILE_DISPATCH_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_V018_SOURCE_PROFILE_DISPATCH_V1")
+    require("HERMES_WECHAT_V018_CONSOLIDATED_PATCH_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_V018_CONSOLIDATED_PATCH_V1")
 if run.exists():
     run_text = read(run)
     require("_non_conversational_metadata" in run_text, "run.py lacks _non_conversational_metadata")
@@ -161,5 +276,121 @@ if base.exists():
     base_text = read(base)
     require("_mark_notify_metadata" in base_text, "base.py lacks _mark_notify_metadata")
 
+contract_test = Path(__file__).with_name("test-context-token-kernel-contract.py")
+require(contract_test.exists(), f"missing {contract_test}")
+contract_text = contract_test.read_text(encoding="utf-8")
+require(
+    "TEST_WEIXIN_ADAPTER_REAL_INIT_V1" in contract_text,
+    "contract harness does not use real WeixinAdapter initialization",
+)
+environment = dict(os.environ)
+environment["HERMES_GATEWAY_SRC"] = str(GATEWAY_SRC)
+process = subprocess.run(
+    [sys.executable, str(contract_test)],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    env=environment,
+    check=False,
+)
+print(process.stdout, end="")
+require(process.returncode == 0, "context-token kernel contract test failed")
+require(
+    "SYNTHETIC_ADAPTER_RUNTIME_INIT_OK" in process.stdout,
+    "adapter runtime initialization preflight did not pass",
+)
+
+state_manager_text = Path(__file__).with_name(
+    "manage-install-state.py"
+).read_text(encoding="utf-8")
+require(
+    '"source_installed_hash"' in state_manager_text,
+    "state manager does not record installed source hash",
+)
+require(
+    'divergences.append("source")' in state_manager_text,
+    "state manager does not fail closed on source divergence",
+)
+require(
+    'copy_path(root / "backups" / "source", source)' in state_manager_text,
+    "state manager does not restore prior canonical source",
+)
+require(
+    "HERMES_WECHAT_TRANSACTION_SNAPSHOT_SOURCE_PATH_V2"
+    in state_manager_text,
+    "state manager lacks snapshot source-path marker",
+)
+require(
+    "gateway_file = gateway / relative" in state_manager_text,
+    "state manager still risks source parameter shadowing",
+)
+require(
+    "source = gateway / relative" not in state_manager_text,
+    "state manager still shadows canonical source parameter",
+)
+require(
+    "HERMES_WECHAT_GIT_METADATA_PRESERVATION_V1"
+    in state_manager_text,
+    "state manager lacks Git metadata preservation marker",
+)
+require(
+    "HERMES_WECHAT_EXACT_FILE_BACKUP_RESTORE_V1"
+    in state_manager_text,
+    "state manager lacks exact file restore marker",
+)
+require(
+    'run_git(gateway, "reset"' not in state_manager_text,
+    "state manager still restores through git reset",
+)
+require(
+    'copy_path(root / entry["backup"], gateway / relative)'
+    in state_manager_text,
+    "state manager does not always restore file backups",
+)
+
 print("PATCH_MARKERS_OK")
+source_path_test = Path(__file__).with_name(
+    "test-install-state-source-path.py"
+)
+process = subprocess.run(
+    [sys.executable, str(source_path_test)],
+    check=False,
+    text=True,
+    capture_output=True,
+)
+print(process.stdout, end="")
+if process.stderr:
+    print(process.stderr, end="", file=sys.stderr)
+require(
+    process.returncode == 0,
+    "install-state source-path regression test failed",
+)
+require(
+    "INSTALL_STATE_SOURCE_PATH_REGRESSION_OK" in process.stdout,
+    "install-state source-path regression marker missing",
+)
+
+git_preservation_test = Path(__file__).with_name(
+    "test-install-state-git-preservation.py"
+)
+process = subprocess.run(
+    [sys.executable, str(git_preservation_test)],
+    check=False,
+    text=True,
+    capture_output=True,
+)
+print(process.stdout, end="")
+if process.stderr:
+    print(process.stderr, end="", file=sys.stderr)
+require(
+    process.returncode == 0,
+    "Git working-tree preservation regression failed",
+)
+require(
+    "INSTALL_STATE_GIT_WORKTREE_PRESERVATION_OK"
+    in process.stdout,
+    "Git preservation regression marker missing",
+)
+
+print("TRANSACTIONAL_SOURCE_STATE_OK")
 print("SELF_INSTALL_VERIFY_OK")

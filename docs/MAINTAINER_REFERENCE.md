@@ -1,18 +1,37 @@
-# hermes-wechat-enhance
+# Maintainer Reference
 
-Hermes Weixin gateway enhancement skill.
+> Archived technical README preserved during the user-facing bilingual redesign.
+> This document is for maintainers, audits, migrations, and patch development.
 
-## Purpose
+# Hermes WeChat Enhance
 
-This skill owns the Weixin adapter enhancement layer for Hermes. It provides `/continue`, startup-ready notification, footer model attribution, system-message classification, model metadata propagation across streaming/queued/handoff send rails, and reliable text delivery using stable `_delivery_id` plus `SendResult.success`.
+`hermes-wechat-enhance` is the Hermes Weixin gateway enhancement skill. It owns the Weixin platform-layer patch set and the active hook that support startup-ready notification, `/continue`, footer model attribution, streaming/queued/handoff metadata propagation, and reliable text delivery using `_delivery_id` plus `SendResult.success`.
 
-## Owned files
+## Ownership boundary
+
+This skill owns and may patch:
 
 ```text
 /opt/hermes/gateway/platforms/weixin.py
 /opt/data/hooks/hermes-wechat-enhance/handler.py
 /opt/data/skills/hermes-wechat-enhance/
 ```
+
+Email Watchdog and other business skills must not overwrite `weixin.py`. Business-critical callers should maintain their own durable outbox and pass stable `metadata._delivery_id` to `adapter.send`.
+
+## Fresh-container validation order
+
+Before applying to production, validate in a fresh isolated test container:
+
+1. Clone this repository/branch into `/opt/data/skills/hermes-wechat-enhance`.
+2. Let Hermes/assistant read this README and run the documented install procedure.
+3. Run self-install verification.
+4. Run function matrix tests.
+5. Run reliable-delivery contract tests.
+6. Run stress tests.
+7. Run real Weixin pairing/e2e with a spare account only when explicitly approved.
+8. Run clean uninstall verification.
+9. Only after every step is zero-error may the skill be applied to production.
 
 ## Install
 
@@ -23,6 +42,18 @@ python3 scripts/verify-self-install.py
 python3 scripts/test-reliable-delivery-contract.py
 ```
 
+A controlled restart of only the Hermes gateway container may be required for Python source patches to load. Do not restart the Docker daemon.
+
+## Verify
+
+```bash
+cd /opt/data/skills/hermes-wechat-enhance
+python3 scripts/verify-self-install.py
+python3 scripts/test-reliable-delivery-contract.py
+python3 scripts/verify-persistence.py
+bash scripts/check-consistency.sh
+```
+
 ## Uninstall
 
 ```bash
@@ -30,28 +61,55 @@ cd /opt/data/skills/hermes-wechat-enhance
 bash scripts/uninstall.sh
 ```
 
-## Validation requirement
+## Patch series
 
-A production apply is valid only after a fresh test container completes:
+Current patch series reaches `009`.
 
-```text
-README-driven self install
-function matrix tests
-stress tests
-real Weixin e2e with spare account if explicitly approved
-safe clean uninstall
-zero-error package review
-```
-
-## Current reliable delivery markers
+Important current markers:
 
 ```text
+HERMES_WECHAT_STREAM_CONSUMER_MODEL_METADATA_V3
+HERMES_WECHAT_QUEUED_FIRST_RESPONSE_MODEL_METADATA_V3
+HERMES_WECHAT_BACKGROUND_REVIEW_SYSTEM_METADATA_V3B
+HERMES_WECHAT_HANDOFF_MODEL_METADATA_V3
+HERMES_WECHAT_FINAL_MODEL_STRICT_SOURCE_V3
+
 WECHAT_ENHANCE_RELIABLE_DELIVERY_V2
 WECHAT_ENHANCE_REPLY_BUDGET_COMMIT_AFTER_ACK_V2
 WECHAT_ENHANCE_QUEUE_PEEK_COMMIT_V2
 WECHAT_ENHANCE_DELIVERY_ID_DEDUPE_V2
 WECHAT_ENHANCE_STARTUP_READY_ACK_V2
 ```
+
+## Reliable delivery contract
+
+For text sends:
+
+```text
+queue.peek -> send chunk -> iLink acknowledgement -> commit budget -> dequeue -> SendResult.success=true
+```
+
+On failure:
+
+```text
+SendResult.success=false
+pending chunk remains queued in memory
+budget is not committed
+caller retains durable business outbox item
+```
+
+Idempotency:
+
+```text
+metadata._delivery_id + metadata._delivery_chunk_index
+```
+
+## Safety rules
+
+- Do not use a production WeChat account during fresh-container real pairing tests.
+- Do not send real messages unless explicitly approved.
+- Do not restart the Docker daemon.
+- Do not apply to production until clean-container install, matrix, stress, real e2e, and uninstall verification all pass with zero errors.
 
 ## Complete patch and reference inventory
 
@@ -97,36 +155,24 @@ The current patch inventory is deliberately listed here so `scripts/check-consis
 - `references/v018-weixin-changes.md`
 - `references/v017-model-propagation-chain.md`
 
+## Context-token kernel contract
 
-## Reference inventory
+The accepted v0.18.0 installation applies patch 010.
 
-The following reference documents are part of the skill package and are intentionally retained:
+- Every accepted inbound message refreshes its Context token before ordinary
+  text-content suppression.
+- Every `text.strip().startswith("/")` slash command bypasses the native
+  300-second content-fingerprint dedup layer.
+- Native `message_id` replay protection remains enabled.
+- `/continue` remains silent: it refreshes the token and drains pending sends.
+- All acknowledged text and media messages consume the shared 1–10 budget.
+- Per-user delivery transactions are serialized and guarded by token generation.
+- Context-token and reply-budget state are reconciled after restart.
+- Safe uninstall restores the exact pre-install gateway source and previous hook.
 
-- `references/development-blueprint.md`
-- `references/migration-test-patterns.md`
-- `references/v018-model-propagation-bug.md`
-- `references/isolated-audit-pattern.md`
-- `references/v017-full-audit.md`
-- `references/side-by-side-testing.md`
-- `references/docker-build-and-test.md`
-- `references/architecture-analysis.md`
-- `references/v018-migration-pitfalls.md`
-- `references/v018-weixin-changes.md`
-- `references/v017-model-propagation-chain.md`
-
-## Portable slash-command and Context-token contract
-
-Patch `patches/010-weixin-context-token-kernel-hardening.patch` is mandatory for
-the accepted Hermes v0.18.0 installation.
-
-All slash commands identified by `text.strip().startswith("/")` bypass native
-content-fingerprint dedup, while `message_id` replay dedup remains enabled.
-Every accepted inbound message refreshes Context token state before ordinary
-content suppression. Installation verification runs
-`scripts/test-context-token-kernel-contract.py`.
-
-The installer snapshots exact pre-install gateway and hook state. Uninstall
-fails closed on divergent source and restores the recorded pre-install state.
+Fresh-install acceptance currently targets Hermes v0.18.0 (`v2026.7.1`).
+The `.v017.patch` files are historical migration evidence, not a complete
+fresh-install support declaration.
 
 ## Patch variant dispatch
 

@@ -1,0 +1,17 @@
+repository=https://github.com/Awenforever/hermes-wechat-enhance.git
+branch=wechat-enhance-v2c-sync-v4-docs-20260712-020736
+commit=f368ef7ed74e40a044c9e618e8f945e86cc529b0
+candidate=distributable-kernel-hardening-v13
+supported_version=v2026.7.1*
+pristine_series=003,004,006,007,008,011
+legacy_series=003,004,006,007,008,012
+ordinary_reply_contract=append-tail-then-fifo-drain
+source_profile_dispatch=official-legacy-hardened-v1
+final_weixin_sha256=9679141c5a5b724b4d5262ffaa82679628cef2f0bafaa2a06dce1826ddb19110
+version_resolution=verified-source-profile-fallback-v1
+version_family=v2026.7.1-alias-normalization-v1
+transactional_source_state=v1
+fault_injection_acceptance=v1
+transaction_snapshot_source_path=v2
+git_metadata_preservation=v1
+exact_file_backup_restore=v1
