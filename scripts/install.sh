@@ -28,6 +28,8 @@ INSTALL_STATE_ACTIVE=0
 # HERMES_WECHAT_EXACT_FILE_BACKUP_RESTORE_V1
 OFFICIAL_V018_WEIXIN_SHA256="2fae85eb726afaa209ac1ba87869eb9a249ad22dc8727732a19e416953065633"
 LEGACY_V018_WEIXIN_SHA256="926b74e3476a78317560fadc5367eb37a061edba72b1fb225cf7e1de80cc5920"
+# HERMES_WECHAT_CURRENT_OFFICIAL_NO_WEIXIN_MUTATION_PROFILE_V2
+CURRENT_OFFICIAL_V018_WEIXIN_SHA256="85e06cea1673ae20e336820e9cac5a7dc467bdd8c2796a73c3e2bf1042c76dc4"
 
 log() { printf '%s\n' "$*"; }
 die() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
@@ -143,7 +145,7 @@ PY
 
   # HERMES_WECHAT_VERSION_FROM_VERIFIED_SOURCE_PROFILE_V1
   case "$source_profile" in
-    pristine-v018|legacy-v018|hardened-v018)
+    pristine-v018|legacy-v018|hardened-v018|current-official-v018)
       echo "v2026.7.1-inferred-$source_profile"
       return
       ;;
@@ -182,6 +184,11 @@ detect_source_profile() {
 
   local digest
   digest="$(sha256sum "$weixin" | awk '{print $1}')"
+
+  if [ "$digest" = "$CURRENT_OFFICIAL_V018_WEIXIN_SHA256" ]; then
+    echo "current-official-v018"
+    return
+  fi
 
   if [ "$digest" = "$OFFICIAL_V018_WEIXIN_SHA256" ]; then
     echo "pristine-v018"

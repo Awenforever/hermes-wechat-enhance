@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -14,11 +15,18 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
 HOME = Path(os.environ.get("HOME", str(HERMES_HOME / ".hermes-home")))
 HOOK_DIR = Path(os.environ.get("HERMES_HOOKS_DIR", str(HERMES_HOME / "hooks"))) / "hermes-wechat-enhance"
 GATEWAY_SRC = Path(os.environ.get("HERMES_GATEWAY_SRC", "/opt/hermes"))
+# HERMES_WECHAT_VERIFY_GATEWAY_IMPORT_BOOTSTRAP_V1
+if str(GATEWAY_SRC) not in sys.path:
+    sys.path.insert(0, str(GATEWAY_SRC))
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_READY = "♻️ Gateway online — Hermes is back and ready."
 _ready_env = os.environ.get("HERMES_WEIXIN_STARTUP_READY_NOTIFY", "").strip()
-# VERIFY_READY_ENV_BOOL_CONTRACT_V1: the runtime treats empty or "1" as "use default".
-READY = DEFAULT_READY if (not _ready_env or _ready_env == "1") else _ready_env
+# VERIFY_READY_ENV_BOOL_CONTRACT_V2: the synthetic startup-ready smoke must remain
+# enabled even when the real production setting intentionally disables startup
+# notifications. Runtime behavior is not changed; only this fake-adapter fixture
+# normalizes disabled values to the built-in ready text.
+_ready_disabled = _ready_env.lower() in {"0", "false", "no", "off", "disabled"}
+READY = DEFAULT_READY if (not _ready_env or _ready_env == "1" or _ready_disabled) else _ready_env
 
 def require(cond: bool, msg: str) -> None:
     if not cond:
@@ -44,6 +52,14 @@ require("agent:end" in hook_text, "HOOK.yaml lacks agent:end")
 handler_text = read(handler_py)
 require("WECHAT_ENHANCE_IMPORT_BOOTSTRAP_V1" in handler_text, "handler lacks import bootstrap")
 require("WECHAT_ENHANCE_IMPORT_BOOTSTRAP_V2" in handler_text, "handler lacks portable import bootstrap")
+require(
+    "HERMES_WECHAT_CURRENT_OFFICIAL_RUNTIME_COMPAT_HOOK_V1" in handler_text,
+    "handler lacks current-official runtime compatibility marker",
+)
+require(
+    "install_weixin_runtime_compat_hook" in handler_text,
+    "handler does not install runtime compatibility dispatcher",
+)
 install_text = Path(__file__).with_name("install.sh").read_text(
     encoding="utf-8"
 )
@@ -67,6 +83,29 @@ require(
 require(
     "series_for_profile" in install_text,
     "installer lacks profile-specific series selection",
+)
+require(
+    "HERMES_WECHAT_CURRENT_OFFICIAL_NO_WEIXIN_MUTATION_PROFILE_V2" in install_text,
+    "installer lacks current official no-weixin-mutation profile",
+)
+require(
+    "CURRENT_OFFICIAL_V018_WEIXIN_SHA256" in install_text
+    and "current-official-v018" in install_text,
+    "installer lacks current official source recognition",
+)
+current_series = SKILL_ROOT / "patches" / "series.current-official-v018"
+require(
+    current_series.exists(),
+    f"missing current official profile series: {current_series}",
+)
+current_series_ids = [
+    line.strip()
+    for line in current_series.read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
+]
+require(
+    current_series_ids == ["006", "007", "008"],
+    f"current official profile must select only 006/007/008, got {current_series_ids}",
 )
 require(
     "HERMES_WECHAT_VERSION_FROM_VERIFIED_SOURCE_PROFILE_V1" in install_text,
@@ -224,32 +263,55 @@ wx = GATEWAY_SRC / "gateway" / "platforms" / "weixin.py"
 run = GATEWAY_SRC / "gateway" / "run.py"
 base = GATEWAY_SRC / "gateway" / "platforms" / "base.py"
 
+# HERMES_WECHAT_CURRENT_OFFICIAL_PROFILE_VERIFY_V2
+CURRENT_OFFICIAL_V018_WEIXIN_SHA256 = "85e06cea1673ae20e336820e9cac5a7dc467bdd8c2796a73c3e2bf1042c76dc4"
+CURRENT_OFFICIAL_V018_BASE_SHA256 = "dbdf137f59c4e541ac4c3ad3cf761e7cd8d11b5e487ead12ba8c19a6e3be4984"
+CURRENT_OFFICIAL_V018_RUN_SHA256 = "9832bc3e285f1616b6bceecd68a457f4bf0ee5fe39d825c0e745167e0f324754"
+current_official_profile = False
+
 if wx.exists():
     wx_text = read(wx)
-    require("class ReplyBudgetStore" in wx_text, "weixin.py lacks ReplyBudgetStore")
-    require("class MessageSendQueue" in wx_text, "weixin.py lacks MessageSendQueue")
-    require("async def _drain_pending" in wx_text, "weixin.py lacks _drain_pending")
-    require("WECHAT_ENHANCE_RELIABLE_DELIVERY_V2" in wx_text, "weixin.py lacks reliable delivery marker")
-    require("WECHAT_ENHANCE_REPLY_BUDGET_COMMIT_AFTER_ACK_V2" in wx_text, "weixin.py lacks commit-after-ack budget marker")
-    require("WECHAT_ENHANCE_QUEUE_PEEK_COMMIT_V2" in wx_text, "weixin.py lacks queue peek/commit marker")
-    require("WECHAT_ENHANCE_DELIVERY_ID_DEDUPE_V2" in wx_text, "weixin.py lacks delivery_id dedupe marker")
-    require("def next_count" in wx_text and "def commit_count" in wx_text, "weixin.py lacks budget next/commit methods")
-    require("def peek" in wx_text, "weixin.py lacks non-destructive queue peek")
-    require("Weixin send attempt bubble_count" in wx_text, "weixin.py lacks corrected send attempt log")
-    require("Weixin queued send count" not in wx_text, "weixin.py still has misleading queued send count log")
-    require("delivery_id_present" in wx_text and "context_token_present" in wx_text, "weixin.py lacks safe delivery/token observability")
-    require("/continue: drain pending" in wx_text, "weixin.py lacks /continue drain marker")
-    require("def _footer_model_name" in wx_text, "weixin.py lacks _footer_model_name")
-    require("def _is_system_meta" in wx_text, "weixin.py lacks _is_system_meta")
-    require("HERMES_WECHAT_SLASH_COMMAND_CONTENT_DEDUP_EXEMPTION_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_SLASH_COMMAND_CONTENT_DEDUP_EXEMPTION_V1")
-    require("HERMES_WECHAT_CONTEXT_TOKEN_REFRESH_BEFORE_CONTENT_DEDUP_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_TOKEN_REFRESH_BEFORE_CONTENT_DEDUP_V1")
-    require("HERMES_WECHAT_CONTEXT_DELIVERY_SERIALIZATION_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_DELIVERY_SERIALIZATION_V1")
-    require("HERMES_WECHAT_CONTEXT_TOKEN_GENERATION_FENCE_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_TOKEN_GENERATION_FENCE_V1")
-    require("HERMES_WECHAT_CONTEXT_BUDGET_RECONCILIATION_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_BUDGET_RECONCILIATION_V1")
-    require("HERMES_WECHAT_MEDIA_CONTEXT_BUDGET_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_MEDIA_CONTEXT_BUDGET_V1")
-    require("HERMES_WECHAT_ORDINARY_REPLY_APPEND_THEN_DRAIN_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_ORDINARY_REPLY_APPEND_THEN_DRAIN_V1")
-    require("HERMES_WECHAT_V018_SOURCE_PROFILE_DISPATCH_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_V018_SOURCE_PROFILE_DISPATCH_V1")
-    require("HERMES_WECHAT_V018_CONSOLIDATED_PATCH_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_V018_CONSOLIDATED_PATCH_V1")
+    wx_digest = hashlib.sha256(wx.read_bytes()).hexdigest()
+    current_official_profile = wx_digest == CURRENT_OFFICIAL_V018_WEIXIN_SHA256
+    if current_official_profile:
+        print("WEIXIN_PROFILE=current-official-v018")
+        require("class ReplyBudgetStore" in wx_text, "current official weixin lacks ReplyBudgetStore")
+        require("class MessageSendQueue" in wx_text, "current official weixin lacks MessageSendQueue")
+        require("async def _drain_pending" in wx_text, "current official weixin lacks _drain_pending")
+        require("/continue: drain pending" in wx_text, "current official weixin lacks /continue drain")
+        require("def _footer_model_name" in wx_text, "current official weixin lacks footer helper")
+        require("def _is_system_meta" in wx_text, "current official weixin lacks system metadata helper")
+        require("Secondary content-fingerprint dedup for text messages" in wx_text, "current official weixin lacks content dedup")
+        require('content_key = f"content:{sender_id}:' in wx_text, "current official content-dedup key shape changed")
+        require(base.exists(), "current official base.py missing")
+        require(hashlib.sha256(base.read_bytes()).hexdigest() == CURRENT_OFFICIAL_V018_BASE_SHA256, "current official base.py hash changed")
+        print("CURRENT_OFFICIAL_WEIXIN_NATIVE_CAPABILITIES_OK")
+        print("CURRENT_OFFICIAL_WEIXIN_BYTE_IDENTITY_OK")
+    else:
+        require("class ReplyBudgetStore" in wx_text, "weixin.py lacks ReplyBudgetStore")
+        require("class MessageSendQueue" in wx_text, "weixin.py lacks MessageSendQueue")
+        require("async def _drain_pending" in wx_text, "weixin.py lacks _drain_pending")
+        require("WECHAT_ENHANCE_RELIABLE_DELIVERY_V2" in wx_text, "weixin.py lacks reliable delivery marker")
+        require("WECHAT_ENHANCE_REPLY_BUDGET_COMMIT_AFTER_ACK_V2" in wx_text, "weixin.py lacks commit-after-ack budget marker")
+        require("WECHAT_ENHANCE_QUEUE_PEEK_COMMIT_V2" in wx_text, "weixin.py lacks queue peek/commit marker")
+        require("WECHAT_ENHANCE_DELIVERY_ID_DEDUPE_V2" in wx_text, "weixin.py lacks delivery_id dedupe marker")
+        require("def next_count" in wx_text and "def commit_count" in wx_text, "weixin.py lacks budget next/commit methods")
+        require("def peek" in wx_text, "weixin.py lacks non-destructive queue peek")
+        require("Weixin send attempt bubble_count" in wx_text, "weixin.py lacks corrected send attempt log")
+        require("Weixin queued send count" not in wx_text, "weixin.py still has misleading queued send count log")
+        require("delivery_id_present" in wx_text and "context_token_present" in wx_text, "weixin.py lacks safe delivery/token observability")
+        require("/continue: drain pending" in wx_text, "weixin.py lacks /continue drain marker")
+        require("def _footer_model_name" in wx_text, "weixin.py lacks _footer_model_name")
+        require("def _is_system_meta" in wx_text, "weixin.py lacks _is_system_meta")
+        require("HERMES_WECHAT_SLASH_COMMAND_CONTENT_DEDUP_EXEMPTION_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_SLASH_COMMAND_CONTENT_DEDUP_EXEMPTION_V1")
+        require("HERMES_WECHAT_CONTEXT_TOKEN_REFRESH_BEFORE_CONTENT_DEDUP_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_TOKEN_REFRESH_BEFORE_CONTENT_DEDUP_V1")
+        require("HERMES_WECHAT_CONTEXT_DELIVERY_SERIALIZATION_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_DELIVERY_SERIALIZATION_V1")
+        require("HERMES_WECHAT_CONTEXT_TOKEN_GENERATION_FENCE_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_TOKEN_GENERATION_FENCE_V1")
+        require("HERMES_WECHAT_CONTEXT_BUDGET_RECONCILIATION_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_CONTEXT_BUDGET_RECONCILIATION_V1")
+        require("HERMES_WECHAT_MEDIA_CONTEXT_BUDGET_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_MEDIA_CONTEXT_BUDGET_V1")
+        require("HERMES_WECHAT_ORDINARY_REPLY_APPEND_THEN_DRAIN_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_ORDINARY_REPLY_APPEND_THEN_DRAIN_V1")
+        require("HERMES_WECHAT_V018_SOURCE_PROFILE_DISPATCH_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_V018_SOURCE_PROFILE_DISPATCH_V1")
+        require("HERMES_WECHAT_V018_CONSOLIDATED_PATCH_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_V018_CONSOLIDATED_PATCH_V1")
 if run.exists():
     run_text = read(run)
     require("_non_conversational_metadata" in run_text, "run.py lacks _non_conversational_metadata")
@@ -272,6 +334,13 @@ if run.exists():
     require("_resolve_gateway_model()" not in final_block, "run.py final footer metadata still uses config/default model fallback")
     require("_stream_consumer.metadata = _current_turn_model_metadata(_status_thread_metadata)" in run_text, "run.py stream consumer metadata not refreshed with model metadata")
     require("wechat queued first_response model metadata source=" in run_text, "run.py lacks queued first_response metadata observability")
+    if current_official_profile:
+        require(
+            hashlib.sha256(run.read_bytes()).hexdigest()
+            == CURRENT_OFFICIAL_V018_RUN_SHA256,
+            "current official run.py does not match accepted 006/007/008 runtime",
+        )
+        print("CURRENT_OFFICIAL_RUN_EXACT_PARITY_OK")
 if base.exists():
     base_text = read(base)
     require("_mark_notify_metadata" in base_text, "base.py lacks _mark_notify_metadata")
@@ -283,22 +352,126 @@ require(
     "TEST_WEIXIN_ADAPTER_REAL_INIT_V1" in contract_text,
     "contract harness does not use real WeixinAdapter initialization",
 )
+
+compat_core = SKILL_ROOT / "hermes_wechat_enhance" / "current_official_runtime_compat_core.py"
+compat_dispatcher = SKILL_ROOT / "hermes_wechat_enhance" / "current_official_runtime_compat.py"
+compat_contract_test = Path(__file__).with_name("test-current-official-runtime-compat.py")
+PROVEN_CURRENT_OFFICIAL_RUNTIME_COMPAT_CORE_SHA256 = (
+    "7d0cac0671bf33f24b5682e5978f0502255e549817d9881ad069256215c95216"
+)
+require(compat_core.exists(), f"missing {compat_core}")
+require(compat_dispatcher.exists(), f"missing {compat_dispatcher}")
+require(compat_contract_test.exists(), f"missing {compat_contract_test}")
+require(
+    hashlib.sha256(compat_core.read_bytes()).hexdigest()
+    == PROVEN_CURRENT_OFFICIAL_RUNTIME_COMPAT_CORE_SHA256,
+    "current-official runtime compatibility core differs from proven candidate",
+)
+
 environment = dict(os.environ)
 environment["HERMES_GATEWAY_SRC"] = str(GATEWAY_SRC)
-process = subprocess.run(
-    [sys.executable, str(contract_test)],
+environment["PYTHONDONTWRITEBYTECODE"] = "1"
+
+if current_official_profile:
+    process = subprocess.run(
+        [sys.executable, str(compat_contract_test)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=environment,
+        check=False,
+    )
+    print(process.stdout, end="")
+    require(
+        process.returncode == 0,
+        "current-official runtime compatibility contract test failed",
+    )
+    for compat_marker in (
+        "SYNTHETIC_ADAPTER_RUNTIME_INIT_OK",
+        "SLASH_COMMAND_CONTENT_DEDUP_EXEMPTION_OK",
+        "MESSAGE_ID_REPLAY_DEDUP_OK",
+        "CONTEXT_REFRESH_BEFORE_CONTENT_DEDUP_OK",
+        "CONTINUE_SILENT_REFRESH_DRAIN_OK",
+        "SHARED_CONTEXT_TOKEN_COUNT_OK",
+        "ORDINARY_REPLY_APPEND_THEN_DRAIN_OK",
+        "ACK_COMMIT_AND_MAXIMUM_TEN_OK",
+        "TOKEN_GENERATION_AND_DRAIN_SERIALIZATION_OK",
+        "MEDIA_CONTEXT_TOKEN_BUDGET_OK",
+        "CONTEXT_BUDGET_RECONCILIATION_OK",
+        "CONTEXT_TOKEN_KERNEL_CONTRACT_OK",
+        "DELIVERY_ID_CHUNK_DEDUPE_OK",
+        "FAILED_SEND_RETRY_STABLE_CLIENT_ID_OK",
+        "CURRENT_OFFICIAL_RUNTIME_COMPAT_DISPATCHER_OK",
+        "CURRENT_OFFICIAL_RUNTIME_COMPAT_TEST=PASS",
+    ):
+        require(
+            compat_marker in process.stdout,
+            f"current-official compatibility marker missing: {compat_marker}",
+        )
+    print("CURRENT_OFFICIAL_RUNTIME_COMPAT_VERIFY_OK")
+else:
+    process = subprocess.run(
+        [sys.executable, str(contract_test)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=environment,
+        check=False,
+    )
+    print(process.stdout, end="")
+    require(
+        process.returncode == 0,
+        "context-token kernel contract test failed",
+    )
+    require(
+        "SYNTHETIC_ADAPTER_RUNTIME_INIT_OK" in process.stdout,
+        "adapter runtime initialization preflight did not pass",
+    )
+
+# HERMES_WECHAT_SLASH_COMMAND_DEDUP_VERIFY_V1
+slash_module = SKILL_ROOT / "hermes_wechat_enhance" / "slash_command_dedup.py"
+slash_contract_test = Path(__file__).with_name(
+    "test-slash-command-dedup-hook.py"
+)
+require(
+    "HERMES_WECHAT_SLASH_COMMAND_DEDUP_HOOK_V1" in handler_text,
+    "handler lacks repeated slash-command runtime hook marker",
+)
+require(
+    slash_module.exists(),
+    f"missing slash-command dedup module: {slash_module}",
+)
+require(
+    slash_contract_test.exists(),
+    f"missing slash-command dedup contract test: {slash_contract_test}",
+)
+slash_environment = dict(os.environ)
+slash_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+slash_process = subprocess.run(
+    [sys.executable, str(slash_contract_test)],
     text=True,
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
-    env=environment,
+    env=slash_environment,
     check=False,
 )
-print(process.stdout, end="")
-require(process.returncode == 0, "context-token kernel contract test failed")
+print(slash_process.stdout, end="")
 require(
-    "SYNTHETIC_ADAPTER_RUNTIME_INIT_OK" in process.stdout,
-    "adapter runtime initialization preflight did not pass",
+    slash_process.returncode == 0,
+    "slash-command dedup contract test failed",
 )
+for slash_marker in (
+    "SLASH_COMMAND_DEDUP_HOOK_TEST=PASS",
+    "provider_message_id_dedup_preserved=true",
+    "repeated_slash_command_allowed=true",
+    "ordinary_text_content_dedup_preserved=true",
+    "contextvar_concurrency_isolation=true",
+):
+    require(
+        slash_marker in slash_process.stdout,
+        f"slash-command dedup contract marker missing: {slash_marker}",
+    )
+print("SLASH_COMMAND_DEDUP_VERIFY_OK")
 
 state_manager_text = Path(__file__).with_name(
     "manage-install-state.py"
