@@ -4,6 +4,9 @@ import asyncio
 import contextvars
 import functools
 import hashlib
+import json
+import os
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -185,7 +188,100 @@ def _patch_classes() -> None:
     wx.ReplyBudgetStore.commit_count_if_generation = commit_count_if_generation
     wx.ReplyBudgetStore.increment_and_get = increment_and_get
 
-    # Delivery-ID-aware queue with non-destructive peek.
+    # Durable, delivery-ID-aware FIFO queue with non-destructive peek.
+    #
+    # The official runtime queue is process memory only.  More importantly,
+    # callers with a stable delivery id used to receive a failure after their
+    # content had already been queued, so every retry appended another copy.
+    # Keep accepted deliveries in SQLite (including a compact sent ledger) and
+    # expose queued acceptance as success at the adapter boundary.
+    def q_db_path(self: Any) -> Path:
+        instance_path = getattr(self, "_durable_db_path", None)
+        if instance_path:
+            return Path(instance_path)
+        configured = os.getenv("HERMES_WEIXIN_QUEUE_DB", "").strip()
+        if configured:
+            return Path(configured)
+        hermes_home = Path(os.getenv("HERMES_HOME", str(wx.get_hermes_home())))
+        return hermes_home / "weixin" / "send-queue.sqlite3"
+
+    def q_connect(self: Any) -> sqlite3.Connection:
+        path = q_db_path(self)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbound_queue (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                reply_to TEXT,
+                metadata_json TEXT NOT NULL,
+                delivery_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                enqueued_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                sent_at REAL,
+                last_error TEXT,
+                UNIQUE(account_id, user_id, dedupe_key)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbound_fifo "
+            "ON outbound_queue(account_id, user_id, status, seq)"
+        )
+        conn.commit()
+        return conn
+
+    def q_expire(self: Any, conn: sqlite3.Connection) -> None:
+        now = time.time()
+        conn.execute(
+            "UPDATE outbound_queue SET status='expired' "
+            "WHERE status='queued' AND expires_at <= ?",
+            (now,),
+        )
+        # The sent/expired ledger only exists to reject late retries.  Thirty
+        # days is ample for that purpose and keeps the database bounded.
+        conn.execute(
+            "DELETE FROM outbound_queue WHERE status != 'queued' "
+            "AND COALESCE(sent_at, expires_at) < ?",
+            (now - 30 * 86400,),
+        )
+
+    def q_default_ttl(metadata: Dict[str, Any], content: str) -> int:
+        try:
+            explicit = int(metadata.get("_delivery_ttl_seconds", 0) or 0)
+        except Exception:
+            explicit = 0
+        if explicit > 0:
+            return max(60, min(explicit, 30 * 86400))
+        source = str(
+            metadata.get("_delivery_source")
+            or metadata.get("source")
+            or metadata.get("message_origin")
+            or ""
+        ).lower()
+        delivery_id = str(metadata.get("_delivery_id") or "").lower()
+        sample = content[:500].lower()
+        if "验证码" in sample or "verification code" in sample or "otp" in source:
+            return 10 * 60
+        if "weekly" in source or "weekly" in delivery_id or "周报" in sample:
+            return 7 * 86400
+        if "alive" in source or "alive" in delivery_id or "proactive" in source:
+            return 6 * 3600
+        if "email" in source or "email" in delivery_id:
+            return 72 * 3600
+        return 72 * 3600
+
     def q_dedupe_key(self: Any, delivery_id: str, chunk_index: int) -> str:
         return f"{delivery_id}:{int(chunk_index)}"
 
@@ -197,7 +293,9 @@ def _patch_classes() -> None:
         delivery_id = str(
             metadata_dict.get("_delivery_id")
             or metadata_dict.get("delivery_id")
-            or f"legacy-{uuid.uuid4().hex}"
+            or "legacy-" + hashlib.sha256(
+                f"{chat_id}|{content}|{reply_to}".encode("utf-8")
+            ).hexdigest()[:32]
         ).strip()
         try:
             chunk_index = int(metadata_dict.get("_delivery_chunk_index", position))
@@ -225,61 +323,159 @@ def _patch_classes() -> None:
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> bool:
-        key = self._key(account_id, user_id)
-        queue = self._queues.setdefault(key, [])
         metadata_dict = dict(metadata or {})
         delivery_id = str(
             metadata_dict.get("_delivery_id")
             or metadata_dict.get("delivery_id")
             or f"auto-{uuid.uuid4().hex}"
         ).strip()
-        try:
-            chunk_index = int(metadata_dict.get("_delivery_chunk_index", len(queue)))
-        except Exception:
-            chunk_index = len(queue)
-        metadata_dict["_delivery_id"] = delivery_id
-        metadata_dict["_delivery_chunk_index"] = chunk_index
-        dedupe_key = q_dedupe_key(self, delivery_id, chunk_index)
-        normalized = [q_normalize(self, item, i) for i, item in enumerate(queue)]
-        self._queues[key] = normalized
-        if any(str(item.get("dedupe_key")) == dedupe_key for item in normalized):
-            return False
-        normalized.append({
-            "content": content,
-            "chat_id": chat_id,
-            "reply_to": reply_to,
-            "metadata": metadata_dict,
-            "delivery_id": delivery_id,
-            "chunk_index": chunk_index,
-            "dedupe_key": dedupe_key,
-            "enqueued_at": time.time(),
-        })
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        with q_connect(self) as conn:
+            q_expire(self, conn)
+            explicit_index = metadata_dict.get("_delivery_chunk_index")
+            if explicit_index is None:
+                # A content-derived key remains stable across process restarts
+                # and caller retries even when the caller did not number its
+                # chunks.  The adapter's splitter does not emit two identical
+                # chunks for one delivery in normal operation.
+                dedupe_key = f"{delivery_id}:sha256:{content_hash}"
+                row = conn.execute(
+                    "SELECT chunk_index FROM outbound_queue "
+                    "WHERE account_id=? AND user_id=? AND dedupe_key=?",
+                    (account_id, user_id, dedupe_key),
+                ).fetchone()
+                if row is not None:
+                    return False
+                next_row = conn.execute(
+                    "SELECT COALESCE(MAX(chunk_index), -1) + 1 AS n "
+                    "FROM outbound_queue WHERE account_id=? AND user_id=? "
+                    "AND delivery_id=?",
+                    (account_id, user_id, delivery_id),
+                ).fetchone()
+                chunk_index = int(next_row["n"] if next_row else 0)
+            else:
+                try:
+                    chunk_index = int(explicit_index)
+                except Exception:
+                    chunk_index = 0
+                dedupe_key = q_dedupe_key(self, delivery_id, chunk_index)
+
+            pending = conn.execute(
+                "SELECT COUNT(*) AS n FROM outbound_queue "
+                "WHERE account_id=? AND user_id=? AND status='queued'",
+                (account_id, user_id),
+            ).fetchone()
+            if int(pending["n"] if pending else 0) >= 500:
+                raise RuntimeError("durable Weixin queue capacity reached (500)")
+
+            now = time.time()
+            ttl = q_default_ttl(metadata_dict, content)
+            metadata_dict["_delivery_id"] = delivery_id
+            metadata_dict["_delivery_chunk_index"] = chunk_index
+            metadata_dict["_delivery_expires_at"] = now + ttl
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO outbound_queue(
+                        account_id,user_id,content,chat_id,reply_to,
+                        metadata_json,delivery_id,chunk_index,dedupe_key,
+                        content_hash,enqueued_at,expires_at,status
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'queued')
+                    """,
+                    (
+                        account_id,
+                        user_id,
+                        content,
+                        chat_id,
+                        reply_to,
+                        json.dumps(metadata_dict, ensure_ascii=False),
+                        delivery_id,
+                        chunk_index,
+                        dedupe_key,
+                        content_hash,
+                        now,
+                        now + ttl,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return False
         return True
 
+    def q_row_item(row: sqlite3.Row) -> Dict[str, Any]:
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except Exception:
+            metadata = {}
+        return {
+            "content": row["content"],
+            "chat_id": row["chat_id"],
+            "reply_to": row["reply_to"],
+            "metadata": metadata,
+            "delivery_id": row["delivery_id"],
+            "chunk_index": int(row["chunk_index"]),
+            "dedupe_key": row["dedupe_key"],
+            "enqueued_at": float(row["enqueued_at"]),
+            "seq": int(row["seq"]),
+        }
+
     def q_peek(self: Any, account_id: str, user_id: str) -> Optional[Dict[str, Any]]:
-        key = self._key(account_id, user_id)
-        queue = self._queues.get(key)
-        if not queue:
-            return None
-        item = q_normalize(self, queue[0], 0)
-        queue[0] = item
-        return item
+        with q_connect(self) as conn:
+            q_expire(self, conn)
+            row = conn.execute(
+                "SELECT * FROM outbound_queue WHERE account_id=? "
+                "AND user_id=? AND status='queued' ORDER BY seq LIMIT 1",
+                (account_id, user_id),
+            ).fetchone()
+            return q_row_item(row) if row is not None else None
 
     def q_dequeue(self: Any, account_id: str, user_id: str) -> Optional[Dict[str, Any]]:
-        key = self._key(account_id, user_id)
-        queue = self._queues.get(key)
-        if not queue:
-            return None
-        item = q_normalize(self, queue.pop(0), 0)
-        if not queue:
-            self._queues.pop(key, None)
-        return item
+        with q_connect(self) as conn:
+            q_expire(self, conn)
+            row = conn.execute(
+                "SELECT * FROM outbound_queue WHERE account_id=? "
+                "AND user_id=? AND status='queued' ORDER BY seq LIMIT 1",
+                (account_id, user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                "UPDATE outbound_queue SET status='sent', sent_at=?, "
+                "last_error=NULL WHERE seq=? AND status='queued'",
+                (time.time(), int(row["seq"])),
+            )
+            return q_row_item(row)
+
+    def q_has_pending(self: Any, account_id: str, user_id: str) -> bool:
+        return q_pending_count(self, account_id, user_id) > 0
+
+    def q_pending_count(self: Any, account_id: str, user_id: str) -> int:
+        with q_connect(self) as conn:
+            q_expire(self, conn)
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM outbound_queue "
+                "WHERE account_id=? AND user_id=? AND status='queued'",
+                (account_id, user_id),
+            ).fetchone()
+            return int(row["n"] if row else 0)
+
+    def q_stats(self: Any, account_id: str, user_id: str) -> Dict[str, int]:
+        with q_connect(self) as conn:
+            q_expire(self, conn)
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM outbound_queue "
+                "WHERE account_id=? AND user_id=? GROUP BY status",
+                (account_id, user_id),
+            ).fetchall()
+            return {str(row["status"]): int(row["n"]) for row in rows}
 
     wx.MessageSendQueue._dedupe_key = q_dedupe_key
     wx.MessageSendQueue._normalize_compat_item = q_normalize
     wx.MessageSendQueue.enqueue = q_enqueue
     wx.MessageSendQueue.peek = q_peek
     wx.MessageSendQueue.dequeue = q_dequeue
+    wx.MessageSendQueue.has_pending = q_has_pending
+    wx.MessageSendQueue.pending_count = q_pending_count
+    wx.MessageSendQueue.stats = q_stats
 
     # Adapter methods.
     def context_delivery_lock(self: Any, chat_id: str) -> asyncio.Lock:
@@ -304,10 +500,13 @@ def _patch_classes() -> None:
                         break
                     if self._budget_store.is_exhausted(self._account_id, chat_id):
                         pending = self._send_queue.pending_count(self._account_id, chat_id)
+                        # The adapter has durably accepted the delivery.  This
+                        # is not a transport failure and upstream producers
+                        # must not retry it.  FIFO order is preserved: no live
+                        # response is moved ahead of older accepted entries.
                         return wx.SendResult(
-                            success=False,
-                            message_id=last_message_id,
-                            error=f"context_token budget exhausted; pending={pending}",
+                            success=True,
+                            message_id=last_message_id or f"queued:{pending}",
                         )
 
                     item = self._send_queue.peek(self._account_id, chat_id)
@@ -380,9 +579,8 @@ def _patch_classes() -> None:
             pending = self._send_queue.pending_count(self._account_id, chat_id)
             if pending:
                 return wx.SendResult(
-                    success=False,
-                    message_id=last_message_id,
-                    error=f"pending chunks remain: {pending}",
+                    success=True,
+                    message_id=last_message_id or f"queued:{pending}",
                 )
             if sent_any:
                 return wx.SendResult(success=True, message_id=last_message_id)
@@ -549,6 +747,15 @@ def patch_weixin_adapter(adapter: Any) -> bool:
 
     proxy = _CompatDedupProxy(original_dedup)
     adapter._dedup = proxy
+
+    # Bind this queue to the same Hermes home as the already initialized
+    # reply-budget store.  This also gives every isolated test adapter its own
+    # database instead of falling back to a process-global path.
+    try:
+        account_root = Path(adapter._budget_store._root)
+        adapter._send_queue._durable_db_path = account_root.parent / "send-queue.sqlite3"
+    except Exception:
+        pass
 
     # Existing stores may have been restored before the startup Hook.
     try:

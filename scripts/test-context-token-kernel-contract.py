@@ -363,10 +363,36 @@ async def acknowledgement_and_maximum(root: Path) -> None:
             {"_delivery_id": f"m-{index}", "_delivery_chunk_index": 0},
         )
     result = await maximum._drain_pending("user")
-    require(not result.success, "11-message drain unexpectedly succeeded")
+    require(result.success, "durably queued remainder was reported as failure")
+    require(str(result.message_id or "").startswith("hermes-weixin-") or str(result.message_id or "").startswith("queued:"), "queued acceptance id missing")
     require(numbers == list(range(1, 11)), "maximum sequence")
     require(maximum._send_queue.pending_count("acct", "user") == 1, "11th not pending")
     print("ACK_COMMIT_AND_MAXIMUM_TEN_OK")
+
+
+def durable_queue_restart_and_retry_dedup(root: Path) -> None:
+    queue_root = root / "durable-queue"
+    first = adapter(queue_root)
+    metadata = {"_delivery_id": "stable-retry", "_delivery_source": "test"}
+    accepted = [
+        first._send_queue.enqueue(
+            "acct", "user", "same payload", "user", None, metadata
+        )
+        for _ in range(100)
+    ]
+    require(accepted[0] is True, "first durable enqueue rejected")
+    require(all(value is False for value in accepted[1:]), "retry dedupe accepted duplicate")
+    require(first._send_queue.pending_count("acct", "user") == 1, "retry dedupe count")
+
+    restarted = adapter(queue_root)
+    require(restarted._send_queue.pending_count("acct", "user") == 1, "queue did not survive restart")
+    require(
+        restarted._send_queue.enqueue(
+            "acct", "user", "same payload", "user", None, metadata
+        ) is False,
+        "restart lost delivery-id dedupe ledger",
+    )
+    print("DURABLE_QUEUE_RESTART_AND_100X_RETRY_DEDUP_OK")
 
 async def token_and_drain_races(root: Path) -> None:
     current = adapter(root / "token-race")
@@ -502,6 +528,7 @@ async def main() -> None:
         await token_and_drain_races(root)
         await media_budget(root)
         persistence_reconciliation(root)
+        durable_queue_restart_and_retry_dedup(root)
     print("CONTEXT_TOKEN_KERNEL_CONTRACT_OK")
 
 if __name__ == "__main__":
