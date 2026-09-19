@@ -21,11 +21,13 @@ def _resolve_skill_dir() -> Path:
 
     hermes_home = os.getenv("HERMES_HOME", "").strip()
     if hermes_home:
-        return (
-            Path(hermes_home).expanduser()
-            / "skills"
-            / "hermes-wechat-enhance"
-        )
+        home = Path(hermes_home).expanduser()
+        plugin = home / "plugins" / "hermes-wechat-enhance"
+        if plugin.exists():
+            return plugin
+        skill = home / "skills" / "hermes-wechat-enhance"
+        if skill.exists():
+            return skill
 
     try:
         hook_home = Path(__file__).resolve().parents[2]
@@ -35,7 +37,7 @@ def _resolve_skill_dir() -> Path:
     except IndexError:
         pass
 
-    return Path("/opt/data/skills/hermes-wechat-enhance")
+    return Path.home() / ".hermes" / "plugins" / "hermes-wechat-enhance"
 
 
 _SKILL_DIR = _resolve_skill_dir().resolve()
@@ -51,14 +53,23 @@ _store = MessageStore()
 async def handle(event_type, context):
     # WECHAT_ENHANCE_STARTUP_READY_OWNER_V1
     if event_type == "gateway:startup":
-        await install_weixin_runtime_compat_hook(context)
+        legacy_compat = os.getenv("HERMES_WECHAT_ENABLE_LEGACY_RUNTIME_COMPAT", "").strip().lower()
+        if legacy_compat in {"1", "true", "yes", "on"}:
+            await install_weixin_runtime_compat_hook(context)
         await _send_startup_ready(context)
         return
     if event_type == "agent:start":
-        _store.append_inbound(context)
+        if _audit_enabled():
+            _store.append_inbound(context)
     elif event_type == "agent:end":
-        _store.append_outbound(context)
+        if _audit_enabled():
+            _store.append_outbound(context)
     return None
+
+
+def _audit_enabled() -> bool:
+    value = os.getenv("HERMES_WECHAT_CAPTURE_MESSAGES", "1").strip().lower()
+    return value not in {"0", "false", "no", "off", "disabled"}
 
 
 # WECHAT_ENHANCE_STARTUP_READY_OWNER_V1
@@ -72,7 +83,9 @@ async def _send_startup_ready(context: dict):
     # A controlled deployment restart can create this one-shot sentinel to
     # prevent an unsolicited real WeChat notification.  Normal later restarts
     # preserve the existing startup-ready behavior.
-    hermes_home = Path(os.getenv("HERMES_HOME", "/opt/data")).expanduser()
+    hermes_home = Path(
+        os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))
+    ).expanduser()
     suppress_once = hermes_home / ".hermes" / "wechat-enhance" / "suppress-startup-ready-once"
     if suppress_once.exists():
         try:
@@ -83,7 +96,10 @@ async def _send_startup_ready(context: dict):
         return
 
     ready = os.getenv("HERMES_WEIXIN_STARTUP_READY_NOTIFY", "").strip()
-    if not ready or ready == "1":
+    if not ready:
+        log.info("Hermes WeChat Enhance: startup ready notification not configured")
+        return
+    if ready == "1":
         ready = "♻️ Gateway online — Hermes is back and ready."
     if ready.lower() in {"0", "false", "no", "off", "disabled"}:
         log.warning("Hermes WeChat Enhance: startup ready notification disabled")

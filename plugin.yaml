@@ -1,0 +1,23 @@
+name: hermes-wechat-enhance
+version: 2.0.0
+manifest_version: 1
+api_version: 1
+description: Production operations, audit capture, and migration support for Hermes Weixin.
+author: Awenforever
+license: MIT
+homepage: https://github.com/Awenforever/hermes-wechat-enhance
+tags: [gateway, weixin, operations, audit]
+requires_hermes: ">=0.21.3,<0.22"
+config_schema:
+  capture_messages:
+    type: bool
+    default: true
+    description: Store a bounded local audit copy of inbound and outbound messages.
+  startup_notification:
+    type: bool
+    default: false
+    description: Send an explicit ready notice after gateway startup.
+  legacy_runtime_compat:
+    type: bool
+    default: false
+    description: Enable the v0.18 compatibility shim; never enable on Hermes v0.21.

@@ -84,5 +84,5 @@ bash /opt/data/skills/hermes-wechat-enhance/scripts/install.sh
 ## 原则
 
 - **不碰生产** — 一切在 `/tmp/` 下
-- **不留痕迹** — 测试完 `rm -rf /tmp/hermes-audit-test/`
+- **不留痕迹** — 测试目录由隔离环境的生命周期管理器回收
 - **验证编译 + 运行** — 不只是存在性检查

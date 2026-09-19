@@ -15,7 +15,13 @@ class MessageStore:
     """Append-only JSONL message store used by Hermes hook handlers."""
 
     def __init__(self, base_dir: Optional[os.PathLike[str] | str] = None) -> None:
-        root = Path(base_dir).expanduser() if base_dir else Path.home() / ".hermes" / "wechat_enhance"
+        if base_dir:
+            root = Path(base_dir).expanduser()
+        else:
+            hermes_home = Path(
+                os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+            ).expanduser()
+            root = hermes_home / "plugin-data" / "hermes-wechat-enhance" / "audit"
         self.base_dir = root
         self.messages_path = root / "messages.jsonl"
         self.pending_path = root / "pending.jsonl"
