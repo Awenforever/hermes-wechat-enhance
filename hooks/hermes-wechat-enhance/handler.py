@@ -46,6 +46,10 @@ if str(_SKILL_DIR) not in sys.path:
 
 from hermes_wechat_enhance.current_official_runtime_compat import install_weixin_runtime_compat_hook
 from hermes_wechat_enhance.store import MessageStore
+from hermes_wechat_enhance.v021_bubble_footer import (
+    install_v021_bubble_footer_hook,
+    register_turn_model,
+)
 
 _store = MessageStore()
 
@@ -56,12 +60,15 @@ async def handle(event_type, context):
         legacy_compat = os.getenv("HERMES_WECHAT_ENABLE_LEGACY_RUNTIME_COMPAT", "").strip().lower()
         if legacy_compat in {"1", "true", "yes", "on"}:
             await install_weixin_runtime_compat_hook(context)
+        else:
+            await install_v021_bubble_footer_hook(context)
         await _send_startup_ready(context)
         return
     if event_type == "agent:start":
         if _audit_enabled():
             _store.append_inbound(context)
     elif event_type == "agent:end":
+        register_turn_model(context)
         if _audit_enabled():
             _store.append_outbound(context)
     return None

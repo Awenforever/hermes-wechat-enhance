@@ -1,8 +1,8 @@
 name: hermes-wechat-enhance
-version: 2.0.0
+version: 2.0.1
 manifest_version: 1
 api_version: 1
-description: Production operations, audit capture, and migration support for Hermes Weixin.
+description: Reliable Weixin delivery, acknowledged bubble counters, model tags, audit, and migration support.
 author: Awenforever
 license: MIT
 homepage: https://github.com/Awenforever/hermes-wechat-enhance

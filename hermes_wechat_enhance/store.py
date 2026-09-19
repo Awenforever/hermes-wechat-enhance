@@ -209,4 +209,6 @@ class MessageStore:
             return str(metadata.get("model_name"))
         if context.get("model_name"):
             return str(context.get("model_name"))
+        if context.get("model"):
+            return str(context.get("model"))
         return ""

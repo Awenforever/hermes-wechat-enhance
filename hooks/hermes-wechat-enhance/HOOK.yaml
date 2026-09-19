@@ -1,7 +1,7 @@
 name: hermes-wechat-enhance
-version: "1.0"
+version: "1.1"
 events:
   - gateway:startup
   - agent:start
   - agent:end
-description: "Hermes WeChat enhancement hook: startup ready notification and message capture"
+description: "Hermes WeChat enhancement hook: bubble counters, model tags, startup notification, and audit"
