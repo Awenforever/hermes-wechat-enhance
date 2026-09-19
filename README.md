@@ -35,6 +35,14 @@ hermes wechat-enhance status
 
 安装插件不会要求重新扫码或配对；微信会话凭据仍由 Hermes 自己管理。
 
+同时安装整套生产插件，可让 Hermes 打开并安装：
+
+```text
+https://raw.githubusercontent.com/Awenforever/hermes-wechat-enhance/main/hermes-pack.yaml
+```
+
+该清单固定到已验收的提交；Hermes 仍会显示审核与授权界面，不会代替用户授予权限。
+
 ## 从 Hermes v0.18 迁移
 
 升级前先备份 `HERMES_HOME`，然后运行：
