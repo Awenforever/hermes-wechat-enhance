@@ -63,16 +63,6 @@ https://raw.githubusercontent.com/Awenforever/hermes-wechat-enhance/main/hermes-
 
 该清单固定到已验收的提交；Hermes 仍会显示审核与授权界面，不会代替用户授予权限。
 
-审核安装完成后，让 Hermes 按用户实际情况引导配置。全新 profile 的最小示例：
-
-```bash
-hermes wechat-enhance bootstrap-pack \
-  --email-to you@example.com \
-  --keyword "your research topic"
-```
-
-引导会安装三个 Gateway 运行时、初始化或迁移 Weekly Briefing，并创建邮件专用计划任务；不会静默启用 Alive 或 Email Watchdog。邮箱授权应先生成并审核 onboarding JSON，再追加 `--email-onboarding-json @setup.json --enable-email-watchdog`；主动消息只有显式追加 `--enable-alive` 才会开启。全部状态确认后只需重启一次 Gateway。
-
 ## 从 Hermes v0.18 迁移
 
 升级前先备份 `HERMES_HOME`，然后运行：
