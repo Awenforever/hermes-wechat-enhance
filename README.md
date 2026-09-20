@@ -7,7 +7,10 @@ Hermes 微信通道的可靠性扩展。它在 Hermes v0.21 原生可靠投递�
 - 每个文本气泡显示当前 Context Token 下的计数和该轮实际模型，例如 `` `3` `qwen3.6-chat` ``。
 - 只有微信发送成功后才提交计数；失败重试不会提前消耗编号。
 - Context Token 变化后计数从 1 重新开始；长回复分片按实际气泡逐个计数。
-- 使用 Hermes v0.21 原生 FIFO、投递凭据、重试和恢复机制，不维护第二套竞争队列。
+- 为微信物理气泡维护独立的持久 FIFO；只有平台确认成功后才出队，Gateway 重启后仍可恢复。
+- 支持静默 `/continue`：新 Context Token 到达后按原顺序继续出队，不把命令交给 Agent。
+- 文本、附件、图片、视频和语音共同遵守每个 Context Token 最多 10 个气泡的限制。
+- Gateway 正常启动后发送一次带 `` `hermes` `` 标签的就绪通知，可显式关闭。
 - 可保存有界的本地收发审计记录。
 - 迁移旧版积压时只归档、不补发历史消息。
 
@@ -43,6 +46,13 @@ hermes wechat-enhance install-hook
 hermes wechat-enhance status
 ```
 
+查看积压（不显示正文）或在自动备份后清空：
+
+```bash
+hermes wechat-enhance queue-list
+hermes wechat-enhance queue-clear --yes
+```
+
 安装插件不会要求重新扫码或配对；微信会话凭据仍由 Hermes 自己管理。
 
 同时安装整套生产插件，可让 Hermes 打开并安装：
@@ -68,7 +78,7 @@ hermes wechat-enhance migrate-v018
 | 选项 | 默认值 | 作用 |
 |---|---:|---|
 | `capture_messages` | `true` | 保存有界的本地消息审计副本 |
-| `startup_notification` | `false` | Gateway 启动后发送就绪提示 |
+| `startup_notification` | `true` | Gateway 启动后发送就绪提示；显式设为 `false` 可关闭 |
 | `legacy_runtime_compat` | `false` | 仅用于 v0.18 兼容；v0.21 不应开启 |
 
 配置和状态位于当前 Hermes profile 的 `plugins/`、`hooks/`、`plugin-data/` 目录中，不修改 Hermes Core 源码。

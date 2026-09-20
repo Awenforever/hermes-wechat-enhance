@@ -54,11 +54,45 @@ from hermes_wechat_enhance.v021_bubble_footer import (
 _store = MessageStore()
 
 
+def _plugin_config_value(name: str, default):
+    """Read the v0.21 plugin setting without requiring plugin runtime context."""
+    hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    candidates = []
+    explicit = os.getenv("HERMES_CONFIG", "").strip()
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    candidates.extend((hermes_home / "config.yaml", hermes_home / ".hermes" / "config.yaml"))
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            import yaml
+
+            config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            entry = (((config.get("plugins") or {}).get("entries") or {}).get("hermes-wechat-enhance") or {})
+            for container in (entry.get("settings"), entry.get("config"), entry):
+                if isinstance(container, dict) and name in container:
+                    return container[name]
+        except Exception:
+            continue
+    return default
+
+
+def _bool_setting(name: str, env_name: str, default: bool) -> bool:
+    raw = os.getenv(env_name)
+    if raw is None:
+        raw = _plugin_config_value(name, default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
 async def handle(event_type, context):
     # WECHAT_ENHANCE_STARTUP_READY_OWNER_V1
     if event_type == "gateway:startup":
-        legacy_compat = os.getenv("HERMES_WECHAT_ENABLE_LEGACY_RUNTIME_COMPAT", "").strip().lower()
-        if legacy_compat in {"1", "true", "yes", "on"}:
+        if _bool_setting(
+            "legacy_runtime_compat", "HERMES_WECHAT_ENABLE_LEGACY_RUNTIME_COMPAT", False
+        ):
             await install_weixin_runtime_compat_hook(context)
         else:
             await install_v021_bubble_footer_hook(context)
@@ -75,8 +109,7 @@ async def handle(event_type, context):
 
 
 def _audit_enabled() -> bool:
-    value = os.getenv("HERMES_WECHAT_CAPTURE_MESSAGES", "1").strip().lower()
-    return value not in {"0", "false", "no", "off", "disabled"}
+    return _bool_setting("capture_messages", "HERMES_WECHAT_CAPTURE_MESSAGES", True)
 
 
 # WECHAT_ENHANCE_STARTUP_READY_OWNER_V1
@@ -102,11 +135,17 @@ async def _send_startup_ready(context: dict):
         log.warning("Hermes WeChat Enhance: startup ready notification suppressed once for controlled deployment")
         return
 
-    ready = os.getenv("HERMES_WEIXIN_STARTUP_READY_NOTIFY", "").strip()
-    if not ready:
-        log.info("Hermes WeChat Enhance: startup ready notification not configured")
-        return
-    if ready == "1":
+    ready_env = os.getenv("HERMES_WEIXIN_STARTUP_READY_NOTIFY")
+    ready = ready_env.strip() if ready_env is not None else _plugin_config_value(
+        "startup_notification", True
+    )
+    if isinstance(ready, bool):
+        if not ready:
+            log.warning("Hermes WeChat Enhance: startup ready notification disabled")
+            return
+        ready = "1"
+    ready = str(ready).strip()
+    if not ready or ready == "1":
         ready = "♻️ Gateway online — Hermes is back and ready."
     if ready.lower() in {"0", "false", "no", "off", "disabled"}:
         log.warning("Hermes WeChat Enhance: startup ready notification disabled")

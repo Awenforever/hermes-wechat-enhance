@@ -25,6 +25,9 @@ class Tokens:
     def get(self, _account, _chat):
         return self.value
 
+    async def set(self, _account, _chat, value):
+        self.value = value
+
 
 class FakeAdapter:
     name = "weixin"
@@ -33,9 +36,27 @@ class FakeAdapter:
     def __init__(self):
         self._account_id = "account"
         self._token_store = Tokens()
+        self._send_session = object()
+        self._token = "token"
         self._split_multiline_messages = False
         self.sent = []
         self.fail_next = False
+        self.processed = []
+
+    async def _send_file(self, chat_id, path, caption, force_file_attachment=False):
+        return "media-id"
+
+    async def send_document(self, chat_id, file_path, caption=None, **kwargs):
+        return Result(True)
+
+    async def send_video(self, chat_id, video_path, caption=None, **kwargs):
+        return Result(True)
+
+    async def send_voice(self, chat_id, audio_path, caption=None, **kwargs):
+        return Result(True)
+
+    async def _process_message(self, message):
+        self.processed.append(message)
 
     def _split_text(self, content):
         width = self.MAX_MESSAGE_LENGTH
@@ -67,12 +88,29 @@ async def main():
         from hermes_wechat_enhance.v021_bubble_footer import (
             install_v021_bubble_footer_hook,
             patch_adapter,
+            patch_gateway_runner,
             register_turn_model,
         )
+
+        class Source:
+            platform = "weixin"
+            chat_id = "route-peer"
+
+        class Runner:
+            def _resolve_session_agent_runtime(self, *, source):
+                return "qwen3.6-chat", {"provider": "custom"}
+
+        runner = Runner()
+        assert patch_gateway_runner(runner)
+        assert runner._resolve_session_agent_runtime(source=Source())[0] == "qwen3.6-chat"
 
         adapter = FakeAdapter()
         assert patch_adapter(adapter) is True
         assert patch_adapter(adapter) is False
+
+        result = await adapter.send("route-peer", "routed before agent:end")
+        assert result.success
+        assert adapter.sent[-1][1].endswith("`1` `qwen3.6-chat`")
 
         register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
         result = await adapter.send("peer", "first")
@@ -105,7 +143,9 @@ async def main():
         assert not result.success
         result = await adapter.send("peer", "retry")
         assert result.success
-        assert adapter.sent[-1][1].endswith("`1` `qwen3.6-chat`")
+        assert adapter.sent[-2][1].startswith("will fail")
+        assert adapter.sent[-2][1].endswith("`1` `qwen3.6-chat`")
+        assert adapter.sent[-1][1].endswith("`2` `qwen3.6-chat`")
 
         adapter._token_store.value = "token-d"
         register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
@@ -118,6 +158,30 @@ async def main():
         assert bubbles[1][1].endswith("`2` `qwen3.6-chat`")
         assert bubbles[-1][1].endswith(f"`{len(bubbles)}` `qwen3.6-chat`")
         assert all(len(item[1]) <= adapter.MAX_MESSAGE_LENGTH for item in bubbles)
+
+        # Ten physical bubbles per context; overflow remains durable and FIFO.
+        adapter._token_store.value = "token-e"
+        register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
+        before = len(adapter.sent)
+        for index in range(12):
+            result = await adapter.send(
+                "peer", f"queued-{index}", metadata={"_delivery_id": f"delivery-{index}"}
+            )
+            assert result.success
+        assert len(adapter.sent) - before == 10
+        assert adapter._hermes_wechat_runtime_v2.pending_count("account", "peer") == 2
+
+        # /continue refreshes the token, drains in FIFO order, and never reaches the agent.
+        await adapter._process_message({
+            "from_user_id": "peer", "message_id": "continue-1", "context_token": "token-f",
+            "item_list": [{"type": 1, "text": "/continue", "text_item": {"text": "/continue"}}],
+        })
+        assert adapter.processed == []
+        assert adapter._hermes_wechat_runtime_v2.pending_count("account", "peer") == 0
+        assert adapter.sent[-2][1].startswith("queued-10")
+        assert adapter.sent[-1][1].startswith("queued-11")
+        assert adapter.sent[-2][1].endswith("`1` `qwen3.6-chat`")
+        assert adapter.sent[-1][1].endswith("`2` `qwen3.6-chat`")
 
         print("V021_BUBBLE_FOOTER_TEST_OK")
 

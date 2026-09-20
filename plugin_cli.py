@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
+import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,7 +33,11 @@ def _hook_backup_root() -> Path:
 
 def register_cli(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="wechat_enhance_action")
-    actions.add_parser("status", help="Show install and legacy-queue status")
+    actions.add_parser("status", help="Show install, budget, and durable queue status")
+    queue_list = actions.add_parser("queue-list", help="List pending deliveries without message content")
+    queue_list.add_argument("--limit", type=int, default=100)
+    queue_clear = actions.add_parser("queue-clear", help="Back up then clear pending deliveries")
+    queue_clear.add_argument("--yes", action="store_true")
     actions.add_parser("install-hook", help="Install or refresh the profile-scoped gateway hook")
     migrate = actions.add_parser("migrate-v018", help="Archive and retire v0.18 queued messages")
     migrate.add_argument("--queue-file", default=None, help="Legacy queue JSON path")
@@ -60,6 +67,72 @@ def _legacy_queue_path(explicit: str | None = None) -> Path:
     if configured:
         return Path(configured).expanduser()
     return _hermes_home() / "weixin_budget" / "message_send_queue.json"
+
+
+def _runtime_db_path() -> Path:
+    configured = os.environ.get("HERMES_WECHAT_ENHANCE_RUNTIME_DB", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return _hermes_home() / "plugin-data" / "hermes-wechat-enhance" / "runtime.sqlite3"
+
+
+def _runtime_status(path: Path) -> dict:
+    if not path.is_file():
+        return {"database": str(path), "exists": False, "pending": 0, "chats": 0, "budgets": 0}
+    uri = path.resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=10.0)) as conn:
+        pending, chats = conn.execute(
+            "SELECT COUNT(*),COUNT(DISTINCT chat_key) FROM outbound_queue WHERE state='queued'"
+        ).fetchone()
+        budgets = conn.execute("SELECT COUNT(*) FROM budgets").fetchone()[0]
+        oldest = conn.execute(
+            "SELECT MIN(created_at) FROM outbound_queue WHERE state='queued'"
+        ).fetchone()[0]
+    return {
+        "database": str(path), "exists": True, "pending": int(pending or 0),
+        "chats": int(chats or 0), "budgets": int(budgets or 0), "oldest_created_at": oldest,
+    }
+
+
+def _runtime_queue_list(path: Path, limit: int) -> int:
+    if not path.is_file():
+        print(json.dumps({"ok": True, "database": str(path), "items": []}, indent=2))
+        return 0
+    uri = path.resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=10.0)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT seq,chat_key,delivery_id,chunk_index,model_name,created_at,expires_at,"
+            "LENGTH(content) AS content_chars,last_error FROM outbound_queue "
+            "WHERE state='queued' ORDER BY seq LIMIT ?",
+            (max(1, min(int(limit), 1000)),),
+        ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["chat"] = str(item.pop("chat_key"))[:12]
+        item["delivery"] = hashlib.sha256(str(item.pop("delivery_id")).encode()).hexdigest()[:12]
+        items.append(item)
+    print(json.dumps({"ok": True, "database": str(path), "items": items}, indent=2))
+    return 0
+
+
+def _runtime_queue_clear(path: Path, confirmed: bool) -> int:
+    if not confirmed:
+        raise SystemExit("queue-clear requires --yes")
+    if not path.is_file():
+        print(json.dumps({"ok": True, "database": str(path), "cleared": 0, "backup": None}))
+        return 0
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = _hermes_home() / "plugin-data" / "hermes-wechat-enhance" / "queue-backups" / f"runtime.{stamp}.sqlite3"
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(str(path), timeout=10.0)) as source, closing(sqlite3.connect(str(backup))) as target:
+        source.backup(target)
+        cursor = source.execute("DELETE FROM outbound_queue WHERE state='queued'")
+        cleared = cursor.rowcount
+        source.commit()
+    print(json.dumps({"ok": True, "database": str(path), "cleared": cleared, "backup": str(backup)}))
+    return 0
 
 
 def _install_hook() -> int:
@@ -118,6 +191,10 @@ def wechat_enhance_command(args: argparse.Namespace) -> int:
         return _install_hook()
     if action == "migrate-v018":
         return _migrate(_legacy_queue_path(getattr(args, "queue_file", None)))
+    if action == "queue-list":
+        return _runtime_queue_list(_runtime_db_path(), getattr(args, "limit", 100))
+    if action == "queue-clear":
+        return _runtime_queue_clear(_runtime_db_path(), bool(getattr(args, "yes", False)))
     if action in {None, "status"}:
         queue = _legacy_queue_path()
         print(
@@ -129,6 +206,7 @@ def wechat_enhance_command(args: argparse.Namespace) -> int:
                     "legacy_queue": str(queue),
                     "legacy_queue_entries": _read_queue_count(queue),
                     "v021_native_context_tokens": True,
+                    "v021_reliable_delivery": _runtime_status(_runtime_db_path()),
                 },
                 indent=2,
             )

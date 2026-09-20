@@ -12,10 +12,10 @@ from pathlib import Path
 
 
 def default_db() -> Path:
-    configured = os.getenv("HERMES_WEIXIN_QUEUE_DB", "").strip()
+    configured = os.getenv("HERMES_WECHAT_ENHANCE_RUNTIME_DB", "").strip()
     if configured:
         return Path(configured)
-    return Path(os.getenv("HERMES_HOME", "/opt/data")) / "weixin" / "send-queue.sqlite3"
+    return Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))) / "plugin-data" / "hermes-wechat-enhance" / "runtime.sqlite3"
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -26,16 +26,16 @@ def connect(path: Path) -> sqlite3.Connection:
 
 def status(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
-        "SELECT status, COUNT(*) AS count, MIN(enqueued_at) AS oldest, "
-        "MAX(enqueued_at) AS newest FROM outbound_queue GROUP BY status"
+        "SELECT state, COUNT(*) AS count, MIN(created_at) AS oldest, "
+        "MAX(created_at) AS newest FROM outbound_queue GROUP BY state"
     ).fetchall()
     print(json.dumps([dict(row) for row in rows], ensure_ascii=False, indent=2))
 
 
 def list_items(conn: sqlite3.Connection, limit: int) -> None:
     rows = conn.execute(
-        "SELECT seq,account_id,user_id,delivery_id,chunk_index,enqueued_at,"
-        "expires_at,status,LENGTH(content) AS content_chars "
+        "SELECT seq,substr(chat_key,1,12) AS chat,model_name,chunk_index,created_at,"
+        "expires_at,state,LENGTH(content) AS content_chars,last_error "
         "FROM outbound_queue ORDER BY seq LIMIT ?",
         (limit,),
     ).fetchall()
@@ -56,8 +56,7 @@ def export_items(conn: sqlite3.Connection, output: Path) -> None:
 
 def expire_due(conn: sqlite3.Connection) -> None:
     cursor = conn.execute(
-        "UPDATE outbound_queue SET status='expired' "
-        "WHERE status='queued' AND expires_at <= ?",
+        "DELETE FROM outbound_queue WHERE state='queued' AND expires_at <= ?",
         (time.time(),),
     )
     conn.commit()
@@ -67,12 +66,12 @@ def expire_due(conn: sqlite3.Connection) -> None:
 def clear_pending(conn: sqlite3.Connection, confirmed: bool) -> None:
     if not confirmed:
         raise SystemExit("clear-pending requires --yes")
-    cursor = conn.execute(
-        "UPDATE outbound_queue SET status='discarded' "
-        "WHERE status='queued'"
-    )
+    backup = Path(str(conn.execute("PRAGMA database_list").fetchone()[2]) + f".backup-{int(time.time())}")
+    with sqlite3.connect(str(backup)) as target:
+        conn.backup(target)
+    cursor = conn.execute("DELETE FROM outbound_queue WHERE state='queued'")
     conn.commit()
-    print(f"discarded={cursor.rowcount}")
+    print(f"cleared={cursor.rowcount} backup={backup}")
 
 
 def main() -> int:

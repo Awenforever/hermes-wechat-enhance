@@ -145,6 +145,10 @@ PY
 
   # HERMES_WECHAT_VERSION_FROM_VERIFIED_SOURCE_PROFILE_V1
   case "$source_profile" in
+    native-v021)
+      echo "v0.21.3-inferred-native-v021"
+      return
+      ;;
     pristine-v018|legacy-v018|hardened-v018|current-official-v018)
       echo "v2026.7.1-inferred-$source_profile"
       return
@@ -162,6 +166,9 @@ normalize_version_family() {
   # Hermes v0.18.0 is released under the calendar tag v2026.7.1. Runtime
   # package metadata may legitimately expose either identifier.
   case "$version" in
+    v0.21.3*|0.21.3*)
+      echo "v0.21.3"
+      ;;
     v2026.7.1*|2026.7.1*|v0.18|v0.18.0|0.18|0.18.0)
       echo "v2026.7.1"
       ;;
@@ -174,7 +181,7 @@ normalize_version_family() {
 
 is_supported_version() {
   local version_family="$1"
-  [ "$version_family" = "v2026.7.1" ]
+  [ "$version_family" = "v2026.7.1" ] || [ "$version_family" = "v0.21.3" ]
 }
 
 
@@ -184,6 +191,20 @@ detect_source_profile() {
 
   local digest
   digest="$(sha256sum "$weixin" | awk '{print $1}')"
+
+  # Hermes v0.21 keeps ContextTokenStore and direct send primitives in core;
+  # this plugin adds the v0.18 delivery contract at runtime and never edits
+  # gateway source. Structural recognition is therefore safe across v0.21.3
+  # rebuilds and downstream image packaging changes.
+  if grep -q "class ContextTokenStore" "$weixin" \
+     && grep -q "async def _send_text_chunk" "$weixin" \
+     && grep -q "async def _process_message" "$weixin" \
+     && [ -f "$GATEWAY_SRC/gateway/run_turn.py" ] \
+     && grep -q "def _resolve_session_agent_runtime" "$GATEWAY_SRC/gateway/run_turn.py"
+  then
+    echo "native-v021"
+    return
+  fi
 
   if [ "$digest" = "$CURRENT_OFFICIAL_V018_WEIXIN_SHA256" ]; then
     echo "current-official-v018"
@@ -495,6 +516,13 @@ verify_install() {
   HERMES_HOME="$HERMES_HOME_DIR" HOME="${HOME:-/opt/data/.hermes-home}" python3 "$SKILL_DIR/scripts/verify-self-install.py"
 }
 
+verify_v021_install() {
+  HERMES_HOME="$HERMES_HOME_DIR" \
+    HERMES_GATEWAY_SRC="$GATEWAY_SRC" \
+    HOME="${HOME:-/opt/data/.hermes-home}" \
+    python3 "$SKILL_DIR/scripts/verify-v021-install.py"
+}
+
 main() {
   log "=== Hermes WeChat Enhance Installer ==="
   log "SKILL_DIR=$SKILL_DIR"
@@ -519,6 +547,9 @@ main() {
   source_profile="$(detect_source_profile)"
   version="$(detect_version "$source_profile" | tail -1)"
   version_family="$(normalize_version_family "$version")"
+  if [ "$source_profile" = "native-v021" ]; then
+    version_family="v0.21.3"
+  fi
 
   log "SOURCE_PROFILE=$source_profile"
   log "VERSION=$version"
@@ -528,7 +559,21 @@ main() {
     *)            log "VERSION_SOURCE=external-metadata" ;;
   esac
 
-  is_supported_version "$version_family" ||     die "Unsupported Hermes version: $version; normalized family=$version_family; accepted family=v2026.7.1"
+  is_supported_version "$version_family" || \
+    die "Unsupported Hermes version: $version; normalized family=$version_family; accepted families=v0.21.3,v2026.7.1"
+
+  if [ "$version_family" = "v0.21.3" ]; then
+    [ "$source_profile" = "native-v021" ] || die "Hermes v0.21 requires native-v021 source profile"
+    log "CORE_MUTATION=none"
+    install_hooks
+    fault_inject after-hook-install
+    verify_v021_install
+    fault_inject after-verification
+    install_state record-installed
+    INSTALL_STATE_ACTIVE=0
+    log "INSTALL_OK profile=native-v021"
+    return
+  fi
 
   patch_dir="$(find_patch_dir "$version_family")"
   [ -n "$patch_dir" ] || die "No matching patch set found"

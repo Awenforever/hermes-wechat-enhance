@@ -1,5 +1,5 @@
 name: hermes-wechat-enhance
-version: 2.0.1
+version: 2.1.0
 manifest_version: 1
 api_version: 1
 description: Reliable Weixin delivery, acknowledged bubble counters, model tags, audit, and migration support.
@@ -15,7 +15,7 @@ config_schema:
     description: Store a bounded local audit copy of inbound and outbound messages.
   startup_notification:
     type: bool
-    default: false
+    default: true
     description: Send an explicit ready notice after gateway startup.
   legacy_runtime_compat:
     type: bool
