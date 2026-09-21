@@ -30,6 +30,8 @@ FOOTER_RESERVE = 160
 MAX_BUBBLES_PER_CONTEXT = 10
 QUEUE_CAPACITY_PER_CHAT = 500
 DEFAULT_QUEUE_TTL_SECONDS = 72 * 3600
+DEFAULT_RETRY_INITIAL_SECONDS = 31.0
+DEFAULT_RETRY_MAX_SECONDS = 300.0
 
 _SEND_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
     "hermes_wechat_v021_send_context", default=None
@@ -412,6 +414,65 @@ def patch_adapter(adapter: Any) -> bool:
     runtime = DurableRuntime(_runtime_db_path())
     locks: Dict[str, asyncio.Lock] = {}
     continue_seen: Dict[str, float] = {}
+    retry_tasks: Dict[str, asyncio.Task] = {}
+
+    def schedule_retry(_self: Any, chat_id: str) -> None:
+        """Retry retained provider failures without waiting for another user turn."""
+        key = str(chat_id)
+        existing = retry_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        try:
+            initial = max(
+                0.01,
+                float(os.getenv("HERMES_WECHAT_RETRY_INITIAL_SECONDS", DEFAULT_RETRY_INITIAL_SECONDS)),
+            )
+            maximum = max(
+                initial,
+                float(os.getenv("HERMES_WECHAT_RETRY_MAX_SECONDS", DEFAULT_RETRY_MAX_SECONDS)),
+            )
+        except (TypeError, ValueError):
+            initial, maximum = DEFAULT_RETRY_INITIAL_SECONDS, DEFAULT_RETRY_MAX_SECONDS
+
+        async def worker() -> None:
+            delay = initial
+            while runtime.pending_count(str(getattr(_self, "_account_id", "")), key):
+                await asyncio.sleep(delay)
+                current_token = _self._token_store.get(_self._account_id, key)
+                count, _fingerprint = runtime.snapshot(_self._account_id, key, current_token)
+                if count >= MAX_BUBBLES_PER_CONTEXT:
+                    logger.info(
+                        "Hermes WeChat Enhance: automatic retry paused at context budget for chat=%s",
+                        hashlib.sha256(key.encode()).hexdigest()[:10],
+                    )
+                    return
+                sent = await drain_pending(_self, key, raise_on_error=False)
+                remaining = runtime.pending_count(str(getattr(_self, "_account_id", "")), key)
+                if not remaining:
+                    logger.warning(
+                        "Hermes WeChat Enhance: automatic retry delivered retained queue to chat=%s",
+                        hashlib.sha256(key.encode()).hexdigest()[:10],
+                    )
+                    return
+                delay = initial if sent else min(maximum, delay * 2)
+
+        task = asyncio.create_task(
+            worker(),
+            name=f"hermes-wechat-retry-{hashlib.sha256(key.encode()).hexdigest()[:10]}",
+        )
+        retry_tasks[key] = task
+
+        def cleanup(done: asyncio.Task) -> None:
+            if retry_tasks.get(key) is done:
+                retry_tasks.pop(key, None)
+            if not done.cancelled() and done.exception() is not None:
+                exc = done.exception()
+                logger.error(
+                    "Hermes WeChat Enhance: automatic retry task failed",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(cleanup)
 
     def split_text(_self: Any, content: str):
         limit = max(1, int(getattr(_self, "MAX_MESSAGE_LENGTH", 2000)) - FOOTER_RESERVE)
@@ -447,6 +508,7 @@ def patch_adapter(adapter: Any) -> bool:
                 except Exception as exc:
                     runtime.mark_error(int(row["seq"]), exc)
                     logger.warning("Hermes WeChat Enhance: queued send retained after provider failure: %s", exc)
+                    schedule_retry(_self, str(chat_id))
                     if raise_on_error:
                         raise
                     break
@@ -612,6 +674,7 @@ def patch_adapter(adapter: Any) -> bool:
     adapter.send_voice = MethodType(send_voice, adapter)
     adapter._process_message = MethodType(process_message, adapter)
     adapter._hermes_wechat_drain_pending_v2 = MethodType(drain_pending, adapter)
+    adapter._hermes_wechat_retry_tasks_v2 = retry_tasks
     adapter._hermes_wechat_runtime_v2 = runtime
     adapter._hermes_wechat_v021_reliable_delivery_v2 = True
     adapter._hermes_wechat_v021_bubble_footer_v1 = True

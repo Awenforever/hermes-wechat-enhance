@@ -147,6 +147,24 @@ async def main():
         assert adapter.sent[-2][1].endswith("`1` `qwen3.6-chat`")
         assert adapter.sent[-1][1].endswith("`2` `qwen3.6-chat`")
 
+        # A transient provider failure retries itself; no new inbound message is required.
+        os.environ["HERMES_WECHAT_RETRY_INITIAL_SECONDS"] = "0.01"
+        os.environ["HERMES_WECHAT_RETRY_MAX_SECONDS"] = "0.02"
+        automatic = FakeAdapter()
+        automatic._token_store.value = "token-auto"
+        assert patch_adapter(automatic) is True
+        automatic.fail_next = True
+        result = await automatic.send(
+            "auto-peer", "automatic retry", metadata={"_delivery_id": "automatic-retry"}
+        )
+        assert not result.success
+        await asyncio.sleep(0.08)
+        assert automatic._hermes_wechat_runtime_v2.pending_count("account", "auto-peer") == 0
+        assert automatic.sent[-1][1].startswith("automatic retry")
+        assert automatic.sent[-1][1].endswith("`1` `hermes`")
+        os.environ.pop("HERMES_WECHAT_RETRY_INITIAL_SECONDS", None)
+        os.environ.pop("HERMES_WECHAT_RETRY_MAX_SECONDS", None)
+
         adapter._token_store.value = "token-d"
         register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
         before = len(adapter.sent)
