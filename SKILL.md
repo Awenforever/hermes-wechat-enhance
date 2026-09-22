@@ -7,7 +7,7 @@ Hermes v0.21 微信可靠投递扩展。当前实现通过 profile 级 Hook 在�
 - 每个成功发送的物理气泡附加计数和真实模型名，例如 `` `3` `qwen3.6-chat` ``；系统消息标记为 `hermes`。
 - Context Token 内最多发送 10 个气泡；计数只在微信平台确认成功后提交。
 - 超出预算的文本分片进入 SQLite 持久 FIFO，Gateway 重启后仍保留。
-- `/continue` 在 Weixin Adapter 入站边界被静默截获，刷新 Token 后严格按 FIFO 继续发送，不进入 Agent 上下文。
+- `/continue` 在 Weixin Adapter 入站边界被静默截获，并作为去重规则的 slash command 例外；刷新 Token 后严格按 FIFO 继续发送，不进入 Agent 上下文。
 - 附件、图片、视频、语音与文本共用气泡预算；带说明的媒体先发送带尾注的说明气泡。
 - Gateway 启动就绪通知默认开启，可通过 `HERMES_WEIXIN_STARTUP_READY_NOTIFY=false` 关闭。
 - 提供状态、无正文队列查看、备份后清空和 v0.18 积压归档命令。

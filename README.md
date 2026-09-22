@@ -8,7 +8,7 @@ Hermes 微信通道的可靠性扩展。它在 Hermes v0.21 原生可靠投递�
 - 只有微信发送成功后才提交计数；失败重试不会提前消耗编号。
 - Context Token 变化后计数从 1 重新开始；长回复分片按实际气泡逐个计数。
 - 为微信物理气泡维护独立的持久 FIFO；只有平台确认成功后才出队，Gateway 重启后仍可恢复。
-- 支持静默 `/continue`：新 Context Token 到达后按原顺序继续出队，不把命令交给 Agent。
+- 支持静默 `/continue`：它是去重规则中的 slash command 例外；新 Context Token 到达后按原顺序继续出队，不把命令交给 Agent。
 - 文本、附件、图片、视频和语音共同遵守每个 Context Token 最多 10 个气泡的限制。
 - Gateway 正常启动后发送一次带 `` `hermes` `` 标签的就绪通知，可显式关闭。
 - 可保存有界的本地收发审计记录。
