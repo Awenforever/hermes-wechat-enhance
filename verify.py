@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from textwrap import dedent
 
-PATCH_DIR = Path("/opt/data/skills/hermes-wechat-enhance/patches")
+PATCH_DIR = Path(
+    os.environ.get(
+        "HERMES_WECHAT_ENHANCE_PATCH_DIR",
+        str(Path(__file__).resolve().parent / "patches"),
+    )
+)
 SCORE = {"pass": 0, "fail": 0}
 ERRORS: List[str] = []
 

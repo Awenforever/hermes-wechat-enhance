@@ -1,5 +1,5 @@
 name: hermes-wechat-enhance
-version: 2.0.1
+version: 2.0.2
 manifest_version: 1
 api_version: 1
 description: Reliable Weixin delivery, acknowledged bubble counters, model tags, audit, and migration support.

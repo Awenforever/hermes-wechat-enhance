@@ -4,7 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GATEWAY_SRC="${HERMES_GATEWAY_SRC:-/opt/hermes}"
-HERMES_HOME_DIR="${HERMES_HOME:-/opt/data}"
+HERMES_HOME_DIR="${HERMES_HOME:-${HOME}/.hermes}"
 HOOKS_DIR="${HERMES_HOOKS_DIR:-${HERMES_HOME_DIR}/hooks}"
 HOOK_DST="$HOOKS_DIR/hermes-wechat-enhance"
 SOURCE_ROOT="${HERMES_SKILLS_DIR:-${HERMES_HOME_DIR}/skills}"

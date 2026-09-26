@@ -15,7 +15,7 @@ def default_db() -> Path:
     configured = os.getenv("HERMES_WEIXIN_QUEUE_DB", "").strip()
     if configured:
         return Path(configured)
-    return Path(os.getenv("HERMES_HOME", "/opt/data")) / "weixin" / "send-queue.sqlite3"
+    return Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))) / "weixin" / "send-queue.sqlite3"
 
 
 def connect(path: Path) -> sqlite3.Connection:

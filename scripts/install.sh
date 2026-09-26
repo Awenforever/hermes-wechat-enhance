@@ -4,7 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GATEWAY_SRC="${HERMES_GATEWAY_SRC:-/opt/hermes}"
-HERMES_HOME_DIR="${HERMES_HOME:-/opt/data}"
+HERMES_HOME_DIR="${HERMES_HOME:-${HOME}/.hermes}"
 HOOKS_DIR="${HERMES_HOOKS_DIR:-${HERMES_HOME_DIR}/hooks}"
 HOOK_MODE="${HERMES_WECHAT_ENHANCE_HOOK_MODE:-copy}"
 
@@ -492,7 +492,7 @@ install_hooks() {
 }
 
 verify_install() {
-  HERMES_HOME="$HERMES_HOME_DIR" HOME="${HOME:-/opt/data/.hermes-home}" python3 "$SKILL_DIR/scripts/verify-self-install.py"
+  HERMES_HOME="$HERMES_HOME_DIR" python3 "$SKILL_DIR/scripts/verify-self-install.py"
 }
 
 main() {
