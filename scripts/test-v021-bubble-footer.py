@@ -5,6 +5,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,20 @@ class Tokens:
     def get(self, _account, _chat):
         return self.value
 
+    async def set(self, _account, _chat, value):
+        self.value = value
+
+
+class Dedup:
+    def __init__(self):
+        self.seen = set()
+
+    def is_duplicate(self, value):
+        if value in self.seen:
+            return True
+        self.seen.add(value)
+        return False
+
 
 class FakeAdapter:
     name = "weixin"
@@ -34,8 +49,20 @@ class FakeAdapter:
         self._account_id = "account"
         self._token_store = Tokens()
         self._split_multiline_messages = False
+        self._dedup = Dedup()
         self.sent = []
+        self.routed = []
         self.fail_next = False
+        self.next_id = 0
+
+    def _is_dm_intake_allowed(self, _sender):
+        return True
+
+    def _is_group_allowed(self, _chat):
+        return False
+
+    async def _process_message(self, message):
+        self.routed.append(message)
 
     def _split_text(self, content):
         width = self.MAX_MESSAGE_LENGTH
@@ -49,12 +76,13 @@ class FakeAdapter:
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         try:
-            for i, chunk in enumerate(self._split_text(content)):
+            for chunk in self._split_text(content):
+                self.next_id += 1
                 await self._send_text_chunk(
                     chat_id=chat_id,
                     chunk=chunk,
                     context_token=self._token_store.get(self._account_id, chat_id),
-                    client_id=f"id-{i}",
+                    client_id=f"id-{self.next_id}",
                 )
             return Result(True)
         except Exception as exc:
@@ -64,6 +92,14 @@ class FakeAdapter:
 async def main():
     with tempfile.TemporaryDirectory() as td:
         os.environ["HERMES_HOME"] = td
+        gateway = types.ModuleType("gateway")
+        platforms = types.ModuleType("gateway.platforms")
+        weixin = types.ModuleType("gateway.platforms.weixin")
+        weixin._extract_text = lambda items: str((items or [{}])[0].get("text") or "")
+        weixin._guess_chat_type = lambda message, _account: ("dm", str(message.get("from_user_id") or ""))
+        sys.modules.setdefault("gateway", gateway)
+        sys.modules.setdefault("gateway.platforms", platforms)
+        sys.modules["gateway.platforms.weixin"] = weixin
         from hermes_wechat_enhance.v021_bubble_footer import (
             install_v021_bubble_footer_hook,
             patch_adapter,
@@ -102,12 +138,25 @@ async def main():
         register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
         adapter.fail_next = True
         result = await adapter.send("peer", "will fail")
-        assert not result.success
-        result = await adapter.send("peer", "retry")
         assert result.success
-        assert adapter.sent[-1][1].endswith("`1` `qwen3.6-chat`")
+        assert adapter._hermes_wechat_v021_pending_queue.count("account", "peer") == 1
+        result = await adapter.send("peer", "retry", metadata={"model_name": "qwen3.6-chat"})
+        assert result.success
+        assert adapter._hermes_wechat_v021_pending_queue.count("account", "peer") == 2
+        before_drain = len(adapter.sent)
+        await adapter._process_message({
+            "from_user_id": "peer",
+            "message_id": "continue-1",
+            "context_token": "token-d",
+            "item_list": [{"text": "/continue"}],
+        })
+        assert len(adapter.sent) == before_drain + 2
+        assert adapter._hermes_wechat_v021_pending_queue.count("account", "peer") == 0
+        assert not adapter.routed
+        assert adapter.sent[-2][1].endswith("`1` `qwen3.6-chat`")
+        assert adapter.sent[-1][1].endswith("`2` `qwen3.6-chat`")
 
-        adapter._token_store.value = "token-d"
+        adapter._token_store.value = "token-e"
         register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
         before = len(adapter.sent)
         result = await adapter.send("peer", "x" * 600)

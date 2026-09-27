@@ -28,6 +28,15 @@ def _hook_backup_root() -> Path:
     return _hermes_home() / "plugin-data" / "hermes-wechat-enhance" / "hook-backups"
 
 
+def _runtime_status() -> dict:
+    path = _hermes_home() / "plugin-data" / "hermes-wechat-enhance" / "runtime-status.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
 def register_cli(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="wechat_enhance_action")
     actions.add_parser("status", help="Show install and legacy-queue status")
@@ -120,12 +129,22 @@ def wechat_enhance_command(args: argparse.Namespace) -> int:
         return _migrate(_legacy_queue_path(getattr(args, "queue_file", None)))
     if action in {None, "status"}:
         queue = _legacy_queue_path()
+        runtime = _runtime_status()
+        capabilities = runtime.get("capabilities") if isinstance(runtime.get("capabilities"), dict) else {}
+        runtime_active = (
+            not runtime.get("errors")
+            and bool(runtime.get("installed") or runtime.get("already"))
+            and capabilities.get("durable_fifo") is True
+            and capabilities.get("continue_intercept") is True
+        )
         print(
             json.dumps(
                 {
-                    "ok": True,
+                    "ok": runtime_active,
                     "hermes_home": str(_hermes_home()),
                     "hook_installed": (_hook_target() / "HOOK.yaml").is_file(),
+                    "runtime_active": runtime_active,
+                    "runtime": runtime,
                     "legacy_queue": str(queue),
                     "legacy_queue_entries": _read_queue_count(queue),
                     "v021_native_context_tokens": True,

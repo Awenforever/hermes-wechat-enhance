@@ -8,13 +8,15 @@ then commits its counter after the adapter reports a successful send.
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 import contextvars
 import hashlib
 import json
 import logging
 import os
+import sqlite3
 import threading
+import time
 from pathlib import Path
 from types import MethodType
 from typing import Any, Dict, Iterable, Optional
@@ -22,6 +24,7 @@ from typing import Any, Dict, Iterable, Optional
 logger = logging.getLogger(__name__)
 
 MARKER = "HERMES_WECHAT_V021_BUBBLE_FOOTER_V1"
+DELIVERY_MARKER = "HERMES_WECHAT_V021_FIFO_CONTINUE_V1"
 FOOTER_RESERVE = 160
 
 _ACTIVE_MODEL: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -114,6 +117,110 @@ class BubbleCounterStore:
             return True
 
 
+class PendingBubbleStore:
+    """Durable FIFO of physical Weixin bubbles.
+
+    Queueing at this boundary prevents a partially delivered multi-bubble reply
+    from being replayed as one large duplicate.  Raw account and peer IDs are
+    never persisted; the queued message text is retained because it must later
+    be delivered verbatim.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.RLock()
+        self._initialize()
+
+    @contextmanager
+    def _connect(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(self.path), timeout=10)
+        connection.row_factory = sqlite3.Row
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def _initialize(self) -> None:
+        with self._lock, self._connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS pending_bubbles (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_key TEXT NOT NULL,
+                    chat_key TEXT NOT NULL,
+                    client_id TEXT NOT NULL UNIQUE,
+                    chunk TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    enqueued_at REAL NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS pending_bubbles_fifo
+                ON pending_bubbles(account_key, chat_key, seq);
+                """
+            )
+        with suppress(OSError):
+            os.chmod(self.path, 0o600)
+
+    @staticmethod
+    def _keys(account_id: str, chat_id: str) -> tuple[str, str]:
+        return (_chat_key(account_id, "<account>"), _chat_key(account_id, chat_id))
+
+    def enqueue(self, account_id: str, chat_id: str, client_id: str, chunk: str, model: str, error: str = "") -> int:
+        account_key, chat_key = self._keys(account_id, chat_id)
+        with self._lock, self._connect() as connection:
+            pending = connection.execute(
+                "SELECT COUNT(*) FROM pending_bubbles WHERE account_key=? AND chat_key=?",
+                (account_key, chat_key),
+            ).fetchone()[0]
+            if int(pending) >= 500:
+                raise RuntimeError("durable Weixin queue capacity reached (500)")
+            connection.execute(
+                "INSERT OR IGNORE INTO pending_bubbles(account_key,chat_key,client_id,chunk,model,enqueued_at,last_error) VALUES(?,?,?,?,?,?,?)",
+                (account_key, chat_key, str(client_id), str(chunk), _safe_model(model), time.time(), str(error)[:500]),
+            )
+            row = connection.execute(
+                "SELECT COUNT(*) FROM pending_bubbles WHERE account_key=? AND chat_key=?",
+                (account_key, chat_key),
+            ).fetchone()
+            return int(row[0])
+
+    def peek(self, account_id: str, chat_id: str) -> Optional[Dict[str, Any]]:
+        account_key, chat_key = self._keys(account_id, chat_id)
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pending_bubbles WHERE account_key=? AND chat_key=? ORDER BY seq LIMIT 1",
+                (account_key, chat_key),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def remove(self, seq: int) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute("DELETE FROM pending_bubbles WHERE seq=?", (int(seq),))
+
+    def record_failure(self, seq: int, error: str) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE pending_bubbles SET attempts=attempts+1,last_error=? WHERE seq=?",
+                (str(error)[:500], int(seq)),
+            )
+
+    def count(self, account_id: str, chat_id: str) -> int:
+        account_key, chat_key = self._keys(account_id, chat_id)
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM pending_bubbles WHERE account_key=? AND chat_key=?",
+                (account_key, chat_key),
+            ).fetchone()
+            return int(row[0])
+
+    def total(self) -> int:
+        with self._lock, self._connect() as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM pending_bubbles").fetchone()[0])
+
+
 def register_turn_model(context: Dict[str, Any]) -> None:
     """Stage the model reported by ``agent:end`` for the next final send to this peer."""
     if str(context.get("platform") or "").lower() != "weixin":
@@ -194,10 +301,15 @@ def _counter_path() -> Path:
     return root / "plugin-data" / "hermes-wechat-enhance" / "bubble-counters.json"
 
 
+def _queue_path() -> Path:
+    root = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    return root / "plugin-data" / "hermes-wechat-enhance" / "send-queue.sqlite3"
+
+
 def patch_adapter(adapter: Any) -> bool:
     if getattr(adapter, "_hermes_wechat_v021_bubble_footer_v1", False):
         return False
-    required = ("send", "_send_text_chunk", "_split_text", "_token_store", "_account_id")
+    required = ("send", "_send_text_chunk", "_split_text", "_process_message", "_token_store", "_account_id", "_dedup")
     missing = [name for name in required if not hasattr(adapter, name)]
     if missing:
         raise RuntimeError(f"unsupported WeixinAdapter; missing: {', '.join(missing)}")
@@ -205,7 +317,9 @@ def patch_adapter(adapter: Any) -> bool:
     original_send = adapter.send
     original_send_text_chunk = adapter._send_text_chunk
     original_split_text = adapter._split_text
+    original_process_message = adapter._process_message
     store = BubbleCounterStore(_counter_path())
+    queue = PendingBubbleStore(_queue_path())
     locks: Dict[str, asyncio.Lock] = {}
 
     def split_text(_self: Any, content: str):
@@ -236,19 +350,38 @@ def patch_adapter(adapter: Any) -> bool:
     ) -> None:
         lock = locks.setdefault(str(chat_id), asyncio.Lock())
         async with lock:
-            count, generation = store.preview(
-                str(getattr(_self, "_account_id", "")), str(chat_id), context_token
-            )
+            account_id = str(getattr(_self, "_account_id", ""))
             model = _safe_model(_ACTIVE_MODEL.get())
-            decorated = f"{chunk}\n\n---\n\n`{count}` `{model}`"
-            await original_send_text_chunk(
-                chat_id=chat_id,
-                chunk=decorated,
-                context_token=context_token,
-                client_id=client_id,
+            if queue.count(account_id, str(chat_id)):
+                pending = queue.enqueue(account_id, str(chat_id), client_id, chunk, model)
+                logger.warning(
+                    "Hermes WeChat Enhance: queued bubble behind existing FIFO backlog peer=%s pending=%d",
+                    hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
+                    pending,
+                )
+                return
+            count, generation = store.preview(
+                account_id, str(chat_id), context_token
             )
+            decorated = f"{chunk}\n\n---\n\n`{count}` `{model}`"
+            try:
+                await original_send_text_chunk(
+                    chat_id=chat_id,
+                    chunk=decorated,
+                    context_token=context_token,
+                    client_id=client_id,
+                )
+            except Exception as exc:
+                pending = queue.enqueue(account_id, str(chat_id), client_id, chunk, model, str(exc))
+                logger.warning(
+                    "Hermes WeChat Enhance: physical bubble queued after delivery failure peer=%s pending=%d error=%s",
+                    hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
+                    pending,
+                    exc,
+                )
+                return
             committed = store.commit(
-                str(getattr(_self, "_account_id", "")),
+                account_id,
                 str(chat_id),
                 generation,
                 count,
@@ -280,14 +413,79 @@ def patch_adapter(adapter: Any) -> bool:
             _consume_turn_model(str(chat_id), model)
         return result
 
+    async def drain_pending(_self: Any, chat_id: str) -> Dict[str, Any]:
+        lock = locks.setdefault(str(chat_id), asyncio.Lock())
+        account_id = str(getattr(_self, "_account_id", ""))
+        sent = 0
+        async with lock:
+            while True:
+                item = queue.peek(account_id, str(chat_id))
+                if not item:
+                    break
+                context_token = _self._token_store.get(account_id, str(chat_id))
+                count, generation = store.preview(account_id, str(chat_id), context_token)
+                decorated = f"{item['chunk']}\n\n---\n\n`{count}` `{_safe_model(item['model'])}`"
+                try:
+                    await original_send_text_chunk(
+                        chat_id=str(chat_id),
+                        chunk=decorated,
+                        context_token=context_token,
+                        client_id=str(item["client_id"]),
+                    )
+                except Exception as exc:
+                    queue.record_failure(int(item["seq"]), str(exc))
+                    return {"ok": False, "sent": sent, "pending": queue.count(account_id, str(chat_id)), "error": str(exc)}
+                if not store.commit(account_id, str(chat_id), generation, count):
+                    logger.warning("Hermes WeChat Enhance: context changed during FIFO drain; counter not committed")
+                queue.remove(int(item["seq"]))
+                sent += 1
+        return {"ok": True, "sent": sent, "pending": 0}
+
+    async def process_message(_self: Any, message: Dict[str, Any]) -> Any:
+        try:
+            from gateway.platforms.weixin import _extract_text, _guess_chat_type
+        except ImportError:
+            return await original_process_message(message)
+        text = str(_extract_text(message.get("item_list") or []) or "")
+        if text.strip() != "/continue":
+            return await original_process_message(message)
+        sender_id = str(message.get("from_user_id") or "").strip()
+        message_id = str(message.get("message_id") or "").strip()
+        if not sender_id or sender_id == str(getattr(_self, "_account_id", "")):
+            return None
+        if message_id and _self._dedup.is_duplicate(message_id):
+            return None
+        chat_type, effective_chat_id = _guess_chat_type(message, getattr(_self, "_account_id", ""))
+        if chat_type == "group":
+            if not _self._is_group_allowed(effective_chat_id):
+                return None
+        elif not _self._is_dm_intake_allowed(sender_id):
+            return None
+        context_token = str(message.get("context_token") or "").strip()
+        if context_token:
+            await _self._token_store.set(_self._account_id, sender_id, context_token)
+        result = await drain_pending(_self, sender_id)
+        logger.warning(
+            "Hermes WeChat Enhance: /continue handled locally peer=%s sent=%d pending=%d ok=%s",
+            hashlib.sha256(sender_id.encode()).hexdigest()[:12],
+            int(result.get("sent", 0)),
+            int(result.get("pending", 0)),
+            bool(result.get("ok")),
+        )
+        return None
+
     adapter._split_text = MethodType(split_text, adapter)
     adapter._send_text_chunk = MethodType(send_text_chunk, adapter)
     adapter.send = MethodType(send, adapter)
+    adapter._drain_pending = MethodType(drain_pending, adapter)
+    adapter._process_message = MethodType(process_message, adapter)
+    adapter._hermes_wechat_v021_pending_queue = queue
     adapter._hermes_wechat_v021_bubble_footer_v1 = True
     adapter._hermes_wechat_v021_bubble_footer_originals = {
         "send": original_send,
         "_send_text_chunk": original_send_text_chunk,
         "_split_text": original_split_text,
+        "_process_message": original_process_message,
     }
     return True
 
@@ -331,4 +529,34 @@ async def install_v021_bubble_footer_hook(
         already,
         len(errors),
     )
-    return {"marker": MARKER, "installed": installed, "already": already, "errors": errors}
+    pending = 0
+    for adapter in adapters:
+        queue = getattr(adapter, "_hermes_wechat_v021_pending_queue", None)
+        if queue is not None:
+            with suppress(Exception):
+                pending += int(queue.total())
+    result = {
+        "marker": MARKER,
+        "delivery_marker": DELIVERY_MARKER,
+        "installed": installed,
+        "already": already,
+        "errors": errors,
+        "capabilities": {
+            "bubble_footer": True,
+            "durable_fifo": True,
+            "continue_intercept": True,
+        },
+        "pending_bubbles": pending,
+        "recorded_at": time.time(),
+    }
+    try:
+        path = _queue_path().parent / "runtime-status.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        with suppress(OSError):
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except Exception as exc:
+        logger.warning("Hermes WeChat Enhance: runtime receipt write failed: %s", exc)
+    return result
