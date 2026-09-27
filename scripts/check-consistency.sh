@@ -818,6 +818,18 @@ else
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
+header "Startup-ready target inheritance"
+
+if grep -q "HERMES_WECHAT_STARTUP_TARGET_INHERIT_V1" \
+   "$SKILL_DIR/hooks/hermes-wechat-enhance/handler.py" \
+   && [[ -f "$SKILL_DIR/hermes_wechat_enhance/peer.py" ]] \
+   && [[ -f "$SKILL_DIR/scripts/test-startup-ready-target.py" ]]; then
+    pass
+else
+    fail "Startup-ready target inheritance is incomplete" \
+         "Restore the independent peer resolver and its contract test"
+fi
+
 summary
 
 if [[ $ERRORS -gt 0 ]]; then

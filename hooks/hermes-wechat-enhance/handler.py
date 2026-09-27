@@ -45,6 +45,7 @@ if str(_SKILL_DIR) not in sys.path:
     sys.path.insert(0, str(_SKILL_DIR))
 
 from hermes_wechat_enhance.current_official_runtime_compat import install_weixin_runtime_compat_hook
+from hermes_wechat_enhance.peer import resolve_weixin_peer
 from hermes_wechat_enhance.store import MessageStore
 from hermes_wechat_enhance.v021_bubble_footer import (
     install_v021_bubble_footer_hook,
@@ -111,10 +112,6 @@ async def _send_startup_ready(context: dict):
     if ready.lower() in {"0", "false", "no", "off", "disabled"}:
         log.warning("Hermes WeChat Enhance: startup ready notification disabled")
         return
-    weixin_chat_id = os.getenv("HERMES_PROACTIVE_WEIXIN_CHAT_ID", "").strip()
-    if not weixin_chat_id:
-        log.warning("Hermes WeChat Enhance: no HERMES_PROACTIVE_WEIXIN_CHAT_ID; skip startup ready")
-        return
     adapters = context.get("adapters") if isinstance(context, dict) else None
     if not adapters:
         runner = None
@@ -131,6 +128,17 @@ async def _send_startup_ready(context: dict):
     for key, adapter in adapters.items():
         key_value = getattr(key, "value", key)
         if key_value == "weixin":
+            # HERMES_WECHAT_STARTUP_TARGET_INHERIT_V1
+            weixin_chat_id, resolution = resolve_weixin_peer(
+                os.getenv("HERMES_PROACTIVE_WEIXIN_CHAT_ID", "").strip(),
+                account_id=str(getattr(adapter, "_account_id", "") or ""),
+            )
+            if not weixin_chat_id:
+                log.warning(
+                    "Hermes WeChat Enhance: startup ready target unavailable (%s); skip",
+                    resolution,
+                )
+                return
             result = await adapter.send(
                 weixin_chat_id,
                 ready,
@@ -146,8 +154,9 @@ async def _send_startup_ready(context: dict):
             )
             if getattr(result, "success", False):
                 log.warning(
-                    "Hermes WeChat Enhance: startup ready notification sent to %s (delivery confirmed)",
-                    weixin_chat_id,
+                    "Hermes WeChat Enhance: startup ready notification sent "
+                    "(delivery confirmed; target=%s)",
+                    resolution,
                 )
             else:
                 log.warning(
