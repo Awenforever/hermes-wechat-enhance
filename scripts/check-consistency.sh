@@ -183,64 +183,20 @@ else
 fi
 
 # ── 3. Check patches/ files referenced in README.md ─────────────────────────
-header "README.md → patches/ cross-reference"
+# The public README documents behavior and migration, not internal patch IDs.
+header "README.md public migration contract"
 
 README="$SKILL_DIR/README.md"
-if [[ ! -f "$README" ]]; then
-    fail "README.md not found" "Expected at $README"
+# README is user-facing release documentation, not a patch inventory. Detailed
+# patch IDs belong in SKILL.md and CUSTOMIZATIONS.md. Keep this check focused on
+# the public migration promise so README can remain concise and useful.
+if [[ -f "$README" ]] \
+   && grep -q 'migrate-v018' "$README" \
+   && grep -q 'v0\.18' "$README"; then
+    pass
 else
-    declare -a README_PATCH_REFS=()
-    while IFS= read -r line; do
-        # Look for patch file references like "001-weixin-..."
-        nums=$(echo "$line" | grep -oP '\b\d{3}-weixin[-a-z]*\.patch\b' | grep -oP '^\d{3}' || true)
-        for n in $nums; do
-            arr_contains "$n" "${README_PATCH_REFS[@]}" || README_PATCH_REFS+=("$n")
-        done
-    done < <(cat "$README" 2>/dev/null || true)
-
-    # Also check for references to patch numbers in code blocks or text
-    while IFS= read -r line; do
-        if echo "$line" | grep -qP '(patch|patches)'; then
-            nums=$(echo "$line" | grep -oP '\b(00[1-9]|0[1-9][0-9])\b' || true)
-            for n in $nums; do
-                arr_contains "$n" "${README_PATCH_REFS[@]}" || README_PATCH_REFS+=("$n")
-            done
-        fi
-    done < <(cat "$README" 2>/dev/null || true)
-
-    echo "  Patches referenced in README.md: ${README_PATCH_REFS[*]:-(none)}"
-
-    # Check: every actual non-archived patch (without .v017 etc) is in README references
-    for p in "${ACTUAL_PATCH_BASENAMES[@]}"; do
-        # Skip archived patches (like *.v017.patch) from this check
-        if echo "$p" | grep -q '\.v[0-9]\{3\}\.'; then
-            continue
-        fi
-        id=$(echo "$p" | sed -n 's/^\([0-9]\{3\}\).*/\1/p')
-        if [[ -n "$id" ]] && ! arr_contains "$id" "${README_PATCH_REFS[@]}"; then
-            warn "Current patch $id ($p) not directly referenced in README.md" \
-                 "README may need updating to mention patch $id"
-        else
-            pass
-        fi
-    done
-
-    # Check: every README patch reference has a file
-    for ref in "${README_PATCH_REFS[@]}"; do
-        found=0
-        for p in "${ACTUAL_PATCH_BASENAMES[@]}"; do
-            if [[ "$p" == "$ref"-* ]]; then
-                found=1
-                break
-            fi
-        done
-        if [[ $found -eq 0 ]]; then
-            warn "README.md references patch '$ref' but no matching .patch file found in patches/" \
-                 "Missing: ${ref}-*.patch"
-        else
-            pass
-        fi
-    done
+    fail "README does not document the supported v0.18 migration" \
+         "Document migrate-v018 without exposing the internal patch inventory"
 fi
 
 # ── 4. Check patches/ files in SKILL.md ─────────────────────────────────────
@@ -462,7 +418,8 @@ do
     fi
 done
 
-if grep -qi "slash command" "$README" && grep -qi "slash command" "$SKILL"; then
+if { grep -qi "slash command" "$README" || grep -q "斜杠命令" "$README"; } \
+   && grep -qi "slash command" "$SKILL"; then
     pass
 else
     fail "README/SKILL do not document slash-command exemption" "Update docs"
