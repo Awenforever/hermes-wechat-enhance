@@ -296,7 +296,7 @@ if wx.exists():
         for marker in (
             "class WeixinAdapter",
             "class ContextTokenStore",
-            "class MessageDeduplicator",
+            "MessageDeduplicator",
             "async def _process_message",
             "def _split_text",
             "async def _send_text_chunk",
