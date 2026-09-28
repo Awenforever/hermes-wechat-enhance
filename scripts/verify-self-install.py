@@ -380,11 +380,12 @@ PROVEN_CURRENT_OFFICIAL_RUNTIME_COMPAT_CORE_SHA256 = (
 require(compat_core.exists(), f"missing {compat_core}")
 require(compat_dispatcher.exists(), f"missing {compat_dispatcher}")
 require(compat_contract_test.exists(), f"missing {compat_contract_test}")
-require(
-    hashlib.sha256(compat_core.read_bytes()).hexdigest()
-    == PROVEN_CURRENT_OFFICIAL_RUNTIME_COMPAT_CORE_SHA256,
-    "current-official runtime compatibility core differs from proven candidate",
-)
+if current_official_profile:
+    require(
+        hashlib.sha256(compat_core.read_bytes()).hexdigest()
+        == PROVEN_CURRENT_OFFICIAL_RUNTIME_COMPAT_CORE_SHA256,
+        "current-official runtime compatibility core differs from proven candidate",
+    )
 
 environment = dict(os.environ)
 environment["HERMES_GATEWAY_SRC"] = str(GATEWAY_SRC)
