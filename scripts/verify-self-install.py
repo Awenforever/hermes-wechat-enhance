@@ -217,7 +217,10 @@ async def main_async():
     os.environ["HERMES_PROACTIVE_WEIXIN_CHAT_ID"] = "test-chat"
     os.environ["HERMES_WEIXIN_STARTUP_READY_NOTIFY"] = READY
     fake = FakeAdapter()
-    await mod.handle("gateway:startup", {"adapters": {"weixin": fake}})
+    # Startup notification has its own contract.  Do not feed this deliberately
+    # minimal transport double into the v0.21 adapter patcher: runtime patching
+    # is exercised below against Hermes' real WeixinAdapter.
+    await mod._send_startup_ready({"adapters": {"weixin": fake}})
     require(len(fake.sent) == 1, "startup ready did not send exactly once")
     sent = fake.sent[0]
     require(sent["chat_id"] == "test-chat", "ready chat id mismatch")
@@ -252,7 +255,7 @@ async def main_async():
 
 asyncio.run(main_async())
 
-store_path = HOME / ".hermes" / "wechat_enhance" / "messages.jsonl"
+store_path = HERMES_HOME / "plugin-data" / "hermes-wechat-enhance" / "audit" / "messages.jsonl"
 require(store_path.exists(), f"message store not created: {store_path}")
 rows = [json.loads(x) for x in store_path.read_text("utf-8").splitlines() if x.strip()]
 require(any(r.get("direction") == "in" for r in rows), "no inbound record")
@@ -268,6 +271,7 @@ CURRENT_OFFICIAL_V018_WEIXIN_SHA256 = "85e06cea1673ae20e336820e9cac5a7dc467bdd8c
 CURRENT_OFFICIAL_V018_BASE_SHA256 = "dbdf137f59c4e541ac4c3ad3cf761e7cd8d11b5e487ead12ba8c19a6e3be4984"
 CURRENT_OFFICIAL_V018_RUN_SHA256 = "9832bc3e285f1616b6bceecd68a457f4bf0ee5fe39d825c0e745167e0f324754"
 current_official_profile = False
+native_v021_profile = False
 
 if wx.exists():
     wx_text = read(wx)
@@ -287,6 +291,20 @@ if wx.exists():
         require(hashlib.sha256(base.read_bytes()).hexdigest() == CURRENT_OFFICIAL_V018_BASE_SHA256, "current official base.py hash changed")
         print("CURRENT_OFFICIAL_WEIXIN_NATIVE_CAPABILITIES_OK")
         print("CURRENT_OFFICIAL_WEIXIN_BYTE_IDENTITY_OK")
+    elif all(
+        marker in wx_text
+        for marker in (
+            "class WeixinAdapter",
+            "class ContextTokenStore",
+            "class MessageDeduplicator",
+            "async def _process_message",
+            "def _split_text",
+            "async def _send_text_chunk",
+        )
+    ):
+        native_v021_profile = True
+        print("WEIXIN_PROFILE=native-v021-adapter")
+        print("NATIVE_V021_ADAPTER_SURFACE_OK")
     else:
         require("class ReplyBudgetStore" in wx_text, "weixin.py lacks ReplyBudgetStore")
         require("class MessageSendQueue" in wx_text, "weixin.py lacks MessageSendQueue")
@@ -312,7 +330,7 @@ if wx.exists():
         require("HERMES_WECHAT_ORDINARY_REPLY_APPEND_THEN_DRAIN_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_ORDINARY_REPLY_APPEND_THEN_DRAIN_V1")
         require("HERMES_WECHAT_V018_SOURCE_PROFILE_DISPATCH_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_V018_SOURCE_PROFILE_DISPATCH_V1")
         require("HERMES_WECHAT_V018_CONSOLIDATED_PATCH_V1" in wx_text, "weixin.py lacks HERMES_WECHAT_V018_CONSOLIDATED_PATCH_V1")
-if run.exists():
+if run.exists() and not native_v021_profile:
     run_text = read(run)
     require("_non_conversational_metadata" in run_text, "run.py lacks _non_conversational_metadata")
     require("is_system" in run_text, "run.py lacks is_system metadata marker")
@@ -341,7 +359,7 @@ if run.exists():
             "current official run.py does not match accepted 006/007/008 runtime",
         )
         print("CURRENT_OFFICIAL_RUN_EXACT_PARITY_OK")
-if base.exists():
+if base.exists() and not native_v021_profile:
     base_text = read(base)
     require("_mark_notify_metadata" in base_text, "base.py lacks _mark_notify_metadata")
 
@@ -409,6 +427,23 @@ if current_official_profile:
             f"current-official compatibility marker missing: {compat_marker}",
         )
     print("CURRENT_OFFICIAL_RUNTIME_COMPAT_VERIFY_OK")
+elif native_v021_profile:
+    for name, marker in (
+        ("test-v021-bubble-footer.py", "V021_BUBBLE_FOOTER_TEST_OK"),
+        ("test-v021-real-adapter.py", "V021_REAL_WEIXIN_ADAPTER_TEST_OK"),
+    ):
+        process = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name(name))],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=environment,
+            check=False,
+        )
+        print(process.stdout, end="")
+        require(process.returncode == 0, f"native v0.21 contract failed: {name}")
+        require(marker in process.stdout, f"native v0.21 marker missing: {marker}")
+    print("NATIVE_V021_RUNTIME_COMPAT_VERIFY_OK")
 else:
     process = subprocess.run(
         [sys.executable, str(contract_test)],
