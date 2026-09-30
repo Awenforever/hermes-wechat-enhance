@@ -47,6 +47,13 @@ hermes wechat-enhance status
 
 安装插件不会要求重新扫码或配对；微信会话凭据仍由 Hermes 自己管理。
 
+卸载运行代码会保留队列、配对、认证与其他用户状态；如果安装前已有同名 Hook，则恢复原件：
+
+```bash
+hermes wechat-enhance uninstall-hook
+hermes plugins remove hermes-wechat-enhance
+```
+
 同时安装整套生产插件，可让 Hermes 打开并安装：
 
 ```text
