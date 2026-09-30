@@ -4,7 +4,7 @@ author: Awenforever
 version: 2026.09.30
 plugins:
   - repo: Awenforever/hermes-wechat-enhance
-    ref: 24da8e908d0ce79df8118c1e5cfc5d1cbf534b4f
+    ref: 11cb9018ba00edd1ea9a3e0350db5f0b70f7abb4
   - repo: Awenforever/hermes-alive
     ref: 8821fde1b6ed5b17d0b57e3620b0102d9dc98ed7
   - repo: Awenforever/hermes-email-watchdog
