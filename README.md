@@ -46,6 +46,7 @@ hermes wechat-enhance status
 ```
 
 安装插件不会要求重新扫码或配对；微信会话凭据仍由 Hermes 自己管理。
+`install-hook` 会把 Hermes 的 `display.busy_input_mode` 切换为 `queue`，确保忙碌期间的新消息依次处理；卸载时只在该值仍由插件持有时恢复安装前设置，不覆盖用户后续修改。
 
 卸载运行代码会保留队列、配对、认证与其他用户状态；如果安装前已有同名 Hook，则恢复原件：
 

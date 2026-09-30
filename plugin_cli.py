@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -32,6 +33,123 @@ def _hook_backup_root() -> Path:
 
 def _install_manifest_path() -> Path:
     return _hermes_home() / "plugin-data" / "hermes-wechat-enhance" / "install" / "manifest.json"
+
+
+def _config_path() -> Path:
+    return _hermes_home() / "config.yaml"
+
+
+def _split_lines(text: str) -> list[str]:
+    return text.splitlines(keepends=True)
+
+
+def _display_block(lines: list[str]) -> tuple[int | None, int | None, int | None]:
+    display = None
+    end = None
+    busy = None
+    for index, line in enumerate(lines):
+        if re.match(r"^display\s*:\s*(?:#.*)?(?:\r?\n)?$", line):
+            display = index
+            break
+    if display is None:
+        return None, None, None
+    end = len(lines)
+    for index in range(display + 1, len(lines)):
+        line = lines[index]
+        if line.strip() and not line.lstrip().startswith("#") and not line[:1].isspace():
+            end = index
+            break
+        if re.match(r"^[ \t]+busy_input_mode\s*:", line):
+            busy = index
+    return display, end, busy
+
+
+def _busy_raw_value(line: str) -> str:
+    match = re.match(r"^[ \t]+busy_input_mode\s*:\s*([^#\r\n]*?)\s*(?:#.*)?(?:\r?\n)?$", line)
+    return match.group(1).strip() if match else ""
+
+
+def _normalized_scalar(raw: str) -> str:
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return value.strip().lower()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    mode = path.stat().st_mode
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=path.parent, delete=False) as handle:
+        handle.write(text)
+        temporary = Path(handle.name)
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+def _ensure_queue_mode(previous: dict) -> dict:
+    """Make Hermes queue concurrent inbound messages without owning its config."""
+    path = _config_path()
+    if not path.is_file():
+        return {"changed": False, "config_present": False, "reason": "config_missing"}
+    text = path.read_text(encoding="utf-8")
+    lines = _split_lines(text)
+    display, end, busy = _display_block(lines)
+    current = _busy_raw_value(lines[busy]) if busy is not None else ""
+    if _normalized_scalar(current) == "queue":
+        existing = previous.get("busy_input_mode")
+        if isinstance(existing, dict) and existing.get("changed"):
+            return existing
+        return {"changed": False, "config_present": True, "already_queue": True}
+
+    existing = previous.get("busy_input_mode")
+    if isinstance(existing, dict) and existing.get("changed"):
+        record = dict(existing)
+    else:
+        record = {
+            "changed": True,
+            "config_present": True,
+            "had_display": display is not None,
+            "had_key": busy is not None,
+            "previous_raw_value": current if busy is not None else None,
+        }
+
+    newline = "\r\n" if "\r\n" in text else "\n"
+    if busy is not None:
+        indent = re.match(r"^([ \t]+)", lines[busy]).group(1)
+        comment = ""
+        if "#" in lines[busy]:
+            comment = "  #" + lines[busy].split("#", 1)[1].rstrip("\r\n")
+        lines[busy] = f"{indent}busy_input_mode: queue{comment}{newline}"
+    elif display is not None:
+        lines.insert(display + 1, f"  busy_input_mode: queue{newline}")
+    else:
+        if text and not text.endswith(("\n", "\r")):
+            lines.append(newline)
+        lines.extend([f"display:{newline}", f"  busy_input_mode: queue{newline}"])
+    _atomic_write_text(path, "".join(lines))
+    return record
+
+
+def _restore_queue_mode(record: object) -> dict:
+    if not isinstance(record, dict) or not record.get("changed"):
+        return {"restored": False, "reason": "not_owned"}
+    path = _config_path()
+    if not path.is_file():
+        return {"restored": False, "reason": "config_missing"}
+    text = path.read_text(encoding="utf-8")
+    lines = _split_lines(text)
+    display, end, busy = _display_block(lines)
+    if busy is None or _normalized_scalar(_busy_raw_value(lines[busy])) != "queue":
+        return {"restored": False, "reason": "changed_by_user"}
+    newline = "\r\n" if "\r\n" in text else "\n"
+    if record.get("had_key"):
+        indent = re.match(r"^([ \t]+)", lines[busy]).group(1)
+        lines[busy] = f"{indent}busy_input_mode: {record.get('previous_raw_value')}{newline}"
+    else:
+        lines.pop(busy)
+        if not record.get("had_display") and display is not None:
+            lines.pop(display)
+    _atomic_write_text(path, "".join(lines))
+    return {"restored": True}
 
 
 def _tree_hash(path: Path) -> str | None:
@@ -140,6 +258,7 @@ def _install_hook() -> int:
         shutil.rmtree(target)
     stage.replace(target)
     installed_hash = _tree_hash(target)
+    busy_input_mode = _ensure_queue_mode(previous)
     _write_manifest({
         "schema_version": 1,
         "owner": "hermes-wechat-enhance",
@@ -147,6 +266,7 @@ def _install_hook() -> int:
         "hook": str(target),
         "installed_hash": installed_hash,
         "original_backup": backup,
+        "busy_input_mode": busy_input_mode,
         "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
     print(json.dumps({"ok": True, "hook": str(target), "backup": str(backup) if backup else None}))
@@ -176,14 +296,16 @@ def _uninstall_hook() -> int:
         assert backup is not None
         backup.replace(target)
         restored = True
+    config_restore = _restore_queue_mode(manifest.get("busy_input_mode"))
     manifest.update({
         "installed": False,
         "installed_hash": None,
         "original_backup": None,
         "last_uninstalled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "busy_input_mode_restore": config_restore,
     })
     _write_manifest(manifest)
-    print(json.dumps({"ok": True, "hook_removed": not target.exists() or restored, "restored_previous": restored}))
+    print(json.dumps({"ok": True, "hook_removed": not target.exists() or restored, "restored_previous": restored, "config_restore": config_restore}))
     return 0
 
 

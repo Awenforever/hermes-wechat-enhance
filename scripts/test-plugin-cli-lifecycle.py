@@ -28,11 +28,16 @@ def main() -> int:
         hermes_constants.get_hermes_home = lambda: home
         sys.modules["hermes_constants"] = hermes_constants
 
+        home.mkdir(parents=True)
+        original_config = "display:\n  compact: false\n  busy_input_mode: interrupt  # upstream default\nstt:\n  enabled: false\n"
+        (home / "config.yaml").write_text(original_config, encoding="utf-8")
+
         target = home / "hooks" / "hermes-wechat-enhance"
         target.mkdir(parents=True)
         (target / "original.txt").write_text("original\n", encoding="utf-8")
 
         require(MODULE._install_hook() == 0, "install failed")
+        require("busy_input_mode: queue" in (home / "config.yaml").read_text(encoding="utf-8"), "queue mode was not enabled")
         manifest = json.loads(MODULE._install_manifest_path().read_text(encoding="utf-8"))
         backup = Path(manifest["original_backup"])
         require(backup.is_dir(), "original hook was not backed up")
@@ -41,6 +46,7 @@ def main() -> int:
 
         require(MODULE._uninstall_hook() == 0, "uninstall failed")
         require((target / "original.txt").read_text(encoding="utf-8") == "original\n", "original hook was not restored")
+        require("busy_input_mode: interrupt" in (home / "config.yaml").read_text(encoding="utf-8"), "prior busy mode was not restored")
 
         require(MODULE._install_hook() == 0, "second install failed")
         (target / "external-change.txt").write_text("owned elsewhere\n", encoding="utf-8")
