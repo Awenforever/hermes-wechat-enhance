@@ -112,8 +112,14 @@ require(
     "installer lacks verified source-profile version fallback",
 )
 require(
-    'detect_version "$source_profile"' in install_text,
-    "installer does not resolve version after source-profile detection",
+    'version="$(detect_version "" | tail -1)"' in install_text
+    and 'detect_version "$source_profile"' in install_text,
+    "installer does not resolve current versions before legacy source-profile fallback",
+)
+require(
+    "HERMES_WECHAT_NATIVE_V021_HOOK_ONLY_INSTALL_V1" in install_text
+    and 'PATCH_MODE=hook-only' in install_text,
+    "installer lacks native v0.21 hook-only installation contract",
 )
 require(
     "VERSION_SOURCE=verified-source-profile" in install_text,

@@ -357,6 +357,8 @@ def wechat_enhance_command(args: argparse.Namespace) -> int:
             and bool(runtime.get("installed") or runtime.get("already"))
             and capabilities.get("durable_fifo") is True
             and capabilities.get("continue_intercept") is True
+            and capabilities.get("all_inbound_context_refresh") is True
+            and capabilities.get("turn_model_before_interim") is True
         )
         print(
             json.dumps(

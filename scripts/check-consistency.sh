@@ -599,11 +599,12 @@ else
          "Restore version inference marker"
 fi
 
-if grep -q 'detect_version "$source_profile"' "$INSTALLER"; then
+if grep -q 'version="$(detect_version "" | tail -1)"' "$INSTALLER" \
+   && grep -q 'detect_version "$source_profile"' "$INSTALLER"; then
     pass
 else
-    fail "Installer resolves version before source profile" \
-         "Detect source profile first"
+    fail "Installer version/profile routing is incomplete" \
+         "Detect current versions first, then use source profiles only as a legacy fallback"
 fi
 
 if grep -q "VERSION_SOURCE=verified-source-profile" "$INSTALLER" \

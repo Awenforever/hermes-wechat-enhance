@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager, suppress
 import contextvars
+import functools
 import hashlib
 import json
 import logging
@@ -23,15 +24,16 @@ from typing import Any, Dict, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
-MARKER = "HERMES_WECHAT_V021_BUBBLE_FOOTER_V1"
-DELIVERY_MARKER = "HERMES_WECHAT_V021_FIFO_CONTINUE_V1"
+MARKER = "HERMES_WECHAT_V021_BUBBLE_FOOTER_V2"
+DELIVERY_MARKER = "HERMES_WECHAT_V021_FIFO_CONTEXT_REFRESH_V2"
 FOOTER_RESERVE = 160
 
 _ACTIVE_MODEL: contextvars.ContextVar[str] = contextvars.ContextVar(
     "hermes_wechat_v021_active_model", default="hermes"
 )
-_TURN_MODELS: Dict[str, str] = {}
+_TURN_MODELS: Dict[str, tuple[str, float, bool]] = {}
 _TURN_MODELS_LOCK = threading.RLock()
+TURN_MODEL_TTL_SECONDS = 6 * 3600
 
 
 def _safe_model(value: Any) -> str:
@@ -221,32 +223,45 @@ class PendingBubbleStore:
             return int(connection.execute("SELECT COUNT(*) FROM pending_bubbles").fetchone()[0])
 
 
+def _remember_model(chat_id: str, model: Any, *, completed: bool = False) -> None:
+    normalized = _safe_model(model)
+    if not chat_id or normalized == "hermes":
+        return
+    with _TURN_MODELS_LOCK:
+        _TURN_MODELS[str(chat_id)] = (normalized, time.time(), completed)
+
+
 def register_turn_model(context: Dict[str, Any]) -> None:
-    """Stage the model reported by ``agent:end`` for the next final send to this peer."""
+    """Refresh the actual model at ``agent:end`` (including provider fallback)."""
     if str(context.get("platform") or "").lower() != "weixin":
         return
     chat_id = str(context.get("chat_id") or "").strip()
-    model = _safe_model(
+    model = (
         context.get("model_name")
         or context.get("model")
         or context.get("resolved_model")
         or context.get("routed_model")
     )
-    if not chat_id or model == "hermes":
-        return
+    _remember_model(chat_id, model, completed=True)
+
+
+def _peek_turn_model(chat_id: str) -> Optional[tuple[str, bool]]:
     with _TURN_MODELS_LOCK:
-        _TURN_MODELS[chat_id] = model
+        entry = _TURN_MODELS.get(str(chat_id))
+        if not entry:
+            return None
+        model, updated_at, completed = entry
+        if time.time() - updated_at > TURN_MODEL_TTL_SECONDS:
+            _TURN_MODELS.pop(str(chat_id), None)
+            return None
+        return model, completed
 
 
-def _peek_turn_model(chat_id: str) -> Optional[str]:
+def _consume_completed_model(chat_id: str, model: str) -> None:
     with _TURN_MODELS_LOCK:
-        return _TURN_MODELS.get(chat_id)
-
-
-def _consume_turn_model(chat_id: str, model: str) -> None:
-    with _TURN_MODELS_LOCK:
-        if _TURN_MODELS.get(chat_id) == model:
-            _TURN_MODELS.pop(chat_id, None)
+        entry = _TURN_MODELS.get(str(chat_id))
+        if entry and entry[0] == model and entry[2]:
+            _TURN_MODELS.pop(str(chat_id), None)
 
 
 def _is_system(metadata: Dict[str, Any]) -> bool:
@@ -274,7 +289,7 @@ def _resolve_model(chat_id: str, metadata: Optional[Dict[str, Any]]) -> tuple[st
     if explicit:
         return _safe_model(explicit), False
     pending = _peek_turn_model(chat_id)
-    return (_safe_model(pending), True) if pending else ("hermes", False)
+    return (_safe_model(pending[0]), pending[1]) if pending else ("hermes", False)
 
 
 def _iter_context_adapters(context: Optional[Dict[str, Any]]) -> Iterable[Any]:
@@ -294,6 +309,40 @@ def _iter_context_adapters(context: Optional[Dict[str, Any]]) -> Iterable[Any]:
                 seen.add(id(adapter))
                 result.append(adapter)
     return result
+
+
+def patch_gateway_runner(runner: Any) -> bool:
+    """Capture the selected turn model before any interim Weixin bubble is sent.
+
+    ``agent:end`` is too late for commentary/tool-boundary bubbles.  The gateway
+    resolves the effective per-session model before creating its stream consumer,
+    so this boundary is both early enough and aware of /model and channel routes.
+    The final hook refreshes the value if provider fallback changed the model.
+    """
+    if runner is None or getattr(runner, "_hermes_wechat_model_route_v3", False):
+        return False
+    original = getattr(runner, "_resolve_session_agent_runtime", None)
+    if not callable(original):
+        return False
+
+    @functools.wraps(original)
+    def wrapped(*args: Any, **kwargs: Any):
+        resolved = original(*args, **kwargs)
+        source = kwargs.get("source")
+        if source is None:
+            source = next(
+                (value for value in args if hasattr(value, "chat_id") and hasattr(value, "platform")),
+                None,
+            )
+        platform_obj = getattr(source, "platform", "")
+        platform = str(getattr(platform_obj, "value", platform_obj) or "").lower()
+        if platform == "weixin" and isinstance(resolved, tuple) and resolved:
+            _remember_model(str(getattr(source, "chat_id", "") or ""), resolved[0])
+        return resolved
+
+    runner._resolve_session_agent_runtime = wrapped
+    runner._hermes_wechat_model_route_v3 = True
+    return True
 
 
 def _counter_path() -> Path:
@@ -398,7 +447,7 @@ def patch_adapter(adapter: Any) -> bool:
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        model, staged = _resolve_model(str(chat_id), metadata)
+        model, completed = _resolve_model(str(chat_id), metadata)
         token = _ACTIVE_MODEL.set(model)
         try:
             result = await original_send(
@@ -409,8 +458,8 @@ def patch_adapter(adapter: Any) -> bool:
             )
         finally:
             _ACTIVE_MODEL.reset(token)
-        if staged and getattr(result, "success", False):
-            _consume_turn_model(str(chat_id), model)
+        if completed and getattr(result, "success", False):
+            _consume_completed_model(str(chat_id), model)
         return result
 
     async def drain_pending(_self: Any, chat_id: str) -> Dict[str, Any]:
@@ -446,13 +495,32 @@ def patch_adapter(adapter: Any) -> bool:
             from gateway.platforms.weixin import _extract_text, _guess_chat_type
         except ImportError:
             return await original_process_message(message)
+        sender_id = str(message.get("from_user_id") or "").strip()
+        if not sender_id or sender_id == str(getattr(_self, "_account_id", "")):
+            return await original_process_message(message)
+
+        # A fresh context_token accompanies every inbound Weixin message.  Persist
+        # it before content/message dedup so even an upstream retry renews the
+        # reply window, then resume any durable FIFO backlog with that token.
+        context_token = str(message.get("context_token") or "").strip()
+        drain_result: Optional[Dict[str, Any]] = None
+        if context_token:
+            await _self._token_store.set(_self._account_id, sender_id, context_token)
+            drain_result = await drain_pending(_self, sender_id)
+
         text = str(_extract_text(message.get("item_list") or []) or "")
         if text.strip() != "/continue":
+            if drain_result and int(drain_result.get("sent", 0)):
+                logger.warning(
+                    "Hermes WeChat Enhance: inbound token resumed FIFO peer=%s sent=%d pending=%d ok=%s",
+                    hashlib.sha256(sender_id.encode()).hexdigest()[:12],
+                    int(drain_result.get("sent", 0)),
+                    int(drain_result.get("pending", 0)),
+                    bool(drain_result.get("ok")),
+                )
             return await original_process_message(message)
-        sender_id = str(message.get("from_user_id") or "").strip()
+
         message_id = str(message.get("message_id") or "").strip()
-        if not sender_id or sender_id == str(getattr(_self, "_account_id", "")):
-            return None
         if message_id and _self._dedup.is_duplicate(message_id):
             return None
         chat_type, effective_chat_id = _guess_chat_type(message, getattr(_self, "_account_id", ""))
@@ -461,10 +529,7 @@ def patch_adapter(adapter: Any) -> bool:
                 return None
         elif not _self._is_dm_intake_allowed(sender_id):
             return None
-        context_token = str(message.get("context_token") or "").strip()
-        if context_token:
-            await _self._token_store.set(_self._account_id, sender_id, context_token)
-        result = await drain_pending(_self, sender_id)
+        result = drain_result or await drain_pending(_self, sender_id)
         logger.warning(
             "Hermes WeChat Enhance: /continue handled locally peer=%s sent=%d pending=%d ok=%s",
             hashlib.sha256(sender_id.encode()).hexdigest()[:12],
@@ -494,11 +559,12 @@ async def install_v021_bubble_footer_hook(
     context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     adapters = list(_iter_context_adapters(context))
-    if not adapters:
-        try:
-            from gateway.run import _gateway_runner_ref
+    runner = None
+    try:
+        from gateway.run import _gateway_runner_ref
 
-            runner = _gateway_runner_ref()
+        runner = _gateway_runner_ref()
+        if not adapters:
             adapters = list(
                 _iter_context_adapters(
                     {
@@ -507,8 +573,11 @@ async def install_v021_bubble_footer_hook(
                     }
                 )
             )
-        except Exception as exc:
+    except Exception as exc:
+        if not adapters:
             logger.error("Hermes WeChat Enhance: v0.21 adapter discovery failed: %s", exc)
+
+    model_route_installed = patch_gateway_runner(runner)
 
     installed = already = 0
     errors = []
@@ -523,10 +592,11 @@ async def install_v021_bubble_footer_hook(
             logger.exception("Hermes WeChat Enhance: v0.21 bubble footer install failed")
     level = logger.warning if installed or already else logger.error
     level(
-        "Hermes WeChat Enhance: %s installed=%d already=%d errors=%d",
+        "Hermes WeChat Enhance: %s installed=%d already=%d model_route=%s errors=%d",
         MARKER,
         installed,
         already,
+        model_route_installed,
         len(errors),
     )
     pending = 0
@@ -540,11 +610,14 @@ async def install_v021_bubble_footer_hook(
         "delivery_marker": DELIVERY_MARKER,
         "installed": installed,
         "already": already,
+        "model_route": model_route_installed,
         "errors": errors,
         "capabilities": {
             "bubble_footer": True,
             "durable_fifo": True,
             "continue_intercept": True,
+            "all_inbound_context_refresh": True,
+            "turn_model_before_interim": True,
         },
         "pending_bubbles": pending,
         "recorded_at": time.time(),

@@ -22,12 +22,14 @@ class Result:
 class Tokens:
     def __init__(self):
         self.value = "token-a"
+        self.updates = []
 
     def get(self, _account, _chat):
         return self.value
 
     async def set(self, _account, _chat, value):
         self.value = value
+        self.updates.append((_account, _chat, value))
 
 
 class Dedup:
@@ -93,7 +95,10 @@ async def main():
     with tempfile.TemporaryDirectory() as td:
         os.environ["HERMES_HOME"] = td
         gateway = types.ModuleType("gateway")
+        gateway.__path__ = []
+        gateway_run = types.ModuleType("gateway.run")
         platforms = types.ModuleType("gateway.platforms")
+        platforms.__path__ = []
         weixin = types.ModuleType("gateway.platforms.weixin")
         weixin._extract_text = lambda items: str((items or [{}])[0].get("text") or "")
         weixin._guess_chat_type = lambda message, _account: ("dm", str(message.get("from_user_id") or ""))
@@ -103,12 +108,40 @@ async def main():
         from hermes_wechat_enhance.v021_bubble_footer import (
             install_v021_bubble_footer_hook,
             patch_adapter,
+            patch_gateway_runner,
             register_turn_model,
         )
+
+        class Source:
+            platform = "weixin"
+            chat_id = "peer"
+
+        class Runner:
+            def _resolve_session_agent_runtime(self, **_kwargs):
+                return "deepseek-flash", {"provider": "ustc"}
+
+        runner = Runner()
+        gateway_run._gateway_runner_ref = lambda: runner
+        sys.modules["gateway.run"] = gateway_run
 
         adapter = FakeAdapter()
         assert patch_adapter(adapter) is True
         assert patch_adapter(adapter) is False
+
+        # The route is captured before streaming/interim bubbles begin and is
+        # retained for every logical send in the same turn.
+        assert patch_gateway_runner(runner) is True
+        assert patch_gateway_runner(runner) is False
+        runner._resolve_session_agent_runtime(source=Source(), session_key="weixin:peer")
+        adapter._token_store.value = "token-route-test"
+        before = len(adapter.sent)
+        for content in ("commentary one", "commentary two", "final answer"):
+            result = await adapter.send("peer", content)
+            assert result.success
+        turn_bubbles = adapter.sent[before:]
+        assert len(turn_bubbles) == 3
+        assert all(item[1].endswith("`deepseek-flash`") for item in turn_bubbles)
+        adapter._token_store.value = "token-a"
 
         register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
         result = await adapter.send("peer", "first")
@@ -155,6 +188,37 @@ async def main():
         assert not adapter.routed
         assert adapter.sent[-2][1].endswith("`1` `qwen3.6-chat`")
         assert adapter.sent[-1][1].endswith("`2` `qwen3.6-chat`")
+
+        # Every ordinary inbound message refreshes the token before Hermes
+        # dedup/routing and automatically resumes the FIFO; it still reaches
+        # the normal conversation path.
+        adapter.fail_next = True
+        result = await adapter.send("peer", "queued for ordinary inbound", metadata={"model": "deepseek-flash"})
+        assert result.success
+        assert adapter._hermes_wechat_v021_pending_queue.count("account", "peer") == 1
+        routed_before = len(adapter.routed)
+        await adapter._process_message({
+            "from_user_id": "peer",
+            "message_id": "ordinary-1",
+            "context_token": "token-ordinary",
+            "item_list": [{"text": "hello"}],
+        })
+        assert adapter._token_store.value == "token-ordinary"
+        assert adapter._token_store.updates[-1] == ("account", "peer", "token-ordinary")
+        assert adapter._hermes_wechat_v021_pending_queue.count("account", "peer") == 0
+        assert len(adapter.routed) == routed_before + 1
+        assert adapter.sent[-1][1].endswith("`1` `deepseek-flash`")
+
+        # Even a duplicate inbound message refreshes the context token before
+        # the core adapter decides not to route it again.
+        adapter._dedup.seen.add("duplicate-1")
+        await adapter._process_message({
+            "from_user_id": "peer",
+            "message_id": "duplicate-1",
+            "context_token": "token-duplicate-refresh",
+            "item_list": [{"text": "hello again"}],
+        })
+        assert adapter._token_store.value == "token-duplicate-refresh"
 
         adapter._token_store.value = "token-e"
         register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})

@@ -22,6 +22,7 @@ INSTALL_STATE_ACTIVE=0
 # HERMES_WECHAT_V018_SOURCE_PROFILE_DISPATCH_V1
 # HERMES_WECHAT_VERSION_FROM_VERIFIED_SOURCE_PROFILE_V1
 # HERMES_WECHAT_V018_VERSION_FAMILY_NORMALIZATION_V1
+# HERMES_WECHAT_NATIVE_V021_HOOK_ONLY_INSTALL_V1
 # HERMES_WECHAT_TRANSACTIONAL_SOURCE_STATE_V1
 # HERMES_WECHAT_FAULT_INJECTION_TEST_V1
 # HERMES_WECHAT_GIT_METADATA_PRESERVATION_V1
@@ -162,6 +163,9 @@ normalize_version_family() {
   # Hermes v0.18.0 is released under the calendar tag v2026.7.1. Runtime
   # package metadata may legitimately expose either identifier.
   case "$version" in
+    v0.21.*|0.21.*|v0.21|0.21)
+      echo "v0.21"
+      ;;
     v2026.7.1*|2026.7.1*|v0.18|v0.18.0|0.18|0.18.0)
       echo "v2026.7.1"
       ;;
@@ -174,7 +178,7 @@ normalize_version_family() {
 
 is_supported_version() {
   local version_family="$1"
-  [ "$version_family" = "v2026.7.1" ]
+  [ "$version_family" = "v2026.7.1" ] || [ "$version_family" = "v0.21" ]
 }
 
 
@@ -516,9 +520,20 @@ main() {
   local patch_dir
   local source_profile
 
-  source_profile="$(detect_source_profile)"
-  version="$(detect_version "$source_profile" | tail -1)"
+  # Resolve current Hermes before inspecting legacy source hashes. Hermes v0.21
+  # is hook-only and must remain compatible with patch releases whose Weixin
+  # source digest naturally changes over time.
+  version="$(detect_version "" | tail -1)"
   version_family="$(normalize_version_family "$version")"
+  if [ "$version_family" = "v0.21" ]; then
+    source_profile="native-v021-hook-only"
+  else
+    source_profile="$(detect_source_profile)"
+    if [ "$version" = "unknown" ]; then
+      version="$(detect_version "$source_profile" | tail -1)"
+      version_family="$(normalize_version_family "$version")"
+    fi
+  fi
 
   log "SOURCE_PROFILE=$source_profile"
   log "VERSION=$version"
@@ -528,15 +543,19 @@ main() {
     *)            log "VERSION_SOURCE=external-metadata" ;;
   esac
 
-  is_supported_version "$version_family" ||     die "Unsupported Hermes version: $version; normalized family=$version_family; accepted family=v2026.7.1"
+  is_supported_version "$version_family" || \
+    die "Unsupported Hermes version: $version; normalized family=$version_family; accepted families=v0.21,v2026.7.1"
 
-  patch_dir="$(find_patch_dir "$version_family")"
-  [ -n "$patch_dir" ] || die "No matching patch set found"
-  log "PATCH_DIR=$patch_dir"
-
-  ensure_git_baseline
-
-  apply_patches "$patch_dir" "$version_family" "$source_profile"
+  if [ "$version_family" = "v0.21" ]; then
+    log "PATCH_MODE=hook-only"
+    log "[OK] Native Hermes v0.21 source left unchanged"
+  else
+    patch_dir="$(find_patch_dir "$version_family")"
+    [ -n "$patch_dir" ] || die "No matching patch set found"
+    log "PATCH_DIR=$patch_dir"
+    ensure_git_baseline
+    apply_patches "$patch_dir" "$version_family" "$source_profile"
+  fi
   fault_inject after-gateway-patches
 
   install_hooks

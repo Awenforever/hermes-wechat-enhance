@@ -5,3 +5,4 @@
 *.yml text eol=lf
 *.json text eol=lf
 *.md text eol=lf
+patches/series* text eol=lf
