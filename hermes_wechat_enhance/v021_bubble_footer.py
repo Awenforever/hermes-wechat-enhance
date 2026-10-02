@@ -749,7 +749,10 @@ async def install_v021_bubble_footer_hook(
     model_route_installed = patch_gateway_runner(runner)
     stream_origin_installed = patch_stream_consumer()
 
+    from hermes_wechat_enhance.slash_command_dedup import patch_weixin_adapter
+
     installed = already = 0
+    slash_installed = slash_already = 0
     errors = []
     for adapter in adapters:
         try:
@@ -757,15 +760,26 @@ async def install_v021_bubble_footer_hook(
                 installed += 1
             else:
                 already += 1
+            # The exemption is part of the live v0.21 startup contract, not a
+            # standalone test utility.  Install it after the footer wrapper so
+            # its task-local content-key scope reaches the official core
+            # _process_message captured by patch_adapter.
+            if patch_weixin_adapter(adapter):
+                slash_installed += 1
+            else:
+                slash_already += 1
         except Exception as exc:
             errors.append(str(exc))
             logger.exception("Hermes WeChat Enhance: v0.21 bubble footer install failed")
     level = logger.warning if installed or already else logger.error
     level(
-        "Hermes WeChat Enhance: %s installed=%d already=%d model_route=%s errors=%d",
+        "Hermes WeChat Enhance: %s installed=%d already=%d slash_installed=%d "
+        "slash_already=%d model_route=%s errors=%d",
         MARKER,
         installed,
         already,
+        slash_installed,
+        slash_already,
         model_route_installed,
         len(errors),
     )
@@ -780,6 +794,8 @@ async def install_v021_bubble_footer_hook(
         "delivery_marker": DELIVERY_MARKER,
         "installed": installed,
         "already": already,
+        "slash_dedup_installed": slash_installed,
+        "slash_dedup_already": slash_already,
         "model_route": model_route_installed,
         "stream_origin": stream_origin_installed,
         "errors": errors,
@@ -790,6 +806,7 @@ async def install_v021_bubble_footer_hook(
             "all_inbound_context_refresh": True,
             "turn_model_before_interim": True,
             "stream_boundary_model_origin": True,
+            "fresh_slash_command_content_dedup_exemption": True,
         },
         "pending_bubbles": pending,
         "recorded_at": time.time(),

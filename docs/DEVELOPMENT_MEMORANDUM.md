@@ -76,6 +76,14 @@ message ID remains a replay. Two early `/approve` messages do not reserve
 approval for a future request: each resolves the oldest request already pending
 when it is handled.
 
+2026-10-02 follow-up: the exemption module and its isolated test existed, but
+the native v0.21 `gateway:startup` path installed only the footer wrapper. This
+made verification green while the live adapter still used core content dedup.
+The v0.21 startup function must install both wrappers atomically and expose
+`fresh_slash_command_content_dedup_exemption=true` in its runtime receipt. The
+integrated startup test must send three fresh `/approve` messages without
+calling the exemption helper separately.
+
 ### Only `/continue` refreshed Context Token
 
 Refresh was incorrectly placed in the special-command branch. Persist a fresh

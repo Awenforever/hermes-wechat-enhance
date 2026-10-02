@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sys
 import tempfile
@@ -64,6 +65,15 @@ class FakeAdapter:
         return False
 
     async def _process_message(self, message):
+        message_id = str(message.get("message_id") or "").strip()
+        if message_id and self._dedup.is_duplicate(message_id):
+            return
+        text = str((message.get("item_list") or [{}])[0].get("text") or "")
+        if text:
+            sender = str(message.get("from_user_id") or "").strip()
+            key = f"content:{sender}:{hashlib.md5(text.encode()).hexdigest()}"
+            if self._dedup.is_duplicate(key):
+                return
         self.routed.append(message)
 
     def format_message(self, content):
@@ -218,6 +228,32 @@ async def main():
         restarted = FakeAdapter()
         installed = await install_v021_bubble_footer_hook({"adapters": {"weixin": restarted}})
         assert installed["installed"] == 1 and not installed["errors"]
+        assert installed["slash_dedup_installed"] == 1
+        assert installed["capabilities"]["fresh_slash_command_content_dedup_exemption"] is True
+        # Integration proof: the startup entrypoint—not a separately invoked
+        # unit helper—must accept repeated slash text with fresh provider IDs,
+        # while retaining exact provider-message replay protection.
+        for message_id in ("approve-1", "approve-2", "approve-3"):
+            await restarted._process_message({
+                "from_user_id": "peer",
+                "message_id": message_id,
+                "context_token": "token-a",
+                "item_list": [{"text": "/approve"}],
+            })
+        assert [
+            message["message_id"] for message in restarted.routed
+            if message["item_list"][0]["text"] == "/approve"
+        ] == ["approve-1", "approve-2", "approve-3"]
+        await restarted._process_message({
+            "from_user_id": "peer",
+            "message_id": "approve-3",
+            "context_token": "token-a",
+            "item_list": [{"text": "/approve"}],
+        })
+        assert len([
+            message for message in restarted.routed
+            if message["item_list"][0]["text"] == "/approve"
+        ]) == 3
         register_turn_model({
             "platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat", "response": "after restart",
         })
@@ -254,7 +290,10 @@ async def main():
         })
         assert len(adapter.sent) == before_drain + 2
         assert adapter._hermes_wechat_v021_pending_queue.count("account", "peer") == 0
-        assert not adapter.routed
+        assert all(
+            message["item_list"][0]["text"] != "/continue"
+            for message in adapter.routed
+        )
         assert adapter.sent[-2][1].endswith("`1` `qwen3.6-chat`")
         assert adapter.sent[-1][1].endswith("`2` `qwen3.6-chat`")
 
