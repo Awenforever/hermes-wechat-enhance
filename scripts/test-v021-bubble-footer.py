@@ -66,6 +66,11 @@ class FakeAdapter:
     async def _process_message(self, message):
         self.routed.append(message)
 
+    def format_message(self, content):
+        # Simulate Hermes v0.21's harmful hard wrap. The plugin must replace
+        # it with logical-line-preserving normalization.
+        return str(content).replace(" via ", " via\n")
+
     def _split_text(self, content):
         width = self.MAX_MESSAGE_LENGTH
         return [content[i : i + width] for i in range(0, len(content), width)]
@@ -78,7 +83,7 @@ class FakeAdapter:
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         try:
-            for chunk in self._split_text(content):
+            for chunk in self._split_text(self.format_message(content)):
                 self.next_id += 1
                 await self._send_text_chunk(
                     chat_id=chat_id,
@@ -138,6 +143,17 @@ async def main():
         adapter = FakeAdapter()
         assert patch_adapter(adapter) is True
         assert patch_adapter(adapter) is False
+
+        long_title = (
+            "- [Uncertainty-Aware Wildfire Smoke Density Classification from Satellite Imagery "
+            "via CBAM-Augmented EfficientNet](https://example.test/paper)"
+        )
+        result = await adapter.send("format-peer", long_title)
+        assert result.success
+        payload = adapter.sent[-1][1].split("\n\n---\n\n", 1)[0]
+        assert payload == long_title
+        assert "via\n" not in payload
+        assert "](https://example.test/paper)" in payload
 
         # The route is captured before streaming begins, but only the model
         # output transport receives it. Unmarked gateway control traffic must

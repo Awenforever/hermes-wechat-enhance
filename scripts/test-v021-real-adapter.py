@@ -50,6 +50,25 @@ async def main() -> None:
             assert len(text) <= adapter.MAX_MESSAGE_LENGTH
             assert token == "context-a"
 
+        # Hermes v0.21 normally hard-wraps this source line at 120 columns,
+        # which turns Weixin's Markdown link into multiple visual paragraphs.
+        # The enhancement keeps the logical Markdown line byte-for-byte intact.
+        markdown = (
+            "- [A deliberately long research title that remains one semantic link label across "
+            "the final Weixin transport boundary without inserted source newlines or broken "
+            "Markdown](https://example.test/paper)"
+        )
+        await adapter._token_store.set("test-account", "format-peer", "context-format")
+        register_turn_model({
+            "platform": "weixin", "chat_id": "format-peer", "model": "qwen3.6-chat",
+            "response": markdown,
+        })
+        result = await adapter.send("format-peer", markdown)
+        assert result.success
+        formatted = sent[-1][1].split("\n\n---\n\n", 1)[0]
+        assert formatted == markdown
+        assert "](https://example.test/paper)" in formatted
+
         state = Path(td) / "plugin-data" / "hermes-wechat-enhance" / "bubble-counters.json"
         raw = state.read_text(encoding="utf-8")
         assert "context-a" not in raw and "test-account" not in raw and "peer" not in raw

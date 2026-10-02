@@ -431,21 +431,56 @@ def _queue_path() -> Path:
     return root / "plugin-data" / "hermes-wechat-enhance" / "send-queue.sqlite3"
 
 
+def _normalize_transport_markdown(content: Any) -> str:
+    """Normalize Markdown blocks without inserting display-width newlines.
+
+    Weixin performs visual wrapping itself. Hermes v0.21's copy-friendly
+    formatter hard-wraps long source lines before delivery, but source
+    newlines are semantic Markdown breaks in Weixin. That splits list items
+    and even ``[label](url)`` tokens into visibly separated paragraphs.
+    Preserve logical lines and leave visual wrapping to the client.
+    """
+    text = "" if content is None else str(content)
+    try:
+        from gateway.platforms.weixin import _normalize_markdown_blocks
+
+        return _normalize_markdown_blocks(text)
+    except (ImportError, AttributeError):
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        output = []
+        previous_blank = False
+        for raw in text.splitlines():
+            line = raw.rstrip()
+            blank = not line.strip()
+            if blank and previous_blank:
+                continue
+            output.append("" if blank else line)
+            previous_blank = blank
+        return "\n".join(output).strip()
+
+
 def patch_adapter(adapter: Any) -> bool:
     if getattr(adapter, "_hermes_wechat_v021_bubble_footer_v1", False):
         return False
-    required = ("send", "_send_text_chunk", "_split_text", "_process_message", "_token_store", "_account_id", "_dedup")
+    required = (
+        "send", "format_message", "_send_text_chunk", "_split_text", "_process_message",
+        "_token_store", "_account_id", "_dedup",
+    )
     missing = [name for name in required if not hasattr(adapter, name)]
     if missing:
         raise RuntimeError(f"unsupported WeixinAdapter; missing: {', '.join(missing)}")
 
     original_send = adapter.send
+    original_format_message = adapter.format_message
     original_send_text_chunk = adapter._send_text_chunk
     original_split_text = adapter._split_text
     original_process_message = adapter._process_message
     store = BubbleCounterStore(_counter_path())
     queue = PendingBubbleStore(_queue_path())
     locks: Dict[str, asyncio.Lock] = {}
+
+    def format_message(_self: Any, content: Optional[str]) -> str:
+        return _normalize_transport_markdown(content)
 
     def split_text(_self: Any, content: str):
         limit = max(1, int(getattr(_self, "MAX_MESSAGE_LENGTH", 2000)) - FOOTER_RESERVE)
@@ -615,6 +650,7 @@ def patch_adapter(adapter: Any) -> bool:
         )
         return None
 
+    adapter.format_message = MethodType(format_message, adapter)
     adapter._split_text = MethodType(split_text, adapter)
     adapter._send_text_chunk = MethodType(send_text_chunk, adapter)
     adapter.send = MethodType(send, adapter)
@@ -624,6 +660,7 @@ def patch_adapter(adapter: Any) -> bool:
     adapter._hermes_wechat_v021_bubble_footer_v1 = True
     adapter._hermes_wechat_v021_bubble_footer_originals = {
         "send": original_send,
+        "format_message": original_format_message,
         "_send_text_chunk": original_send_text_chunk,
         "_split_text": original_split_text,
         "_process_message": original_process_message,
