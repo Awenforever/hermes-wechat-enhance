@@ -12,6 +12,7 @@ from contextlib import contextmanager, suppress
 import contextvars
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -34,6 +35,13 @@ _ACTIVE_MODEL: contextvars.ContextVar[str] = contextvars.ContextVar(
 _TURN_MODELS: Dict[str, tuple[str, float, bool, str]] = {}
 _TURN_MODELS_LOCK = threading.RLock()
 TURN_MODEL_TTL_SECONDS = 6 * 3600
+
+
+async def _set_context_token(store: Any, account_id: str, chat_id: str, token: str) -> None:
+    """Support both synchronous and asynchronous Hermes token stores."""
+    result = store.set(account_id, chat_id, token)
+    if inspect.isawaitable(result):
+        await result
 
 
 def _safe_model(value: Any) -> str:
@@ -616,7 +624,7 @@ def patch_adapter(adapter: Any) -> bool:
         context_token = str(message.get("context_token") or "").strip()
         drain_result: Optional[Dict[str, Any]] = None
         if context_token:
-            await _self._token_store.set(_self._account_id, sender_id, context_token)
+            await _set_context_token(_self._token_store, _self._account_id, sender_id, context_token)
             drain_result = await drain_pending(_self, sender_id)
 
         text = str(_extract_text(message.get("item_list") or []) or "")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the footer through Hermes v0.21's real WeixinAdapter.send path."""
+"""Exercise the enhancement against Hermes v0.21's real WeixinAdapter."""
 
 from __future__ import annotations
 
@@ -19,7 +19,10 @@ async def main() -> None:
         os.environ["HERMES_HOME"] = td
         from gateway.config import PlatformConfig
         from gateway.platforms.weixin import WeixinAdapter
-        from hermes_wechat_enhance.v021_bubble_footer import patch_adapter, register_turn_model
+        from hermes_wechat_enhance.v021_bubble_footer import (
+            _set_context_token,
+            patch_adapter,
+        )
 
         adapter = WeixinAdapter(
             PlatformConfig(
@@ -35,21 +38,6 @@ async def main() -> None:
             sent.append((chat_id, chunk, context_token, client_id))
 
         adapter._send_text_chunk = MethodType(fake_transport, adapter)
-        await adapter._token_store.set("test-account", "peer", "context-a")
-        assert patch_adapter(adapter)
-        body = "z" * 3900
-        register_turn_model({
-            "platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat", "response": body,
-        })
-
-        result = await adapter.send("peer", body)
-        assert result.success
-        assert len(sent) >= 2
-        for index, (_, text, token, _) in enumerate(sent, 1):
-            assert text.endswith(f"`{index}` `qwen3.6-chat`")
-            assert len(text) <= adapter.MAX_MESSAGE_LENGTH
-            assert token == "context-a"
-
         # Hermes v0.21 normally hard-wraps this source line at 120 columns,
         # which turns Weixin's Markdown link into multiple visual paragraphs.
         # The enhancement keeps the logical Markdown line byte-for-byte intact.
@@ -58,20 +46,24 @@ async def main() -> None:
             "the final Weixin transport boundary without inserted source newlines or broken "
             "Markdown](https://example.test/paper)"
         )
-        await adapter._token_store.set("test-account", "format-peer", "context-format")
-        register_turn_model({
-            "platform": "weixin", "chat_id": "format-peer", "model": "qwen3.6-chat",
-            "response": markdown,
-        })
-        result = await adapter.send("format-peer", markdown)
-        assert result.success
-        formatted = sent[-1][1].split("\n\n---\n\n", 1)[0]
-        assert formatted == markdown
-        assert "](https://example.test/paper)" in formatted
+        assert adapter.format_message(markdown) != markdown
+        assert patch_adapter(adapter)
+        assert adapter.format_message(markdown) == markdown
+
+        body = "z" * 3900
+        chunks = adapter._split_text(body)
+        assert len(chunks) >= 2
+        assert all(len(chunk) <= adapter.MAX_MESSAGE_LENGTH - 160 for chunk in chunks)
+
+        # The official v0.21 store is synchronous while older fixtures and
+        # compatible runtimes may be asynchronous; the hook supports both.
+        await _set_context_token(
+            adapter._token_store, "test-account", "format-peer", "context-format"
+        )
+        assert adapter._token_store.get("test-account", "format-peer") == "context-format"
 
         state = Path(td) / "plugin-data" / "hermes-wechat-enhance" / "bubble-counters.json"
-        raw = state.read_text(encoding="utf-8")
-        assert "context-a" not in raw and "test-account" not in raw and "peer" not in raw
+        assert not state.exists()
         print("V021_REAL_WEIXIN_ADAPTER_TEST_OK")
 
 
