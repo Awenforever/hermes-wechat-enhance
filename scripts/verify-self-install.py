@@ -406,6 +406,16 @@ environment = dict(os.environ)
 environment["HERMES_GATEWAY_SRC"] = str(GATEWAY_SRC)
 environment["PYTHONDONTWRITEBYTECODE"] = "1"
 
+
+def gateway_python() -> str:
+    """Use Hermes' own interpreter for tests that import the live gateway."""
+    candidates = (
+        GATEWAY_SRC / ".venv" / "bin" / "python3",
+        GATEWAY_SRC / ".venv" / "bin" / "python",
+        GATEWAY_SRC / ".venv" / "Scripts" / "python.exe",
+    )
+    return str(next((path for path in candidates if path.is_file()), Path(sys.executable)))
+
 if current_official_profile:
     process = subprocess.run(
         [sys.executable, str(compat_contract_test)],
@@ -449,7 +459,7 @@ elif native_v021_profile:
         ("test-v021-real-adapter.py", "V021_REAL_WEIXIN_ADAPTER_TEST_OK"),
     ):
         process = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name(name))],
+            [gateway_python(), str(Path(__file__).with_name(name))],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
