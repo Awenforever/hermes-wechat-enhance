@@ -32,6 +32,9 @@ FOOTER_RESERVE = 160
 _ACTIVE_MODEL: contextvars.ContextVar[str] = contextvars.ContextVar(
     "hermes_wechat_v021_active_model", default="hermes"
 )
+_STREAM_BOUNDARY_MODEL: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "hermes_wechat_v021_stream_boundary_model", default=None
+)
 _TURN_MODELS: Dict[str, tuple[str, float, bool, str]] = {}
 _TURN_MODELS_LOCK = threading.RLock()
 TURN_MODEL_TTL_SECONDS = 6 * 3600
@@ -330,6 +333,15 @@ def _resolve_model(
     )
     if explicit:
         return _safe_model(explicit), False
+    # Hermes' stream consumer has one exceptional fallback rail for text that
+    # precedes an approval/clarification prompt.  That rail calls adapter.send
+    # without forwarding the consumer metadata.  patch_stream_consumer scopes
+    # the already-proven model origin across that exact call, avoiding both a
+    # false ``hermes`` footer and the unsafe chat-wide model inference that used
+    # to mislabel approval/progress/lifecycle messages.
+    boundary_model = _STREAM_BOUNDARY_MODEL.get()
+    if boundary_model:
+        return _safe_model(boundary_model), False
     # Unmarked sends are Hermes-owned control traffic by default.  The sole
     # exception is the completed agent result: agent:end supplies both the
     # actual fallback-aware model and a response prefix, which must match the
@@ -354,26 +366,62 @@ def patch_stream_consumer() -> bool:
         from gateway.stream_consumer import GatewayStreamConsumer
     except (ImportError, AttributeError):
         return False
-    if getattr(GatewayStreamConsumer, "_hermes_wechat_model_origin_v1", False):
-        return False
-    original_init = GatewayStreamConsumer.__init__
+    installed = False
+    if not getattr(GatewayStreamConsumer, "_hermes_wechat_model_origin_v1", False):
+        original_init = GatewayStreamConsumer.__init__
 
-    @functools.wraps(original_init)
-    def wrapped(self: Any, *args: Any, **kwargs: Any) -> None:
-        adapter = kwargs.get("adapter") or (args[0] if args else None)
-        chat_id = kwargs.get("chat_id") or (args[1] if len(args) > 1 else "")
-        name = str(getattr(adapter, "name", "") or "").lower()
-        if "weixin" in name:
-            pending = _peek_turn_model(str(chat_id))
-            if pending and not pending[1]:
-                metadata = dict(kwargs.get("metadata") or {})
-                metadata.update({"actor": "model", "model_name": pending[0]})
-                kwargs["metadata"] = metadata
-        original_init(self, *args, **kwargs)
+        @functools.wraps(original_init)
+        def wrapped(self: Any, *args: Any, **kwargs: Any) -> None:
+            adapter = kwargs.get("adapter") or (args[0] if args else None)
+            chat_id = kwargs.get("chat_id") or (args[1] if len(args) > 1 else "")
+            name = str(getattr(adapter, "name", "") or "").lower()
+            if "weixin" in name:
+                pending = _peek_turn_model(str(chat_id))
+                if pending and not pending[1]:
+                    metadata = dict(kwargs.get("metadata") or {})
+                    metadata.update({"actor": "model", "model_name": pending[0]})
+                    kwargs["metadata"] = metadata
+            original_init(self, *args, **kwargs)
 
-    GatewayStreamConsumer.__init__ = wrapped
-    GatewayStreamConsumer._hermes_wechat_model_origin_v1 = True
-    return True
+        GatewayStreamConsumer.__init__ = wrapped
+        GatewayStreamConsumer._hermes_wechat_model_origin_v1 = True
+        installed = True
+
+    # Hermes v0.21's approval/clarification boundary has a fallback send rail
+    # that intentionally lives outside the ordinary _send_or_edit path.  Core
+    # currently omits metadata on that one adapter.send call.  Carry provenance
+    # in a task-local scope around the boundary rather than guessing from text
+    # or borrowing the last model for the whole chat.
+    boundary_method = getattr(GatewayStreamConsumer, "_finalize_boundary_stream", None)
+    if (
+        callable(boundary_method)
+        and not getattr(GatewayStreamConsumer, "_hermes_wechat_boundary_origin_v2", False)
+    ):
+        @functools.wraps(boundary_method)
+        async def wrapped_boundary(self: Any, *args: Any, **kwargs: Any) -> Any:
+            metadata = dict(getattr(self, "metadata", None) or {})
+            actor = str(metadata.get("actor") or "").strip().lower()
+            model = next(
+                (
+                    metadata.get(key)
+                    for key in ("model_name", "resolved_model", "routed_model", "model")
+                    if metadata.get(key)
+                ),
+                None,
+            )
+            if actor != "model" or not model:
+                return await boundary_method(self, *args, **kwargs)
+            token = _STREAM_BOUNDARY_MODEL.set(_safe_model(model))
+            try:
+                return await boundary_method(self, *args, **kwargs)
+            finally:
+                _STREAM_BOUNDARY_MODEL.reset(token)
+
+        GatewayStreamConsumer._finalize_boundary_stream = wrapped_boundary
+        GatewayStreamConsumer._hermes_wechat_boundary_origin_v2 = True
+        installed = True
+
+    return installed
 
 
 def _iter_context_adapters(context: Optional[Dict[str, Any]]) -> Iterable[Any]:
@@ -741,6 +789,7 @@ async def install_v021_bubble_footer_hook(
             "continue_intercept": True,
             "all_inbound_context_refresh": True,
             "turn_model_before_interim": True,
+            "stream_boundary_model_origin": True,
         },
         "pending_bubbles": pending,
         "recorded_at": time.time(),

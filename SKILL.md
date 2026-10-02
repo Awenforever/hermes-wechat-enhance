@@ -6,13 +6,53 @@ Hermes Weixin gateway enhancement skill.
 
 This skill owns the Weixin adapter enhancement layer for Hermes. It provides `/continue`, startup-ready notification, footer model attribution, system-message classification, model metadata propagation across streaming/queued/handoff send rails, and reliable text delivery using stable `_delivery_id` plus `SendResult.success`.
 
+## Current installation contract
+
+The public release targets Hermes `>=0.21.3,<0.22`. On this family the plugin
+is hook-only and must not modify Hermes Core source. Legacy v0.18 patch material
+below is retained for controlled migration and historical verification, not as
+the default installation path.
+
+When Hermes is asked to install this plugin, it must:
+
+1. inspect the active Hermes version, profile, Weixin readiness, existing hook,
+   and persistent data paths without changing them;
+2. install or update plugin/runtime code while preserving pairing, credentials,
+   counters, queues, audit records, configuration, and unrelated files;
+3. explain and offer customization for startup notification/message, local
+   audit capture, and the target profile;
+4. **ask for explicit user confirmation before enabling the plugin, restarting
+   the Gateway, or sending any real Weixin message**;
+5. run offline verification before enablement, then verify runtime health after
+   the confirmed restart;
+6. never request a new QR scan or pairing code when the existing profile remains
+   healthy.
+
+Do not select or hard-code a model. Model selection belongs to Hermes. Do not
+infer that Weixin is the user's only channel; this plugin activates only for the
+already configured Weixin adapter.
+
+For v0.21 the normal lifecycle is:
+
+```bash
+hermes plugins install Awenforever/hermes-wechat-enhance
+hermes plugins enable hermes-wechat-enhance       # only after confirmation
+hermes wechat-enhance install-hook
+hermes gateway restart                            # only after confirmation
+hermes wechat-enhance status
+```
+
 ## Owned files
 
 ```text
-/opt/hermes/gateway/platforms/weixin.py
-/opt/data/hooks/hermes-wechat-enhance/handler.py
-/opt/data/skills/hermes-wechat-enhance/
+$HERMES_HOME/plugins/hermes-wechat-enhance/
+$HERMES_HOME/hooks/hermes-wechat-enhance/
+$HERMES_HOME/plugin-data/hermes-wechat-enhance/
 ```
+
+Legacy v0.18 migration may operate on an explicitly verified
+`gateway/platforms/weixin.py`; v0.21 installation must leave `/opt/hermes`
+byte-unchanged.
 
 ## Install
 

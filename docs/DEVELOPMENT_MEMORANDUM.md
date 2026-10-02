@@ -1,0 +1,147 @@
+# Hermes WeChat Enhance — Development Memorandum
+
+Internal engineering memorandum. Keep incident history, attribution rules,
+compatibility traps, and regression obligations here rather than turning the
+public README into a development log.
+
+## Non-negotiable invariants
+
+1. **Attribute the physical bubble, not the chat.** Model identity comes from
+   the exact producing turn/send rail. Never borrow the last model seen in a
+   chat as a default.
+2. **Unknown origin fails closed to `hermes`.** Approvals, progress, command
+   confirmations, errors, and lifecycle notices must not inherit a model.
+3. **Every model rail carries provenance.** Commentary, streamed segments,
+   pre-approval/pre-clarification prose, final responses, multipart chunks,
+   retry/FIFO recovery, and provider fallback retain the actual model.
+4. **A scope ends where its rail ends.** A task-local ContextVar may bridge a
+   structurally bounded core call. Chat-global or time-window inference is
+   forbidden.
+5. **Count only acknowledged physical sends.** Failed delivery and retry do not
+   consume or duplicate a number.
+6. **FIFO is absolute.** New replies cannot jump pending bubbles. Queue rows
+   persist model identity across restart.
+7. **Every inbound message refreshes Context Token state.** `/continue` is a
+   silent local control path, not the exclusive refresh mechanism.
+8. **Fresh slash commands are not content duplicates.** Preserve provider
+   message-ID replay protection while bypassing only the secondary text hash.
+9. **Transport never inserts display-width newlines.** Markdown source lines,
+   links, lists, and code remain semantic; the client owns visual wrapping.
+10. **Install and upgrade preserve user state.** Pairing, credentials, queues,
+    counters, audit, configuration, Git state, and unrelated files survive.
+
+## Model attribution matrix
+
+| Outbound rail | Required footer | Proof source |
+|---|---|---|
+| Streamed model commentary | actual model | stream consumer metadata from the resolved turn |
+| Model prose before approval/clarification | actual model | task-local boundary provenance |
+| Final model answer | actual/fallback model | `agent:end` and response-signature match |
+| Multipart model response | actual model on every chunk | one send scope copied into each physical send |
+| Pending/retried model bubble | original actual model | model stored with durable FIFO row |
+| Plugin business message with model metadata | explicit actual model | sender-owned metadata |
+| Approval/clarification prompt or control | `hermes` | explicit system or no model provenance |
+| Command acknowledgement, heartbeat, error | `hermes` | explicit system or no model provenance |
+| Startup/shutdown/lifecycle notification | `hermes` | explicit system metadata |
+| Unknown or unmarked send | `hermes` | fail-closed default |
+
+## Repeated incident record
+
+### Only the final chunk showed the right model
+
+Attribution was attached too late or only to the final result. Capture the
+resolved model before creating the stream consumer, and retain one scoped
+origin across every physical split chunk.
+
+### Everything showed `deepseek-flash`
+
+A chat-wide current/last-model heuristic leaked into Hermes-owned messages.
+Unmarked output must be `hermes`; only structurally proven model rails override
+the default.
+
+### Pre-confirmation prose showed `hermes`
+
+Hermes v0.21 `_finalize_boundary_stream()` falls back to
+`adapter.send(chat_id, finalize_text)` without consumer metadata. Scope the
+consumer's proven model around this exact method. Do not classify text, and do
+not extend the scope to the prompt that follows.
+
+Stable runtime marker: `_hermes_wechat_boundary_origin_v2`.
+
+### Repeated `/approve` or `/continue` was lost
+
+The sender+content fingerprint treated a fresh identical slash command as a
+replay. Distinct provider message IDs are distinct controls; the same provider
+message ID remains a replay. Two early `/approve` messages do not reserve
+approval for a future request: each resolves the oldest request already pending
+when it is handled.
+
+### Only `/continue` refreshed Context Token
+
+Refresh was incorrectly placed in the special-command branch. Persist a fresh
+token before ordinary content dedup/routing for every inbound message;
+`/continue` only suppresses conversation routing.
+
+### Startup-ready notification disappeared
+
+Observed causes included opt-in-only configuration, wrong `HERMES_HOME`, a
+suppression sentinel in an extra `.hermes` directory, and restarts that bypassed
+the planned marker. Required behavior: default on, profile-scoped target,
+one-shot suppression receipt, explicit system metadata, acknowledged logging.
+
+### Markdown links and list items developed blank lines
+
+The core formatter hard-wrapped source at a visual width. Weixin treats source
+newlines as semantic Markdown. Normalize blocks without visual wrapping and
+split only at the physical limit with a Markdown-aware splitter.
+
+## Hermes v0.21 send-rail audit
+
+Audit these boundaries before raising `requires_hermes`:
+
+- `GatewayStreamConsumer.__init__`: turn model injection;
+- `_send_or_edit` / `_first_send`: normal stream and final metadata;
+- stream fallback helpers: final retry, tail sends, overflow continuations;
+- `_finalize_boundary_stream`: pre-prompt fallback—the metadata-dropping rail
+  found in the 2026-10-02 audit;
+- approval, clarify, busy, progress, command, update, and lifecycle senders:
+  remain Hermes-owned unless explicit model provenance exists;
+- `WeixinAdapter.send` → format → split → `_send_text_chunk`: provenance remains
+  active across every chunk and FIFO enqueue.
+
+Search every `adapter.send(` call, but review structurally: the mere presence of
+`metadata=` does not prove that edits, native streams, boundaries, or background
+callbacks preserve the correct origin.
+
+## Required regression matrix
+
+No release is acceptable unless tests prove all of these together:
+
+- two commentary bubbles use the actual model;
+- a boundary preamble through the metadata-less fallback uses the actual model;
+- the immediately following prompt uses `hermes`—no scope leak;
+- approval, acknowledgement, and progress use `hermes` during an active turn;
+- final answer after provider fallback uses the actual fallback model;
+- every multipart chunk uses the same actual model;
+- failure + restart/FIFO drain preserves model and monotonic counters;
+- ordinary and duplicate inbound messages refresh Context Token before dedup;
+- fresh repeated slash commands pass; exact message-ID replay does not;
+- long Markdown link/list lines remain unbroken at the transport boundary;
+- startup-ready uses explicit `hermes` metadata and acknowledged delivery;
+- install is idempotent, uninstall fails closed, and user state is preserved.
+
+Run both the simulated matrix and the real Hermes v0.21 adapter/stream-consumer
+test. A fake adapter alone is insufficient when the defect can live upstream in
+Hermes' stream consumer.
+
+## Documentation discipline
+
+- `README.md` / `README_CN.md`: value, install, configuration, operations,
+  privacy, troubleshooting—never an incident diary or patch inventory.
+- `SKILL.md`: automation/install contract and safety gates.
+- This memorandum: recurring failures, architectural reasoning, regressions.
+- `MAINTAINER_REFERENCE.md`: legacy source-patch and migration reference.
+
+When a visible footer or delivery defect is reported, update the invariant,
+root-cause record, and regression matrix here in the same release. Do not wait
+for the same defect class to be reported on a second send rail.

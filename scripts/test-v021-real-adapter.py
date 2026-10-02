@@ -22,7 +22,9 @@ async def main() -> None:
         from hermes_wechat_enhance.v021_bubble_footer import (
             _set_context_token,
             patch_adapter,
+            patch_stream_consumer,
         )
+        from gateway.stream_consumer import GatewayStreamConsumer
 
         adapter = WeixinAdapter(
             PlatformConfig(
@@ -49,6 +51,30 @@ async def main() -> None:
         assert adapter.format_message(markdown) != markdown
         assert patch_adapter(adapter)
         assert adapter.format_message(markdown) == markdown
+        state = Path(td) / "plugin-data" / "hermes-wechat-enhance" / "bubble-counters.json"
+        assert not state.exists()
+
+        # Exercise Hermes' real approval/clarification boundary fallback.  The
+        # core fallback omits metadata on adapter.send; the enhancement must
+        # retain model provenance only for this pre-prompt body and then clear
+        # it before the following control prompt.
+        assert patch_stream_consumer()
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="boundary-peer",
+            metadata={"actor": "model", "model_name": "deepseek-flash"},
+        )
+        consumer._accumulated = "model preamble before confirmation"
+
+        async def no_native_frame(_text, *, finalize=False):
+            return False
+
+        consumer._send_frame = no_native_frame
+        assert await consumer._finalize_boundary_stream("Clarification")
+        assert sent[-1][1].endswith("`deepseek-flash`")
+        control = await adapter.send("boundary-peer", "confirmation prompt")
+        assert control.success
+        assert sent[-1][1].endswith("`hermes`")
 
         body = "z" * 3900
         chunks = adapter._split_text(body)
@@ -62,8 +88,7 @@ async def main() -> None:
         )
         assert adapter._token_store.get("test-account", "format-peer") == "context-format"
 
-        state = Path(td) / "plugin-data" / "hermes-wechat-enhance" / "bubble-counters.json"
-        assert not state.exists()
+        assert state.exists()
         print("V021_REAL_WEIXIN_ADAPTER_TEST_OK")
 
 

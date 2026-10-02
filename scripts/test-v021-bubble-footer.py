@@ -110,6 +110,13 @@ async def main():
                 self.chat_id = chat_id
                 self.metadata = metadata
 
+            async def _finalize_boundary_stream(self, _reason):
+                # Mirror Hermes v0.21's exceptional fallback rail: the
+                # pre-prompt model text is sent without consumer metadata.
+                return (
+                    await self.adapter.send(self.chat_id, "boundary preamble")
+                ).success
+
         stream_consumer_module.GatewayStreamConsumer = FakeStreamConsumer
         platforms = types.ModuleType("gateway.platforms")
         platforms.__path__ = []
@@ -168,6 +175,13 @@ async def main():
         consumer = FakeStreamConsumer(adapter=adapter, chat_id="peer")
         assert consumer.metadata["actor"] == "model"
         assert consumer.metadata["model_name"] == "deepseek-flash"
+        assert await consumer._finalize_boundary_stream("Clarification")
+        assert adapter.sent[-1][1].endswith("`deepseek-flash`")
+        # The boundary scope must not leak into the prompt/control send that
+        # immediately follows it.
+        result = await adapter.send("peer", "clarification prompt")
+        assert result.success
+        assert adapter.sent[-1][1].endswith("`hermes`")
         for content in ("commentary one", "commentary two"):
             result = await adapter.send("peer", content, metadata=consumer.metadata)
             assert result.success
@@ -182,9 +196,11 @@ async def main():
         result = await adapter.send("peer", "final answer")
         assert result.success
         turn_bubbles = adapter.sent[before:]
-        assert len(turn_bubbles) == 6
-        assert all(item[1].endswith("`deepseek-flash`") for item in turn_bubbles[:2])
-        assert all(item[1].endswith("`hermes`") for item in turn_bubbles[2:5])
+        assert len(turn_bubbles) == 8
+        assert turn_bubbles[0][1].endswith("`deepseek-flash`")
+        assert turn_bubbles[1][1].endswith("`hermes`")
+        assert all(item[1].endswith("`deepseek-flash`") for item in turn_bubbles[2:4])
+        assert all(item[1].endswith("`hermes`") for item in turn_bubbles[4:7])
         assert turn_bubbles[-1][1].endswith("`deepseek-flash`")
         adapter._token_store.value = "token-a"
 
