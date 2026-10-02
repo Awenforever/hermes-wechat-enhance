@@ -83,6 +83,29 @@ async def main() -> None:
             await module._send_startup_ready({"adapters": {"weixin": Adapter()}})
             assert len(calls) == before
             assert not sentinel.exists()
+
+        # A root-owned or otherwise undeletable sentinel suppresses exactly
+        # once. Its receipt prevents permanent suppression on every restart.
+        sentinel = home / "wechat-enhance" / "suppress-startup-ready-once"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+        original_unlink = Path.unlink
+
+        def guarded_unlink(path, *args, **kwargs):
+            if path == sentinel:
+                raise PermissionError("fixture-owned sentinel")
+            return original_unlink(path, *args, **kwargs)
+
+        Path.unlink = guarded_unlink
+        try:
+            before = len(calls)
+            await module._send_startup_ready({"adapters": {"weixin": Adapter()}})
+            assert len(calls) == before
+            await module._send_startup_ready({"adapters": {"weixin": Adapter()}})
+            assert len(calls) == before + 1
+        finally:
+            Path.unlink = original_unlink
+            sentinel.unlink(missing_ok=True)
         print("WECHAT_STARTUP_TARGET_INHERIT_TEST=PASS")
 
 

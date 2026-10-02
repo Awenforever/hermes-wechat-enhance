@@ -4,6 +4,7 @@
 # HERMES_WECHAT_CURRENT_OFFICIAL_RUNTIME_COMPAT_HOOK_V1
 import os
 import sys
+import json
 from pathlib import Path
 
 
@@ -85,7 +86,67 @@ def _audit_enabled() -> bool:
 
 # WECHAT_ENHANCE_STARTUP_READY_OWNER_V1
 # WECHAT_ENHANCE_STARTUP_READY_ACK_V2
-# WECHAT_ENHANCE_STARTUP_READY_SUPPRESS_ONCE_V1
+# WECHAT_ENHANCE_STARTUP_READY_SUPPRESS_ONCE_V2
+def _consume_startup_suppression(hermes_home: Path, log) -> bool:
+    """Consume one deployment sentinel without allowing an undeletable file to suppress forever."""
+    candidates = (
+        hermes_home / "wechat-enhance" / "suppress-startup-ready-once",
+        # 2.1.7 and earlier accidentally inserted an extra .hermes segment.
+        hermes_home / ".hermes" / "wechat-enhance" / "suppress-startup-ready-once",
+    )
+    sentinel = next((path for path in candidates if path.exists()), None)
+    if sentinel is None:
+        return False
+    receipt = (
+        hermes_home
+        / "plugin-data"
+        / "hermes-wechat-enhance"
+        / "startup-suppression-consumed.json"
+    )
+    try:
+        stat = sentinel.stat()
+        identity = {"path": str(sentinel), "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+    except OSError:
+        identity = {"path": str(sentinel)}
+    try:
+        previous = json.loads(receipt.read_text(encoding="utf-8"))
+    except Exception:
+        previous = None
+    if previous == identity:
+        log.warning(
+            "Hermes WeChat Enhance: ignoring already-consumed undeletable startup suppression sentinel"
+        )
+        return False
+    failed = []
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            failed.append((path, exc))
+    if failed:
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        temporary = receipt.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(identity, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(temporary, receipt)
+        for path, exc in failed:
+            log.warning(
+                "Hermes WeChat Enhance: startup suppression sentinel could not be deleted; "
+                "recorded as consumed path=%s error=%s",
+                path,
+                exc,
+            )
+    else:
+        try:
+            receipt.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("Hermes WeChat Enhance: stale suppression receipt cleanup failed: %s", exc)
+    return True
+
+
 async def _send_startup_ready(context: dict):
     import logging
 
@@ -97,20 +158,7 @@ async def _send_startup_ready(context: dict):
     hermes_home = Path(
         os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))
     ).expanduser()
-    suppress_candidates = (
-        hermes_home / "wechat-enhance" / "suppress-startup-ready-once",
-        # 2.1.7 and earlier accidentally inserted an extra .hermes segment.
-        hermes_home / ".hermes" / "wechat-enhance" / "suppress-startup-ready-once",
-    )
-    suppress_once = next((path for path in suppress_candidates if path.exists()), None)
-    if suppress_once is not None:
-        for path in suppress_candidates:
-            if not path.exists():
-                continue
-            try:
-                path.unlink()
-            except OSError as exc:
-                log.warning("Hermes WeChat Enhance: failed to consume startup-ready suppress sentinel: %s", exc)
+    if _consume_startup_suppression(hermes_home, log):
         log.warning("Hermes WeChat Enhance: startup ready notification suppressed once for controlled deployment")
         return
 

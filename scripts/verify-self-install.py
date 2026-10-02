@@ -27,7 +27,8 @@ _ready_env = os.environ.get("HERMES_WEIXIN_STARTUP_READY_NOTIFY", "").strip()
 # notifications. Runtime behavior is not changed; only this fake-adapter fixture
 # normalizes disabled values to the built-in ready text.
 _ready_disabled = _ready_env.lower() in {"0", "false", "no", "off", "disabled"}
-READY = DEFAULT_READY if (not _ready_env or _ready_env == "1" or _ready_disabled) else _ready_env
+_ready_enabled = _ready_env.lower() in {"1", "true", "yes", "on", "enabled"}
+READY = DEFAULT_READY if (not _ready_env or _ready_enabled or _ready_disabled) else _ready_env
 
 def require(cond: bool, msg: str) -> None:
     if not cond:
