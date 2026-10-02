@@ -14,7 +14,7 @@ plugins:
 config:
   hermes-wechat-enhance:
     capture_messages: true
-    startup_notification: false
+    startup_notification: true
     legacy_runtime_compat: false
   hermes-alive:
     enabled: false

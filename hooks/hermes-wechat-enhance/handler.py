@@ -46,6 +46,7 @@ if str(_SKILL_DIR) not in sys.path:
 
 from hermes_wechat_enhance.current_official_runtime_compat import install_weixin_runtime_compat_hook
 from hermes_wechat_enhance.peer import resolve_weixin_peer
+from hermes_wechat_enhance.settings import configured_bool, startup_ready_message
 from hermes_wechat_enhance.store import MessageStore
 from hermes_wechat_enhance.v021_bubble_footer import (
     install_v021_bubble_footer_hook,
@@ -58,8 +59,11 @@ _store = MessageStore()
 async def handle(event_type, context):
     # WECHAT_ENHANCE_STARTUP_READY_OWNER_V1
     if event_type == "gateway:startup":
-        legacy_compat = os.getenv("HERMES_WECHAT_ENABLE_LEGACY_RUNTIME_COMPAT", "").strip().lower()
-        if legacy_compat in {"1", "true", "yes", "on"}:
+        if configured_bool(
+            "HERMES_WECHAT_ENABLE_LEGACY_RUNTIME_COMPAT",
+            "legacy_runtime_compat",
+            False,
+        ):
             await install_weixin_runtime_compat_hook(context)
         else:
             await install_v021_bubble_footer_hook(context)
@@ -76,8 +80,7 @@ async def handle(event_type, context):
 
 
 def _audit_enabled() -> bool:
-    value = os.getenv("HERMES_WECHAT_CAPTURE_MESSAGES", "1").strip().lower()
-    return value not in {"0", "false", "no", "off", "disabled"}
+    return configured_bool("HERMES_WECHAT_CAPTURE_MESSAGES", "capture_messages", True)
 
 
 # WECHAT_ENHANCE_STARTUP_READY_OWNER_V1
@@ -94,22 +97,25 @@ async def _send_startup_ready(context: dict):
     hermes_home = Path(
         os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))
     ).expanduser()
-    suppress_once = hermes_home / ".hermes" / "wechat-enhance" / "suppress-startup-ready-once"
-    if suppress_once.exists():
-        try:
-            suppress_once.unlink()
-        except OSError as exc:
-            log.warning("Hermes WeChat Enhance: failed to consume startup-ready suppress sentinel: %s", exc)
+    suppress_candidates = (
+        hermes_home / "wechat-enhance" / "suppress-startup-ready-once",
+        # 2.1.7 and earlier accidentally inserted an extra .hermes segment.
+        hermes_home / ".hermes" / "wechat-enhance" / "suppress-startup-ready-once",
+    )
+    suppress_once = next((path for path in suppress_candidates if path.exists()), None)
+    if suppress_once is not None:
+        for path in suppress_candidates:
+            if not path.exists():
+                continue
+            try:
+                path.unlink()
+            except OSError as exc:
+                log.warning("Hermes WeChat Enhance: failed to consume startup-ready suppress sentinel: %s", exc)
         log.warning("Hermes WeChat Enhance: startup ready notification suppressed once for controlled deployment")
         return
 
-    ready = os.getenv("HERMES_WEIXIN_STARTUP_READY_NOTIFY", "").strip()
-    if not ready:
-        log.info("Hermes WeChat Enhance: startup ready notification not configured")
-        return
-    if ready == "1":
-        ready = "♻️ Gateway online — Hermes is back and ready."
-    if ready.lower() in {"0", "false", "no", "off", "disabled"}:
+    ready = startup_ready_message("♻️ Gateway online — Hermes is back and ready.")
+    if ready is None:
         log.warning("Hermes WeChat Enhance: startup ready notification disabled")
         return
     adapters = context.get("adapters") if isinstance(context, dict) else None

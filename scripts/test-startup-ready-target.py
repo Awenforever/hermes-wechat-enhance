@@ -25,7 +25,7 @@ async def main() -> None:
 
         os.environ["HERMES_HOME"] = str(home)
         os.environ["HERMES_WECHAT_ENHANCE_SOURCE_DIR"] = str(root)
-        os.environ["HERMES_WEIXIN_STARTUP_READY_NOTIFY"] = "1"
+        os.environ.pop("HERMES_WEIXIN_STARTUP_READY_NOTIFY", None)
         os.environ.pop("HERMES_PROACTIVE_WEIXIN_CHAT_ID", None)
         sys.path.insert(0, str(root))
 
@@ -34,6 +34,8 @@ async def main() -> None:
         module = importlib.util.module_from_spec(spec)
         assert spec and spec.loader
         spec.loader.exec_module(module)
+        import hermes_wechat_enhance.settings as settings
+
         calls = []
 
         class Adapter:
@@ -46,7 +48,41 @@ async def main() -> None:
         await module._send_startup_ready({"adapters": {"weixin": Adapter()}})
         assert len(calls) == 1
         assert calls[0][0] == "human-peer"
+        assert calls[0][1] == "♻️ Gateway online — Hermes is back and ready."
         assert calls[0][2]["_delivery_id"] == "hermes-wechat-enhance-startup-ready"
+
+        # Hermes plugin settings are a real runtime input, not merely a
+        # manifest declaration. Explicit disable must win over the default.
+        settings._load_config = lambda: {
+            "plugins": {"entries": {"hermes-wechat-enhance": {"settings": {
+                "startup_notification": False,
+            }}}}
+        }
+        await module._send_startup_ready({"adapters": {"weixin": Adapter()}})
+        assert len(calls) == 1
+
+        settings._load_config = lambda: {
+            "plugins": {"entries": {"hermes-wechat-enhance": {"settings": {
+                "startup_notification": True,
+                "startup_message": "custom ready",
+            }}}}
+        }
+        await module._send_startup_ready({"adapters": {"weixin": Adapter()}})
+        assert calls[-1][1] == "custom ready"
+
+        # Consume both the corrected profile-relative path and the legacy
+        # 2.1.7 path so upgrades cannot leave a stale one-shot suppression.
+        for relative in (
+            Path("wechat-enhance/suppress-startup-ready-once"),
+            Path(".hermes/wechat-enhance/suppress-startup-ready-once"),
+        ):
+            sentinel = home / relative
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.touch()
+            before = len(calls)
+            await module._send_startup_ready({"adapters": {"weixin": Adapter()}})
+            assert len(calls) == before
+            assert not sentinel.exists()
         print("WECHAT_STARTUP_TARGET_INHERIT_TEST=PASS")
 
 

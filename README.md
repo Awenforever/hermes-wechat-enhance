@@ -78,10 +78,28 @@ hermes wechat-enhance migrate-v018
 | 选项 | 默认值 | 作用 |
 |---|---:|---|
 | `capture_messages` | `true` | 保存有界的本地消息审计副本 |
-| `startup_notification` | `false` | Gateway 启动后发送就绪提示 |
+| `startup_notification` | `true` | Gateway 启动后发送就绪提示；可明确设为 `false` 关闭 |
+| `startup_message` | `♻️ Gateway online — Hermes is back and ready.` | 自定义就绪通知正文 |
 | `legacy_runtime_compat` | `false` | 仅用于 v0.18 兼容；v0.21 不应开启 |
 
-配置和状态位于当前 Hermes profile 的 `plugins/`、`hooks/`、`plugin-data/` 目录中，不修改 Hermes Core 源码。
+插件同时支持 Hermes 的 `plugins.entries.hermes-wechat-enhance.settings` 配置和兼容环境变量；
+环境变量具有最高优先级。配置和状态位于当前 Hermes profile 的 `plugins/`、`hooks/`、
+`plugin-data/` 目录中，不修改 Hermes Core 源码。
+
+需要定制时，让 Hermes 引导修改下面这段配置即可；未配置时，就绪通知默认开启：
+
+```yaml
+plugins:
+  entries:
+    hermes-wechat-enhance:
+      settings:
+        startup_notification: true
+        startup_message: "♻️ Gateway online — Hermes is back and ready."
+        capture_messages: true
+```
+
+兼容环境变量为 `HERMES_WEIXIN_STARTUP_READY_NOTIFY`：`1` 使用默认文案，
+`0/false/off` 关闭，其他非空字符串作为自定义文案。
 
 ## 安全与隐私
 
