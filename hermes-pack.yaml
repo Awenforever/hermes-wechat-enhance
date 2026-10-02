@@ -6,7 +6,7 @@ plugins:
   - repo: Awenforever/hermes-wechat-enhance
     ref: be45463e26da47dbc98b5580dd30290f8b32c784
   - repo: Awenforever/hermes-alive
-    ref: b91cdfd7ae0d8cc0b8c2f5fd7cbb3ba4628e33c1
+    ref: aaf6126fccb767e42096832e5ed2e8712010f44f
   - repo: Awenforever/hermes-email-watchdog
     ref: 9e0a6ff08ecdac88cc757f0a8c9c30cf5ac9e44d
   - repo: Awenforever/hermes-weekly-briefing
