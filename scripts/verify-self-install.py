@@ -9,6 +9,7 @@ import os
 import py_compile
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
@@ -206,6 +207,13 @@ require(
 print("IMPORT_OK")
 print("IMPORT_BOOTSTRAP_PORTABLE_OK")
 
+# Verification must never append synthetic agent:start/agent:end fixtures to a
+# user's real audit history.  The imported hook has already resolved its live
+# paths, so replace only its test store with a disposable isolated store.
+_audit_fixture_tmp = tempfile.TemporaryDirectory(prefix="wechat-enhance-verify-audit-")
+_audit_fixture_dir = Path(_audit_fixture_tmp.name)
+mod._store = mod.MessageStore(_audit_fixture_dir)
+
 class FakeResult:
     def __init__(self, success=True, error=None):
         self.success = success
@@ -261,7 +269,7 @@ async def main_async():
 
 asyncio.run(main_async())
 
-store_path = HERMES_HOME / "plugin-data" / "hermes-wechat-enhance" / "audit" / "messages.jsonl"
+store_path = _audit_fixture_dir / "messages.jsonl"
 require(store_path.exists(), f"message store not created: {store_path}")
 rows = [json.loads(x) for x in store_path.read_text("utf-8").splitlines() if x.strip()]
 require(any(r.get("direction") == "in" for r in rows), "no inbound record")
