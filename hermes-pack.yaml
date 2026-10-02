@@ -1,10 +1,10 @@
 name: awen-hermes-production-pack
 description: Production-pinned WeChat, proactive presence, email triage, and academic weekly reporting for Hermes >=0.21.3,<0.22.
 author: Awenforever
-version: 2026.09.30
+version: 2026.10.02
 plugins:
   - repo: Awenforever/hermes-wechat-enhance
-    ref: e4ff8abbe85595380429a03f0edc6bca1f59f143
+    ref: b93e14444f123576e2d024fb08521b64e7ab2af9
   - repo: Awenforever/hermes-alive
     ref: 8821fde1b6ed5b17d0b57e3620b0102d9dc98ed7
   - repo: Awenforever/hermes-email-watchdog
