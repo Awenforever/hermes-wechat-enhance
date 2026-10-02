@@ -97,6 +97,15 @@ async def main():
         gateway = types.ModuleType("gateway")
         gateway.__path__ = []
         gateway_run = types.ModuleType("gateway.run")
+        stream_consumer_module = types.ModuleType("gateway.stream_consumer")
+
+        class FakeStreamConsumer:
+            def __init__(self, adapter, chat_id, metadata=None, **_kwargs):
+                self.adapter = adapter
+                self.chat_id = chat_id
+                self.metadata = metadata
+
+        stream_consumer_module.GatewayStreamConsumer = FakeStreamConsumer
         platforms = types.ModuleType("gateway.platforms")
         platforms.__path__ = []
         weixin = types.ModuleType("gateway.platforms.weixin")
@@ -105,10 +114,12 @@ async def main():
         sys.modules.setdefault("gateway", gateway)
         sys.modules.setdefault("gateway.platforms", platforms)
         sys.modules["gateway.platforms.weixin"] = weixin
+        sys.modules["gateway.stream_consumer"] = stream_consumer_module
         from hermes_wechat_enhance.v021_bubble_footer import (
             install_v021_bubble_footer_hook,
             patch_adapter,
             patch_gateway_runner,
+            patch_stream_consumer,
             register_turn_model,
         )
 
@@ -128,22 +139,42 @@ async def main():
         assert patch_adapter(adapter) is True
         assert patch_adapter(adapter) is False
 
-        # The route is captured before streaming/interim bubbles begin and is
-        # retained for every logical send in the same turn.
+        # The route is captured before streaming begins, but only the model
+        # output transport receives it. Unmarked gateway control traffic must
+        # remain Hermes-owned even while that model turn is active.
         assert patch_gateway_runner(runner) is True
         assert patch_gateway_runner(runner) is False
+        assert patch_stream_consumer() is True
+        assert patch_stream_consumer() is False
         runner._resolve_session_agent_runtime(source=Source(), session_key="weixin:peer")
         adapter._token_store.value = "token-route-test"
         before = len(adapter.sent)
-        for content in ("commentary one", "commentary two", "final answer"):
-            result = await adapter.send("peer", content)
+        consumer = FakeStreamConsumer(adapter=adapter, chat_id="peer")
+        assert consumer.metadata["actor"] == "model"
+        assert consumer.metadata["model_name"] == "deepseek-flash"
+        for content in ("commentary one", "commentary two"):
+            result = await adapter.send("peer", content, metadata=consumer.metadata)
             assert result.success
+        for control in ("approval prompt", "command approved", "working heartbeat"):
+            result = await adapter.send("peer", control)
+            assert result.success
+            assert adapter.sent[-1][1].endswith("`hermes`")
+        register_turn_model({
+            "platform": "weixin", "chat_id": "peer", "model": "deepseek-flash",
+            "response": "final answer",
+        })
+        result = await adapter.send("peer", "final answer")
+        assert result.success
         turn_bubbles = adapter.sent[before:]
-        assert len(turn_bubbles) == 3
-        assert all(item[1].endswith("`deepseek-flash`") for item in turn_bubbles)
+        assert len(turn_bubbles) == 6
+        assert all(item[1].endswith("`deepseek-flash`") for item in turn_bubbles[:2])
+        assert all(item[1].endswith("`hermes`") for item in turn_bubbles[2:5])
+        assert turn_bubbles[-1][1].endswith("`deepseek-flash`")
         adapter._token_store.value = "token-a"
 
-        register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
+        register_turn_model({
+            "platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat", "response": "first",
+        })
         result = await adapter.send("peer", "first")
         assert result.success
         assert adapter.sent[-1][1].endswith("`1` `qwen3.6-chat`")
@@ -155,20 +186,26 @@ async def main():
         restarted = FakeAdapter()
         installed = await install_v021_bubble_footer_hook({"adapters": {"weixin": restarted}})
         assert installed["installed"] == 1 and not installed["errors"]
-        register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
+        register_turn_model({
+            "platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat", "response": "after restart",
+        })
         result = await restarted.send("peer", "after restart")
         assert result.success
         assert restarted.sent[-1][1].endswith("`3` `qwen3.6-chat`")
         adapter = restarted
 
         adapter._token_store.value = "token-b"
-        register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
+        register_turn_model({
+            "platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat", "response": "new context",
+        })
         result = await adapter.send("peer", "new context")
         assert result.success
         assert adapter.sent[-1][1].endswith("`1` `qwen3.6-chat`")
 
         adapter._token_store.value = "token-c"
-        register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
+        register_turn_model({
+            "platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat", "response": "will fail",
+        })
         adapter.fail_next = True
         result = await adapter.send("peer", "will fail")
         assert result.success
@@ -221,7 +258,9 @@ async def main():
         assert adapter._token_store.value == "token-duplicate-refresh"
 
         adapter._token_store.value = "token-e"
-        register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
+        register_turn_model({
+            "platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat", "response": "x" * 600,
+        })
         before = len(adapter.sent)
         result = await adapter.send("peer", "x" * 600)
         assert result.success

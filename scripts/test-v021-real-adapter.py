@@ -37,9 +37,12 @@ async def main() -> None:
         adapter._send_text_chunk = MethodType(fake_transport, adapter)
         await adapter._token_store.set("test-account", "peer", "context-a")
         assert patch_adapter(adapter)
-        register_turn_model({"platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat"})
+        body = "z" * 3900
+        register_turn_model({
+            "platform": "weixin", "chat_id": "peer", "model": "qwen3.6-chat", "response": body,
+        })
 
-        result = await adapter.send("peer", "z" * 3900)
+        result = await adapter.send("peer", body)
         assert result.success
         assert len(sent) >= 2
         for index, (_, text, token, _) in enumerate(sent, 1):

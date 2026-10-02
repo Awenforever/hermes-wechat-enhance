@@ -24,14 +24,14 @@ from typing import Any, Dict, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
-MARKER = "HERMES_WECHAT_V021_BUBBLE_FOOTER_V2"
+MARKER = "HERMES_WECHAT_V021_BUBBLE_FOOTER_V3"
 DELIVERY_MARKER = "HERMES_WECHAT_V021_FIFO_CONTEXT_REFRESH_V2"
 FOOTER_RESERVE = 160
 
 _ACTIVE_MODEL: contextvars.ContextVar[str] = contextvars.ContextVar(
     "hermes_wechat_v021_active_model", default="hermes"
 )
-_TURN_MODELS: Dict[str, tuple[str, float, bool]] = {}
+_TURN_MODELS: Dict[str, tuple[str, float, bool, str]] = {}
 _TURN_MODELS_LOCK = threading.RLock()
 TURN_MODEL_TTL_SECONDS = 6 * 3600
 
@@ -223,12 +223,28 @@ class PendingBubbleStore:
             return int(connection.execute("SELECT COUNT(*) FROM pending_bubbles").fetchone()[0])
 
 
-def _remember_model(chat_id: str, model: Any, *, completed: bool = False) -> None:
+def _response_signature(value: Any) -> str:
+    """Stable prefix used only to bind an agent:end result to its final send."""
+    return str(value or "").strip()[:500]
+
+
+def _remember_model(
+    chat_id: str,
+    model: Any,
+    *,
+    completed: bool = False,
+    response: Any = "",
+) -> None:
     normalized = _safe_model(model)
     if not chat_id or normalized == "hermes":
         return
     with _TURN_MODELS_LOCK:
-        _TURN_MODELS[str(chat_id)] = (normalized, time.time(), completed)
+        _TURN_MODELS[str(chat_id)] = (
+            normalized,
+            time.time(),
+            completed,
+            _response_signature(response) if completed else "",
+        )
 
 
 def register_turn_model(context: Dict[str, Any]) -> None:
@@ -242,19 +258,25 @@ def register_turn_model(context: Dict[str, Any]) -> None:
         or context.get("resolved_model")
         or context.get("routed_model")
     )
-    _remember_model(chat_id, model, completed=True)
+    response = (
+        context.get("response")
+        or context.get("final_response")
+        or context.get("content")
+        or ""
+    )
+    _remember_model(chat_id, model, completed=True, response=response)
 
 
-def _peek_turn_model(chat_id: str) -> Optional[tuple[str, bool]]:
+def _peek_turn_model(chat_id: str) -> Optional[tuple[str, bool, str]]:
     with _TURN_MODELS_LOCK:
         entry = _TURN_MODELS.get(str(chat_id))
         if not entry:
             return None
-        model, updated_at, completed = entry
+        model, updated_at, completed, response = entry
         if time.time() - updated_at > TURN_MODEL_TTL_SECONDS:
             _TURN_MODELS.pop(str(chat_id), None)
             return None
-        return model, completed
+        return model, completed, response
 
 
 def _consume_completed_model(chat_id: str, model: str) -> None:
@@ -274,7 +296,19 @@ def _is_system(metadata: Dict[str, Any]) -> bool:
     return any(tag in source for tag in ("startup-ready", "system", "lifecycle"))
 
 
-def _resolve_model(chat_id: str, metadata: Optional[Dict[str, Any]]) -> tuple[str, bool]:
+def _matches_completed_response(content: str, signature: str) -> bool:
+    candidate = str(content or "").strip()
+    signature = str(signature or "").strip()
+    if not candidate or not signature:
+        return False
+    return candidate.startswith(signature) or signature.startswith(candidate)
+
+
+def _resolve_model(
+    chat_id: str,
+    content: str,
+    metadata: Optional[Dict[str, Any]],
+) -> tuple[str, bool]:
     meta = dict(metadata or {})
     if _is_system(meta):
         return "hermes", False
@@ -288,8 +322,50 @@ def _resolve_model(chat_id: str, metadata: Optional[Dict[str, Any]]) -> tuple[st
     )
     if explicit:
         return _safe_model(explicit), False
+    # Unmarked sends are Hermes-owned control traffic by default.  The sole
+    # exception is the completed agent result: agent:end supplies both the
+    # actual fallback-aware model and a response prefix, which must match the
+    # outgoing body.  This prevents approvals, progress heartbeats, command
+    # confirmations, errors, and lifecycle notices from borrowing a chat-wide
+    # model merely because an agent turn happens to be active.
     pending = _peek_turn_model(chat_id)
-    return (_safe_model(pending[0]), pending[1]) if pending else ("hermes", False)
+    if pending and pending[1] and _matches_completed_response(content, pending[2]):
+        return _safe_model(pending[0]), True
+    return "hermes", False
+
+
+def patch_stream_consumer() -> bool:
+    """Attach the routed model only to Hermes' model-output transport.
+
+    ``GatewayStreamConsumer`` is the structural boundary for streamed model
+    deltas and interim assistant commentary.  Gateway approvals, busy/progress
+    notices, command acknowledgements, errors, and lifecycle messages bypass
+    this constructor, so they remain conservatively Hermes-owned.
+    """
+    try:
+        from gateway.stream_consumer import GatewayStreamConsumer
+    except (ImportError, AttributeError):
+        return False
+    if getattr(GatewayStreamConsumer, "_hermes_wechat_model_origin_v1", False):
+        return False
+    original_init = GatewayStreamConsumer.__init__
+
+    @functools.wraps(original_init)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> None:
+        adapter = kwargs.get("adapter") or (args[0] if args else None)
+        chat_id = kwargs.get("chat_id") or (args[1] if len(args) > 1 else "")
+        name = str(getattr(adapter, "name", "") or "").lower()
+        if "weixin" in name:
+            pending = _peek_turn_model(str(chat_id))
+            if pending and not pending[1]:
+                metadata = dict(kwargs.get("metadata") or {})
+                metadata.update({"actor": "model", "model_name": pending[0]})
+                kwargs["metadata"] = metadata
+        original_init(self, *args, **kwargs)
+
+    GatewayStreamConsumer.__init__ = wrapped
+    GatewayStreamConsumer._hermes_wechat_model_origin_v1 = True
+    return True
 
 
 def _iter_context_adapters(context: Optional[Dict[str, Any]]) -> Iterable[Any]:
@@ -447,7 +523,7 @@ def patch_adapter(adapter: Any) -> bool:
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        model, completed = _resolve_model(str(chat_id), metadata)
+        model, completed = _resolve_model(str(chat_id), content, metadata)
         token = _ACTIVE_MODEL.set(model)
         try:
             result = await original_send(
@@ -578,6 +654,7 @@ async def install_v021_bubble_footer_hook(
             logger.error("Hermes WeChat Enhance: v0.21 adapter discovery failed: %s", exc)
 
     model_route_installed = patch_gateway_runner(runner)
+    stream_origin_installed = patch_stream_consumer()
 
     installed = already = 0
     errors = []
@@ -611,6 +688,7 @@ async def install_v021_bubble_footer_hook(
         "installed": installed,
         "already": already,
         "model_route": model_route_installed,
+        "stream_origin": stream_origin_installed,
         "errors": errors,
         "capabilities": {
             "bubble_footer": True,
