@@ -68,6 +68,22 @@ not extend the scope to the prompt that follows.
 
 Stable runtime marker: `_hermes_wechat_boundary_origin_v2`.
 
+### Tool-era commentary and the normal final send showed `hermes`
+
+The 2026-10-03 production transcript exposed two distinct metadata gaps in one
+turn. On non-editable Weixin, Hermes can route model-authored interim commentary
+through `TurnRunner._send_status_text` when no stream consumer can be created.
+The same helper also sends real system status, so its exact semantic callback
+label—not message text—must mark only `interim_assistant_callback` as model
+output. Separately, `agent:end` crosses from a worker thread to the event loop;
+a fast normal final send can race ahead of that hook. Capture the completed
+`_run_agent_inner` result before delivery, using its post-fallback `model` and
+exact `final_response` signature. Do not broaden either rule to arbitrary
+status traffic or chat-wide active-model inference.
+
+Stable runtime markers: `_hermes_wechat_interim_origin_v1` and
+`_hermes_wechat_model_route_v4`.
+
 ### Repeated `/approve` or `/continue` was lost
 
 The sender+content fingerprint treated a fresh identical slash command as a
@@ -126,10 +142,14 @@ callbacks preserve the correct origin.
 No release is acceptable unless tests prove all of these together:
 
 - two commentary bubbles use the actual model;
+- direct non-streaming interim commentary uses the actual model while another
+  `_send_status_text` call in the same turn remains `hermes`;
 - a boundary preamble through the metadata-less fallback uses the actual model;
 - the immediately following prompt uses `hermes`—no scope leak;
 - approval, acknowledgement, and progress use `hermes` during an active turn;
 - final answer after provider fallback uses the actual fallback model;
+- a normal final send that beats the asynchronous `agent:end` hook still uses
+  the completed result's actual fallback model;
 - every multipart chunk uses the same actual model;
 - failure + restart/FIFO drain preserves model and monotonic counters;
 - ordinary and duplicate inbound messages refresh Context Token before dedup;

@@ -6,7 +6,7 @@
 
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.21.3%2C%20%3C0.22-5965f2)](https://github.com/NousResearch/hermes-agent)
 [![微信](https://img.shields.io/badge/通道-Weixin-07c160)](#核心能力)
-[![版本](https://img.shields.io/badge/版本-2.1.12-7950f2)](plugin.yaml)
+[![版本](https://img.shields.io/badge/版本-2.1.13-7950f2)](plugin.yaml)
 [![许可证](https://img.shields.io/badge/许可证-MIT-2f9e44)](LICENSE)
 
 [English](README.md) · [快速安装](#快速安装) · [个性化配置](#个性化配置) · [故障排查](#故障排查)

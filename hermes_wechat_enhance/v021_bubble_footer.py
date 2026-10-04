@@ -25,7 +25,7 @@ from typing import Any, Dict, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
-MARKER = "HERMES_WECHAT_V021_BUBBLE_FOOTER_V3"
+MARKER = "HERMES_WECHAT_V021_BUBBLE_FOOTER_V4"
 DELIVERY_MARKER = "HERMES_WECHAT_V021_FIFO_CONTEXT_REFRESH_V2"
 FOOTER_RESERVE = 160
 
@@ -451,15 +451,16 @@ def patch_gateway_runner(runner: Any) -> bool:
     so this boundary is both early enough and aware of /model and channel routes.
     The final hook refreshes the value if provider fallback changed the model.
     """
-    if runner is None or getattr(runner, "_hermes_wechat_model_route_v3", False):
+    if runner is None or getattr(runner, "_hermes_wechat_model_route_v4", False):
         return False
-    original = getattr(runner, "_resolve_session_agent_runtime", None)
-    if not callable(original):
+    original_resolve = getattr(runner, "_resolve_session_agent_runtime", None)
+    original_run = getattr(runner, "_run_agent_inner", None)
+    if not callable(original_resolve):
         return False
 
-    @functools.wraps(original)
+    @functools.wraps(original_resolve)
     def wrapped(*args: Any, **kwargs: Any):
-        resolved = original(*args, **kwargs)
+        resolved = original_resolve(*args, **kwargs)
         source = kwargs.get("source")
         if source is None:
             source = next(
@@ -473,7 +474,79 @@ def patch_gateway_runner(runner: Any) -> bool:
         return resolved
 
     runner._resolve_session_agent_runtime = wrapped
-    runner._hermes_wechat_model_route_v3 = True
+    # ``agent:end`` is emitted from the worker thread and scheduled onto the
+    # gateway loop. On a fast non-streaming Weixin turn, the normal final send
+    # can beat that hook and arrive without model metadata. Record the completed
+    # result synchronously at the runner boundary instead. The result contains
+    # the actual post-fallback model selected by Hermes, so this is provenance,
+    # not a chat-wide last-model guess.
+    if callable(original_run):
+        @functools.wraps(original_run)
+        async def wrapped_run(*args: Any, **kwargs: Any):
+            result = await original_run(*args, **kwargs)
+            source = kwargs.get("source")
+            if source is None:
+                source = next(
+                    (value for value in args if hasattr(value, "chat_id") and hasattr(value, "platform")),
+                    None,
+                )
+            platform_obj = getattr(source, "platform", "")
+            platform = str(getattr(platform_obj, "value", platform_obj) or "").lower()
+            if platform == "weixin" and isinstance(result, dict):
+                chat_id = str(getattr(source, "chat_id", "") or "")
+                pending = _peek_turn_model(chat_id)
+                model = (
+                    result.get("model_name")
+                    or result.get("model")
+                    or result.get("resolved_model")
+                    or result.get("routed_model")
+                    or (pending[0] if pending else None)
+                )
+                response = result.get("final_response") or result.get("response") or ""
+                _remember_model(chat_id, model, completed=True, response=response)
+            return result
+
+        runner._run_agent_inner = wrapped_run
+    runner._hermes_wechat_model_route_v4 = True
+    return True
+
+
+def patch_turn_runner_status() -> bool:
+    """Mark only direct model-commentary fallback sends as model-authored.
+
+    Weixin cannot edit ordinary messages, so Hermes may fail to construct a
+    stream consumer and route ``interim_assistant_cb`` through
+    ``TurnRunner._send_status_text``. That method also carries real system
+    status traffic, so patching every call would recreate the old "everything
+    is the model" defect. The callback supplies a stable semantic call-site
+    label; use that structural signal and leave every other status send alone.
+    """
+    try:
+        from gateway.run_turn_runner import TurnRunner
+    except (ImportError, AttributeError):
+        return False
+    if getattr(TurnRunner, "_hermes_wechat_interim_origin_v1", False):
+        return False
+    original = getattr(TurnRunner, "_send_status_text", None)
+    if not callable(original):
+        return False
+
+    @functools.wraps(original)
+    def wrapped(self: Any, text: str, metadata: Any, log_message: str) -> Any:
+        ctx = getattr(self, "_ctx", None)
+        source = getattr(ctx, "source", None)
+        platform_obj = getattr(source, "platform", "")
+        platform = str(getattr(platform_obj, "value", platform_obj) or "").lower()
+        if platform == "weixin" and log_message == "interim_assistant_callback scheduling error":
+            chat_id = str(getattr(source, "chat_id", "") or "")
+            pending = _peek_turn_model(chat_id)
+            if pending:
+                metadata = dict(metadata or {})
+                metadata.update({"actor": "model", "model_name": pending[0]})
+        return original(self, text, metadata, log_message)
+
+    TurnRunner._send_status_text = wrapped
+    TurnRunner._hermes_wechat_interim_origin_v1 = True
     return True
 
 
@@ -748,6 +821,7 @@ async def install_v021_bubble_footer_hook(
 
     model_route_installed = patch_gateway_runner(runner)
     stream_origin_installed = patch_stream_consumer()
+    interim_origin_installed = patch_turn_runner_status()
 
     from hermes_wechat_enhance.slash_command_dedup import patch_weixin_adapter
 
@@ -798,6 +872,7 @@ async def install_v021_bubble_footer_hook(
         "slash_dedup_already": slash_already,
         "model_route": model_route_installed,
         "stream_origin": stream_origin_installed,
+        "interim_origin": interim_origin_installed,
         "errors": errors,
         "capabilities": {
             "bubble_footer": True,
@@ -806,6 +881,8 @@ async def install_v021_bubble_footer_hook(
             "all_inbound_context_refresh": True,
             "turn_model_before_interim": True,
             "stream_boundary_model_origin": True,
+            "nonstream_interim_model_origin": True,
+            "pre_delivery_final_model_origin": True,
             "fresh_slash_command_content_dedup_exemption": True,
         },
         "pending_bubbles": pending,

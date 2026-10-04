@@ -113,6 +113,7 @@ async def main():
         gateway.__path__ = []
         gateway_run = types.ModuleType("gateway.run")
         stream_consumer_module = types.ModuleType("gateway.stream_consumer")
+        turn_runner_module = types.ModuleType("gateway.run_turn_runner")
 
         class FakeStreamConsumer:
             def __init__(self, adapter, chat_id, metadata=None, **_kwargs):
@@ -128,6 +129,18 @@ async def main():
                 ).success
 
         stream_consumer_module.GatewayStreamConsumer = FakeStreamConsumer
+
+        class FakeTurnRunner:
+            def __init__(self, adapter, source):
+                self._ctx = types.SimpleNamespace(source=source)
+                self.adapter = adapter
+
+            def _send_status_text(self, text, metadata, log_message):
+                return asyncio.create_task(
+                    self.adapter.send(self._ctx.source.chat_id, text, metadata=metadata)
+                )
+
+        turn_runner_module.TurnRunner = FakeTurnRunner
         platforms = types.ModuleType("gateway.platforms")
         platforms.__path__ = []
         weixin = types.ModuleType("gateway.platforms.weixin")
@@ -137,11 +150,13 @@ async def main():
         sys.modules.setdefault("gateway.platforms", platforms)
         sys.modules["gateway.platforms.weixin"] = weixin
         sys.modules["gateway.stream_consumer"] = stream_consumer_module
+        sys.modules["gateway.run_turn_runner"] = turn_runner_module
         from hermes_wechat_enhance.v021_bubble_footer import (
             install_v021_bubble_footer_hook,
             patch_adapter,
             patch_gateway_runner,
             patch_stream_consumer,
+            patch_turn_runner_status,
             register_turn_model,
         )
 
@@ -152,6 +167,12 @@ async def main():
         class Runner:
             def _resolve_session_agent_runtime(self, **_kwargs):
                 return "deepseek-flash", {"provider": "ustc"}
+
+            async def _run_agent_inner(self, **_kwargs):
+                return {
+                    "final_response": "final before agent-end hook",
+                    "model": "deepseek-flash",
+                }
 
         runner = Runner()
         gateway_run._gateway_runner_ref = lambda: runner
@@ -179,9 +200,21 @@ async def main():
         assert patch_gateway_runner(runner) is False
         assert patch_stream_consumer() is True
         assert patch_stream_consumer() is False
+        assert patch_turn_runner_status() is True
+        assert patch_turn_runner_status() is False
         runner._resolve_session_agent_runtime(source=Source(), session_key="weixin:peer")
         adapter._token_store.value = "token-route-test"
         before = len(adapter.sent)
+        direct = FakeTurnRunner(adapter, Source())
+        await direct._send_status_text(
+            "direct non-streaming model commentary", {},
+            "interim_assistant_callback scheduling error",
+        )
+        assert adapter.sent[-1][1].endswith("`deepseek-flash`")
+        await direct._send_status_text(
+            "gateway status", {}, "status_callback scheduling error",
+        )
+        assert adapter.sent[-1][1].endswith("`hermes`")
         consumer = FakeStreamConsumer(adapter=adapter, chat_id="peer")
         assert consumer.metadata["actor"] == "model"
         assert consumer.metadata["model_name"] == "deepseek-flash"
@@ -206,12 +239,22 @@ async def main():
         result = await adapter.send("peer", "final answer")
         assert result.success
         turn_bubbles = adapter.sent[before:]
-        assert len(turn_bubbles) == 8
+        assert len(turn_bubbles) == 10
         assert turn_bubbles[0][1].endswith("`deepseek-flash`")
         assert turn_bubbles[1][1].endswith("`hermes`")
-        assert all(item[1].endswith("`deepseek-flash`") for item in turn_bubbles[2:4])
-        assert all(item[1].endswith("`hermes`") for item in turn_bubbles[4:7])
+        assert turn_bubbles[2][1].endswith("`deepseek-flash`")
+        assert turn_bubbles[3][1].endswith("`hermes`")
+        assert all(item[1].endswith("`deepseek-flash`") for item in turn_bubbles[4:6])
+        assert all(item[1].endswith("`hermes`") for item in turn_bubbles[6:9])
         assert turn_bubbles[-1][1].endswith("`deepseek-flash`")
+
+        # The runner result is available before the asynchronously scheduled
+        # agent:end hook. It must still stamp the normal final-send rail with
+        # the actual post-fallback model.
+        result_payload = await runner._run_agent_inner(source=Source())
+        result = await adapter.send("peer", result_payload["final_response"])
+        assert result.success
+        assert adapter.sent[-1][1].endswith("`deepseek-flash`")
         adapter._token_store.value = "token-a"
 
         register_turn_model({
