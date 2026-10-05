@@ -6,7 +6,7 @@
 
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.21.3%2C%20%3C0.22-5965f2)](https://github.com/NousResearch/hermes-agent)
 [![Channel](https://img.shields.io/badge/channel-Weixin-07c160)](#what-it-does)
-[![Release](https://img.shields.io/badge/release-2.1.13-7950f2)](plugin.yaml)
+[![Release](https://img.shields.io/badge/release-2.1.14-7950f2)](plugin.yaml)
 [![License](https://img.shields.io/badge/license-MIT-2f9e44)](LICENSE)
 
 [简体中文](README_CN.md) · [Install](#install) · [Configure](#configure) · [Troubleshoot](#troubleshoot)

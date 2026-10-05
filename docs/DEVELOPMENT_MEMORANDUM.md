@@ -106,6 +106,22 @@ Refresh was incorrectly placed in the special-command branch. Persist a fresh
 token before ordinary content dedup/routing for every inbound message;
 `/continue` only suppresses conversation routing.
 
+### A fresh token still failed to drain during adapter cooldown
+
+Context freshness and transport readiness are independent. A `/continue` may
+arrive with a valid 24-hour token while the adapter is still inside the short
+process-wide cooldown created by a preceding 429. A single synchronous drain
+then records the failure and swallows `/continue`, leaving the queue dormant
+until another inbound message.
+
+The runtime must schedule one coalesced, bounded delayed retry per peer for
+transient cooldown/rate-limit/timeout failures. It reuses the newest token,
+keeps FIFO and acknowledgement-before-dequeue semantics, and stops on permanent
+errors or after the retry bound. Repeated inbound messages may attempt an
+immediate drain but must not create duplicate retry workers. Regression tests
+must reproduce the real sequence: queued bubble → fresh `/continue` → cooldown
+exception → no second user message → automatic FIFO recovery.
+
 ### Startup-ready notification disappeared
 
 Observed causes included opt-in-only configuration, wrong `HERMES_HOME`, a

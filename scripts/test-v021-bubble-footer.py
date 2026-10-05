@@ -56,6 +56,7 @@ class FakeAdapter:
         self.sent = []
         self.routed = []
         self.fail_next = False
+        self.cooldown_failures = 0
         self.next_id = 0
 
     def _is_dm_intake_allowed(self, _sender):
@@ -86,6 +87,9 @@ class FakeAdapter:
         return [content[i : i + width] for i in range(0, len(content), width)]
 
     async def _send_text_chunk(self, *, chat_id, chunk, context_token, client_id):
+        if self.cooldown_failures:
+            self.cooldown_failures -= 1
+            raise RuntimeError("iLink sendmessage rate limited; cooldown active for 0.01s")
         if self.fail_next:
             self.fail_next = False
             raise RuntimeError("simulated failure")
@@ -158,6 +162,11 @@ async def main():
             patch_stream_consumer,
             patch_turn_runner_status,
             register_turn_model,
+        )
+        import hermes_wechat_enhance.v021_bubble_footer as footer_module
+        original_retry_delay = footer_module._transient_retry_delay
+        footer_module._transient_retry_delay = lambda adapter, error, attempt: (
+            0.01 if original_retry_delay(adapter, error, attempt) is not None else None
         )
 
         class Source:
@@ -359,6 +368,27 @@ async def main():
         assert adapter._hermes_wechat_v021_pending_queue.count("account", "peer") == 0
         assert len(adapter.routed) == routed_before + 1
         assert adapter.sent[-1][1].endswith("`1` `deepseek-flash`")
+
+        # A fresh /continue can arrive while the core adapter is still inside
+        # its process-wide cooldown. The command stays silent, but the FIFO
+        # must resume automatically after the cooldown without requiring a
+        # second user message.
+        adapter.fail_next = True
+        result = await adapter.send("peer", "queued before cooldown", metadata={"model": "deepseek-flash"})
+        assert result.success
+        adapter.cooldown_failures = 1
+        routed_before = len(adapter.routed)
+        await adapter._process_message({
+            "from_user_id": "peer",
+            "message_id": "continue-cooldown",
+            "context_token": "token-cooldown",
+            "item_list": [{"text": "/continue"}],
+        })
+        assert adapter._hermes_wechat_v021_pending_queue.count("account", "peer") == 1
+        await asyncio.sleep(0.08)
+        assert adapter._hermes_wechat_v021_pending_queue.count("account", "peer") == 0
+        assert len(adapter.routed) == routed_before
+        assert adapter.sent[-1][2] == "token-cooldown"
 
         # Even a duplicate inbound message refreshes the context token before
         # the core adapter decides not to route it again.

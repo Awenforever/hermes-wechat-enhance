@@ -16,6 +16,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -26,7 +27,7 @@ from typing import Any, Dict, Iterable, Optional
 logger = logging.getLogger(__name__)
 
 MARKER = "HERMES_WECHAT_V021_BUBBLE_FOOTER_V4"
-DELIVERY_MARKER = "HERMES_WECHAT_V021_FIFO_CONTEXT_REFRESH_V2"
+DELIVERY_MARKER = "HERMES_WECHAT_V021_FIFO_CONTEXT_REFRESH_V3"
 FOOTER_RESERVE = 160
 
 _ACTIVE_MODEL: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -38,6 +39,7 @@ _STREAM_BOUNDARY_MODEL: contextvars.ContextVar[Optional[str]] = contextvars.Cont
 _TURN_MODELS: Dict[str, tuple[str, float, bool, str]] = {}
 _TURN_MODELS_LOCK = threading.RLock()
 TURN_MODEL_TTL_SECONDS = 6 * 3600
+MAX_TRANSIENT_DRAIN_RETRIES = 4
 
 
 async def _set_context_token(store: Any, account_id: str, chat_id: str, token: str) -> None:
@@ -60,6 +62,38 @@ def _chat_key(account_id: str, chat_id: str) -> str:
 def _token_fingerprint(context_token: Optional[str]) -> str:
     raw = str(context_token or "<tokenless>").encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def _transient_retry_delay(adapter: Any, error: Any, attempt: int) -> Optional[float]:
+    """Return a bounded retry delay for transport failures that can self-heal.
+
+    A fresh Weixin Context Token does not clear the adapter's process-wide
+    cooldown.  Treating the first cooldown exception as a terminal drain made
+    a silent ``/continue`` look ineffective until another inbound message
+    happened to arrive.  Permanent/budget failures deliberately return None:
+    they must wait for another fresh inbound token instead of retrying forever.
+    """
+    message = str(error or "")
+    folded = message.casefold()
+    transient = any(
+        marker in folded
+        for marker in (
+            "cooldown", "rate limit", "rate-limit", "429", "temporar",
+            "timeout", "timed out", "connection reset", "connection aborted",
+        )
+    )
+    if not transient:
+        return None
+    remaining = 0.0
+    getter = getattr(adapter, "_rate_limit_cooldown_remaining", None)
+    if callable(getter):
+        with suppress(Exception):
+            remaining = max(0.0, float(getter() or 0.0))
+    match = re.search(r"(?:cooldown[^0-9]*|retry(?:ing)?[^0-9]*)([0-9]+(?:\.[0-9]+)?)\s*s", folded)
+    if match:
+        remaining = max(remaining, float(match.group(1)))
+    backoff = min(120.0, 2.0 * (2 ** max(0, int(attempt) - 1)))
+    return max(0.05, remaining + 0.25, backoff)
 
 
 class BubbleCounterStore:
@@ -607,6 +641,57 @@ def patch_adapter(adapter: Any) -> bool:
     store = BubbleCounterStore(_counter_path())
     queue = PendingBubbleStore(_queue_path())
     locks: Dict[str, asyncio.Lock] = {}
+    retry_tasks: Dict[str, asyncio.Task[Any]] = {}
+
+    def schedule_retry(_self: Any, chat_id: str, error: Any) -> bool:
+        key = str(chat_id)
+        current = retry_tasks.get(key)
+        if current is not None and not current.done():
+            return True
+        first_delay = _transient_retry_delay(_self, error, 1)
+        if first_delay is None:
+            return False
+
+        async def retry_worker() -> None:
+            delay = first_delay
+            try:
+                for attempt in range(1, MAX_TRANSIENT_DRAIN_RETRIES + 1):
+                    await asyncio.sleep(delay)
+                    account_id = str(getattr(_self, "_account_id", ""))
+                    if not queue.count(account_id, key):
+                        return
+                    result = await drain_pending(_self, key)
+                    if bool(result.get("ok")) or not int(result.get("pending", 0)):
+                        logger.warning(
+                            "Hermes WeChat Enhance: deferred FIFO retry recovered peer=%s sent=%d pending=%d",
+                            hashlib.sha256(key.encode()).hexdigest()[:12],
+                            int(result.get("sent", 0)),
+                            int(result.get("pending", 0)),
+                        )
+                        return
+                    next_delay = _transient_retry_delay(
+                        _self, result.get("error"), attempt + 1
+                    )
+                    if next_delay is None:
+                        return
+                    delay = next_delay
+                logger.warning(
+                    "Hermes WeChat Enhance: deferred FIFO retries exhausted peer=%s pending=%d; awaiting fresh inbound token",
+                    hashlib.sha256(key.encode()).hexdigest()[:12],
+                    queue.count(str(getattr(_self, "_account_id", "")), key),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Hermes WeChat Enhance: deferred FIFO retry crashed")
+            finally:
+                if retry_tasks.get(key) is asyncio.current_task():
+                    retry_tasks.pop(key, None)
+
+        retry_tasks[key] = asyncio.create_task(
+            retry_worker(), name=f"hermes-wechat-fifo-retry-{hashlib.sha256(key.encode()).hexdigest()[:8]}"
+        )
+        return True
 
     def format_message(_self: Any, content: Optional[str]) -> str:
         return _normalize_transport_markdown(content)
@@ -723,7 +808,14 @@ def patch_adapter(adapter: Any) -> bool:
                     )
                 except Exception as exc:
                     queue.record_failure(int(item["seq"]), str(exc))
-                    return {"ok": False, "sent": sent, "pending": queue.count(account_id, str(chat_id)), "error": str(exc)}
+                    scheduled = schedule_retry(_self, str(chat_id), exc)
+                    return {
+                        "ok": False,
+                        "sent": sent,
+                        "pending": queue.count(account_id, str(chat_id)),
+                        "error": str(exc),
+                        "retry_scheduled": scheduled,
+                    }
                 if not store.commit(account_id, str(chat_id), generation, count):
                     logger.warning("Hermes WeChat Enhance: context changed during FIFO drain; counter not committed")
                 queue.remove(int(item["seq"]))
@@ -786,6 +878,7 @@ def patch_adapter(adapter: Any) -> bool:
     adapter._drain_pending = MethodType(drain_pending, adapter)
     adapter._process_message = MethodType(process_message, adapter)
     adapter._hermes_wechat_v021_pending_queue = queue
+    adapter._hermes_wechat_v021_retry_tasks = retry_tasks
     adapter._hermes_wechat_v021_bubble_footer_v1 = True
     adapter._hermes_wechat_v021_bubble_footer_originals = {
         "send": original_send,
