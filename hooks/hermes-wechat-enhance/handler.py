@@ -193,6 +193,13 @@ async def _send_startup_ready(context: dict):
                     resolution,
                 )
                 return
+            pending_before = 0
+            queue = getattr(adapter, "_hermes_wechat_v021_pending_queue", None)
+            if queue is not None:
+                try:
+                    pending_before = int(queue.count(str(getattr(adapter, "_account_id", "")), weixin_chat_id))
+                except Exception:
+                    pending_before = 0
             result = await adapter.send(
                 weixin_chat_id,
                 ready,
@@ -206,12 +213,26 @@ async def _send_startup_ready(context: dict):
                     "_delivery_id": "hermes-wechat-enhance-startup-ready",
                 },
             )
+            pending_after = pending_before
+            if queue is not None:
+                try:
+                    pending_after = int(queue.count(str(getattr(adapter, "_account_id", "")), weixin_chat_id))
+                except Exception:
+                    pending_after = pending_before
             if getattr(result, "success", False):
-                log.warning(
-                    "Hermes WeChat Enhance: startup ready notification sent "
-                    "(delivery confirmed; target=%s)",
-                    resolution,
-                )
+                if pending_after > 0:
+                    log.warning(
+                        "Hermes WeChat Enhance: startup ready notification queued "
+                        "(pending=%d; awaits fresh Context Token; target=%s)",
+                        pending_after,
+                        resolution,
+                    )
+                else:
+                    log.warning(
+                        "Hermes WeChat Enhance: startup ready notification sent "
+                        "(delivery confirmed; target=%s)",
+                        resolution,
+                    )
             else:
                 log.warning(
                     "Hermes WeChat Enhance: startup ready not delivered to %s: %s",

@@ -122,6 +122,12 @@ immediate drain but must not create duplicate retry workers. Regression tests
 must reproduce the real sequence: queued bubble → fresh `/continue` → cooldown
 exception → no second user message → automatic FIFO recovery.
 
+Startup readiness uses the same acknowledgement boundary. A successful
+``adapter.send`` call can mean “accepted into the durable FIFO” when another
+delivery is pending; it is not physical Weixin delivery. Startup logs therefore
+say ``queued`` with the live pending count in that case and reserve “delivery
+confirmed” for an actually acknowledged transport send.
+
 ### Startup-ready notification disappeared
 
 Observed causes included opt-in-only configuration, wrong `HERMES_HOME`, a
