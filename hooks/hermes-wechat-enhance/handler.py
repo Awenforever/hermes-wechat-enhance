@@ -52,6 +52,7 @@ from hermes_wechat_enhance.store import MessageStore
 from hermes_wechat_enhance.v021_bubble_footer import (
     install_v021_bubble_footer_hook,
     register_turn_model,
+    refresh_runtime_status,
 )
 
 _store = MessageStore()
@@ -69,6 +70,7 @@ async def handle(event_type, context):
         else:
             await install_v021_bubble_footer_hook(context)
         await _send_startup_ready(context)
+        refresh_runtime_status(context)
         return
     if event_type == "agent:start":
         if _audit_enabled():

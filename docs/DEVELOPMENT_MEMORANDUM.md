@@ -128,6 +128,11 @@ delivery is pending; it is not physical Weixin delivery. Startup logs therefore
 say ``queued`` with the live pending count in that case and reserve “delivery
 confirmed” for an actually acknowledged transport send.
 
+The runtime receipt is refreshed after startup and after every inbound token
+drain. The install-time snapshot alone is not authoritative because startup
+notices and ordinary replies may enqueue new durable bubbles immediately after
+the hook is installed.
+
 ### Startup-ready notification disappeared
 
 Observed causes included opt-in-only configuration, wrong `HERMES_HOME`, a

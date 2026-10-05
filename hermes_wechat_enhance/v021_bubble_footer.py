@@ -594,6 +594,33 @@ def _queue_path() -> Path:
     return root / "plugin-data" / "hermes-wechat-enhance" / "send-queue.sqlite3"
 
 
+def refresh_runtime_status(context: Optional[Dict[str, Any]] = None) -> None:
+    """Refresh live queue observability after startup or an inbound drain."""
+    path = _queue_path().parent / "runtime-status.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except Exception:
+        value = {}
+    adapters = list(_iter_context_adapters(context)) if context else []
+    total = 0
+    for adapter in adapters:
+        queue = getattr(adapter, "_hermes_wechat_v021_pending_queue", None)
+        if queue is not None:
+            with suppress(Exception):
+                total += int(queue.total())
+    value["pending_bubbles"] = total
+    value["recorded_at"] = time.time()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        with suppress(OSError):
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except Exception as exc:
+        logger.warning("Hermes WeChat Enhance: runtime receipt refresh failed: %s", exc)
+
+
 def _normalize_transport_markdown(content: Any) -> str:
     """Normalize Markdown blocks without inserting display-width newlines.
 
@@ -839,6 +866,7 @@ def patch_adapter(adapter: Any) -> bool:
         if context_token:
             await _set_context_token(_self._token_store, _self._account_id, sender_id, context_token)
             drain_result = await drain_pending(_self, sender_id)
+            refresh_runtime_status({"adapters": {"weixin": _self}})
 
         text = str(_extract_text(message.get("item_list") or []) or "")
         if text.strip() != "/continue":
