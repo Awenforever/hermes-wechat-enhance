@@ -140,6 +140,12 @@ suppression sentinel in an extra `.hermes` directory, and restarts that bypassed
 the planned marker. Required behavior: default on, profile-scoped target,
 one-shot suppression receipt, explicit system metadata, acknowledged logging.
 
+Operational invariant: an install, upgrade, deployment, or routine restart must
+never create the one-shot suppression sentinel. Testing convenience is not
+authorization to silence a user-facing lifecycle event. Suppression may be used
+only when the user explicitly requests a silent restart, and the sentinel must
+be scoped to that single restart and verified as consumed afterwards.
+
 ### Markdown links and list items developed blank lines
 
 The core formatter hard-wrapped source at a visual width. Weixin treats source
