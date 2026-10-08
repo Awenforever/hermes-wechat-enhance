@@ -42,7 +42,13 @@ TURN_MODEL_TTL_SECONDS = 6 * 3600
 MAX_TRANSIENT_DRAIN_RETRIES = 4
 
 
-def normalize_weixin_inbound_reference(message: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_weixin_inbound_reference(
+    message: Dict[str, Any],
+    *,
+    quote_store: Optional["OutboundQuoteStore"] = None,
+    account_id: str = "",
+    chat_id: str = "",
+) -> Dict[str, Any]:
     """Return current text and quoted-message metadata without concatenating them.
 
     Tencent places the user's newly typed text in ``text_item.text``.  Older
@@ -74,6 +80,12 @@ def normalize_weixin_inbound_reference(message: Dict[str, Any]) -> Dict[str, Any
             or ""
         )
         title = str(ref.get("title") or "")
+        cache_hit = False
+        if not ref_text and ref_id and quote_store is not None:
+            cached = quote_store.get(account_id, chat_id, ref_id)
+            if cached:
+                ref_text = cached
+                cache_hit = True
         return {
             "text": current_text,
             "reference": {
@@ -85,6 +97,7 @@ def normalize_weixin_inbound_reference(message: Dict[str, Any]) -> Dict[str, Any
                 "text": ref_text or title,
                 "title": title,
                 "type": ref_item.get("type"),
+                "cache_hit": cache_hit,
             },
         }
     return {"text": "", "reference": {"present": False, "message_id": "", "text": "", "title": "", "type": None}}
@@ -93,7 +106,12 @@ def normalize_weixin_inbound_reference(message: Dict[str, Any]) -> Dict[str, Any
 async def _emit_inbound_action(adapter: Any, message: Dict[str, Any], normalized: Dict[str, Any]) -> bool:
     """Offer an authorized inbound message to independent optional plugins."""
     reference = normalized.get("reference") if isinstance(normalized.get("reference"), dict) else {}
-    if not reference.get("present"):
+    current_text = str(normalized.get("text") or "")
+    # References are always offered as structured events.  Leading @ commands
+    # are also offered so an independently installed plugin can claim its own
+    # namespace before the conversational agent sees it. Unknown @ commands
+    # deliberately fall through unchanged.
+    if not reference.get("present") and not current_text.lstrip().startswith("@"):
         return False
     try:
         from gateway.platforms.weixin import _guess_chat_type
@@ -116,7 +134,7 @@ async def _emit_inbound_action(adapter: Any, message: Dict[str, Any], normalized
             "chat_id": str(chat_id),
             "chat_type": str(chat_type),
             "message_id": str(message.get("message_id") or ""),
-            "message": str(normalized.get("text") or ""),
+            "message": current_text,
             "reference": dict(reference),
         }
         results = await hooks.emit_collect("message:inbound", context)
@@ -367,6 +385,164 @@ class PendingBubbleStore:
     def total(self) -> int:
         with self._lock, self._connect() as connection:
             return int(connection.execute("SELECT COUNT(*) FROM pending_bubbles").fetchone()[0])
+
+
+class OutboundQuoteStore:
+    """Bounded restart-safe lookup for iLink references that contain only an ID.
+
+    Recent Weixin clients may omit the quoted body and send only ``svr_id``.
+    The ID is assigned by the server after an outbound bubble succeeds, so the
+    mapping must be captured at the low-level transport response boundary.
+    Raw account and conversation identifiers are never persisted.
+    """
+
+    RETENTION_SECONDS = 30 * 24 * 3600
+    MAX_ROWS_PER_ACCOUNT = 10_000
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.RLock()
+        self._writes = 0
+        self._initialize()
+
+    @contextmanager
+    def _connect(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(self.path), timeout=10)
+        connection.row_factory = sqlite3.Row
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def _initialize(self) -> None:
+        with self._lock, self._connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS outbound_quotes (
+                    account_key TEXT NOT NULL,
+                    chat_key TEXT NOT NULL,
+                    server_message_id TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(account_key, chat_key, server_message_id)
+                );
+                CREATE INDEX IF NOT EXISTS outbound_quotes_retention
+                ON outbound_quotes(account_key, created_at);
+                """
+            )
+            self._prune(connection)
+        with suppress(OSError):
+            os.chmod(self.path, 0o600)
+
+    @staticmethod
+    def _keys(account_id: str, chat_id: str) -> tuple[str, str]:
+        return (_chat_key(account_id, "<account>"), _chat_key(account_id, chat_id))
+
+    def _prune(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "DELETE FROM outbound_quotes WHERE created_at < ?",
+            (time.time() - self.RETENTION_SECONDS,),
+        )
+        accounts = connection.execute(
+            "SELECT DISTINCT account_key FROM outbound_quotes"
+        ).fetchall()
+        for row in accounts:
+            connection.execute(
+                """
+                DELETE FROM outbound_quotes
+                WHERE account_key=? AND rowid NOT IN (
+                    SELECT rowid FROM outbound_quotes WHERE account_key=?
+                    ORDER BY created_at DESC LIMIT ?
+                )
+                """,
+                (row[0], row[0], self.MAX_ROWS_PER_ACCOUNT),
+            )
+
+    def put(self, account_id: str, chat_id: str, server_message_id: str, body: str) -> None:
+        if not account_id or not chat_id or not server_message_id or not body:
+            return
+        account_key, chat_key = self._keys(account_id, chat_id)
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO outbound_quotes(account_key,chat_key,server_message_id,body,created_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(account_key,chat_key,server_message_id)
+                DO UPDATE SET body=excluded.body,created_at=excluded.created_at
+                """,
+                (account_key, chat_key, str(server_message_id), str(body), time.time()),
+            )
+            self._writes += 1
+            if self._writes % 100 == 0:
+                self._prune(connection)
+
+    def get(self, account_id: str, chat_id: str, server_message_id: str) -> str:
+        if not account_id or not chat_id or not server_message_id:
+            return ""
+        account_key, chat_key = self._keys(account_id, chat_id)
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT body FROM outbound_quotes
+                WHERE account_key=? AND chat_key=? AND server_message_id=?
+                  AND created_at>=?
+                """,
+                (account_key, chat_key, str(server_message_id), time.time() - self.RETENTION_SECONDS),
+            ).fetchone()
+            return str(row[0]) if row else ""
+
+
+def _install_outbound_quote_capture(adapter: Any, store: OutboundQuoteStore) -> bool:
+    """Capture server-assigned iLink IDs without patching Hermes source files."""
+    try:
+        import gateway.platforms.weixin as weixin_module
+    except ImportError:
+        return False
+    low_level = getattr(weixin_module, "_send_message", None)
+    if not callable(low_level):
+        return False
+
+    registry = getattr(weixin_module, "_hermes_wechat_quote_registry", None)
+    if not isinstance(registry, dict):
+        registry = {}
+        setattr(weixin_module, "_hermes_wechat_quote_registry", registry)
+    token = str(getattr(adapter, "_token", "") or "")
+    if token:
+        registry[hashlib.sha256(token.encode()).hexdigest()] = (
+            str(getattr(adapter, "_account_id", "")), store
+        )
+
+    if getattr(weixin_module, "_hermes_wechat_quote_capture_installed", False):
+        return True
+    original = low_level
+    signature = inspect.signature(original)
+
+    @functools.wraps(original)
+    async def captured_send_message(*args: Any, **kwargs: Any):
+        response = await original(*args, **kwargs)
+        try:
+            bound = signature.bind_partial(*args, **kwargs)
+            token_value = str(bound.arguments.get("token") or "")
+            chat_id = str(bound.arguments.get("to") or "")
+            body = str(bound.arguments.get("text") or "")
+            server_id = ""
+            if isinstance(response, dict):
+                server_id = str(response.get("message_id") or response.get("msg_id") or "")
+            else:
+                server_id = str(getattr(response, "message_id", "") or "")
+            owner = registry.get(hashlib.sha256(token_value.encode()).hexdigest())
+            if owner and server_id:
+                owner[1].put(owner[0], chat_id, server_id, body)
+        except Exception:
+            logger.exception("Hermes WeChat Enhance: outbound quote cache write failed")
+        return response
+
+    setattr(weixin_module, "_send_message", captured_send_message)
+    setattr(weixin_module, "_hermes_wechat_quote_capture_installed", True)
+    setattr(weixin_module, "_hermes_wechat_quote_capture_original", original)
+    return True
 
 
 def _response_signature(value: Any) -> str:
@@ -695,6 +871,11 @@ def _queue_path() -> Path:
     return root / "plugin-data" / "hermes-wechat-enhance" / "send-queue.sqlite3"
 
 
+def _quote_cache_path() -> Path:
+    root = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    return root / "plugin-data" / "hermes-wechat-enhance" / "quote-cache.sqlite3"
+
+
 def refresh_runtime_status(context: Optional[Dict[str, Any]] = None) -> None:
     """Refresh live queue observability after startup or an inbound drain."""
     path = _queue_path().parent / "runtime-status.json"
@@ -768,6 +949,8 @@ def patch_adapter(adapter: Any) -> bool:
     original_process_message = adapter._process_message
     store = BubbleCounterStore(_counter_path())
     queue = PendingBubbleStore(_queue_path())
+    quote_store = OutboundQuoteStore(_quote_cache_path())
+    quote_capture = _install_outbound_quote_capture(adapter, quote_store)
     locks: Dict[str, asyncio.Lock] = {}
     retry_tasks: Dict[str, asyncio.Task[Any]] = {}
 
@@ -969,7 +1152,13 @@ def patch_adapter(adapter: Any) -> bool:
             drain_result = await drain_pending(_self, sender_id)
             refresh_runtime_status({"adapters": {"weixin": _self}})
 
-        normalized = normalize_weixin_inbound_reference(message)
+        chat_type, effective_chat_id = _guess_chat_type(message, getattr(_self, "_account_id", ""))
+        normalized = normalize_weixin_inbound_reference(
+            message,
+            quote_store=quote_store,
+            account_id=str(getattr(_self, "_account_id", "")),
+            chat_id=str(effective_chat_id or sender_id),
+        )
         text = str(_extract_text(message.get("item_list") or []) or "")
         if await _emit_inbound_action(_self, message, normalized):
             return None
@@ -987,7 +1176,6 @@ def patch_adapter(adapter: Any) -> bool:
         message_id = str(message.get("message_id") or "").strip()
         if message_id and _self._dedup.is_duplicate(message_id):
             return None
-        chat_type, effective_chat_id = _guess_chat_type(message, getattr(_self, "_account_id", ""))
         if chat_type == "group":
             if not _self._is_group_allowed(effective_chat_id):
                 return None
@@ -1010,6 +1198,8 @@ def patch_adapter(adapter: Any) -> bool:
     adapter._drain_pending = MethodType(drain_pending, adapter)
     adapter._process_message = MethodType(process_message, adapter)
     adapter._hermes_wechat_v021_pending_queue = queue
+    adapter._hermes_wechat_v021_quote_store = quote_store
+    adapter._hermes_wechat_v021_quote_capture = quote_capture
     adapter._hermes_wechat_v021_retry_tasks = retry_tasks
     adapter._hermes_wechat_v021_bubble_footer_v1 = True
     adapter._hermes_wechat_v021_bubble_footer_originals = {

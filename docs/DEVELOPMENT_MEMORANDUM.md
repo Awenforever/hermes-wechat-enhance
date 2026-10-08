@@ -207,14 +207,25 @@ When a visible footer or delivery defect is reported, update the invariant,
 root-cause record, and regression matrix here in the same release. Do not wait
 for the same defect class to be reported on a second send rail.
 
-## 2026-10-08 — iLink title-only quote references
+## 2026-10-08 — iLink ID-only quote references and generic action commands
 
-Newer Weixin clients may represent a native quote as ``ref_msg.svr_id`` plus a
-truncated display ``title`` while omitting ``ref_msg.message_item``. A quote is
-therefore present when any of message item, server ID, or title is present.
-Never downgrade the title-only form to ordinary chat: normalize current text and
-reference metadata separately, refresh Context Token/FIFO first, then emit the
-plugin-neutral authorized inbound Hook. Consumers may use a sufficiently long
-preview only when it identifies exactly one durable record; ambiguity must fail
-closed. Regression coverage must include both full-message and title-only quote
-forms and prove an optional Hook can consume either without an agent turn.
+Newer Weixin clients may represent a native quote as only ``ref_msg.svr_id``;
+``message_item`` and even the display ``title`` can both be absent. Parsing the
+inbound payload alone can never recover that quoted bubble. Capture the server-
+assigned ``message_id`` returned by every successful outbound text send and
+persist a bounded per-account/per-conversation ID-to-body mapping. Keep it for
+30 days, cap it at 10,000 rows per account, and never persist raw account or
+conversation identifiers. Resolve inbound ``svr_id`` from that cache before
+publishing the plugin-neutral Hook.
+
+Leading ``@`` commands are offered to optional plugins even when the client
+drops quote metadata. This is a generic namespace bridge, not Email Watchdog
+logic: Context Token refresh and FIFO drain happen first; a consumer may claim
+the event, while unknown/unhandled commands still reach Hermes normally. A
+consumer must fail closed when its command needs a quote but no verified quote
+was restored—it must never guess the newest object.
+
+Regression coverage must prove full, title-only, and ID-only references; cache
+survival across restart; 64-bit server IDs preserved as strings; handled and
+unhandled leading ``@`` commands; authorization; and no change to slash-command
+Context Token/FIFO ordering.

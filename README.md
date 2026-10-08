@@ -6,7 +6,7 @@
 
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.21.3%2C%20%3C0.22-5965f2)](https://github.com/NousResearch/hermes-agent)
 [![Channel](https://img.shields.io/badge/channel-Weixin-07c160)](#what-it-does)
-[![Release](https://img.shields.io/badge/release-2.2.1-7950f2)](plugin.yaml)
+[![Release](https://img.shields.io/badge/release-2.3.0-7950f2)](plugin.yaml)
 [![License](https://img.shields.io/badge/license-MIT-2f9e44)](LICENSE)
 
 [简体中文](README_CN.md) · [Install](#install) · [Configure](#configure) · [Troubleshoot](#troubleshoot)
@@ -33,7 +33,7 @@ channel, pairing, and profile configuration.
 | **Repeatable slash commands** | Fresh `/approve`, `/continue`, and other slash commands are not discarded because their text repeats; provider message-ID replay protection remains active. |
 | **Markdown-safe transport** | Logical Markdown lines and links are preserved; the client performs visual wrapping. |
 | **Ready notification** | An optional startup message confirms that the Gateway is available again. |
-| **Authorized quote actions** | Publishes typed text and the quoted bubble as a structured event for optional plugins; unhandled messages continue normally. |
+| **Authorized action bridge** | Restores ID-only native quotes across restarts and offers quoted or leading `@` messages to optional plugins; unhandled messages continue normally. |
 
 Each delivered text bubble ends with:
 
@@ -55,9 +55,10 @@ configured by Hermes; pairing and credentials remain owned by the Hermes
 profile. Installation does not require a new QR scan when that profile is
 healthy.
 
-The quote-action bridge is channel infrastructure, not a dependency on any
-business plugin. With no consumer installed, ordinary Weixin behavior is
-unchanged.
+The action bridge is channel infrastructure, not a dependency on any business
+plugin. It refreshes Context Token and drains FIFO first, then offers native
+quotes and leading `@` commands to installed consumers. Unknown commands and
+unhandled references continue to Hermes as ordinary chat.
 
 ## Requirements
 
