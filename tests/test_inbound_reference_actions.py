@@ -60,6 +60,35 @@ class InboundReferenceTests(unittest.TestCase):
         self.assertEqual(context["reference"]["text"], "邮件推送")
         self.assertIs(context["authorized"], True)
 
+    def test_new_ilink_title_only_reference_is_not_lost(self):
+        message = self.message()
+        message["item_list"][0]["ref_msg"] = {
+            "svr_id": "server-message-9",
+            "title": "### 📬 新邮件｜USTC · 2026-10-08 10:24…",
+        }
+        normalized = normalize_weixin_inbound_reference(message)
+        self.assertEqual(normalized["text"], "回复\n原样正文")
+        self.assertTrue(normalized["reference"]["present"])
+        self.assertEqual(normalized["reference"]["message_id"], "server-message-9")
+        self.assertIn("新邮件｜USTC", normalized["reference"]["text"])
+
+    def test_title_only_reference_reaches_optional_hook(self):
+        message = self.message()
+        message["item_list"][0]["ref_msg"] = {
+            "svr_id": "server-message-10",
+            "title": "### 📬 新邮件｜USTC · 2026-10-08 10:24…",
+        }
+        self.hooks.emit_collect.return_value = [{"decision": "handled", "message": "草稿", "source": "test"}]
+        adapter = types.SimpleNamespace(
+            _account_id="bot", _is_dm_intake_allowed=lambda user: True,
+            _is_group_allowed=lambda chat: False, send=AsyncMock(return_value=types.SimpleNamespace(success=True)),
+        )
+        normalized = normalize_weixin_inbound_reference(message)
+        handled = asyncio.run(_emit_inbound_action(adapter, message, normalized))
+        self.assertTrue(handled)
+        context = self.hooks.emit_collect.await_args.args[1]
+        self.assertEqual(context["reference"]["message_id"], "server-message-10")
+
 
 if __name__ == "__main__":
     unittest.main()

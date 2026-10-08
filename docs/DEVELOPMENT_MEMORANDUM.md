@@ -206,3 +206,15 @@ Hermes' stream consumer.
 When a visible footer or delivery defect is reported, update the invariant,
 root-cause record, and regression matrix here in the same release. Do not wait
 for the same defect class to be reported on a second send rail.
+
+## 2026-10-08 — iLink title-only quote references
+
+Newer Weixin clients may represent a native quote as ``ref_msg.svr_id`` plus a
+truncated display ``title`` while omitting ``ref_msg.message_item``. A quote is
+therefore present when any of message item, server ID, or title is present.
+Never downgrade the title-only form to ordinary chat: normalize current text and
+reference metadata separately, refresh Context Token/FIFO first, then emit the
+plugin-neutral authorized inbound Hook. Consumers may use a sufficiently long
+preview only when it identifies exactly one durable record; ambiguity must fail
+closed. Regression coverage must include both full-message and title-only quote
+forms and prove an optional Hook can consume either without an agent turn.

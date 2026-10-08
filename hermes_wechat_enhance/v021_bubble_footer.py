@@ -45,10 +45,10 @@ MAX_TRANSIENT_DRAIN_RETRIES = 4
 def normalize_weixin_inbound_reference(message: Dict[str, Any]) -> Dict[str, Any]:
     """Return current text and quoted-message metadata without concatenating them.
 
-    Tencent places the user's newly typed text in ``text_item.text`` and the
-    quoted bubble in ``ref_msg.message_item``.  Keeping those two planes
-    separate lets optional plugins consume quote-based actions without parsing
-    a display string or coupling WeChat Enhance to any particular plugin.
+    Tencent places the user's newly typed text in ``text_item.text``.  Older
+    clients include the quoted bubble in ``ref_msg.message_item``; newer ones
+    may send only ``ref_msg.svr_id`` plus a display ``title``.  Both forms are
+    real references and must reach optional plugins as structured metadata.
     """
     item_list = message.get("item_list") or []
     for item in item_list:
@@ -66,18 +66,24 @@ def normalize_weixin_inbound_reference(message: Dict[str, Any]) -> Dict[str, Any
             except Exception:
                 nested = ref_item.get("text_item") if isinstance(ref_item.get("text_item"), dict) else {}
                 ref_text = str(nested.get("text") or "")
+        ref_id = str(
+            ref_item.get("msg_id")
+            or ref_item.get("message_id")
+            or ref.get("svr_id")
+            or ref.get("message_id")
+            or ""
+        )
+        title = str(ref.get("title") or "")
         return {
             "text": current_text,
             "reference": {
-                "present": bool(ref_item),
-                "message_id": str(
-                    ref_item.get("msg_id")
-                    or ref_item.get("message_id")
-                    or ref.get("message_id")
-                    or ""
-                ),
-                "text": ref_text,
-                "title": str(ref.get("title") or ""),
+                "present": bool(ref_item or ref_id or title),
+                "message_id": ref_id,
+                # A title-only quote is a truncated preview, but retaining it
+                # is strictly better than downgrading a real quote to a normal
+                # chat message. Consumers must require a unique safe match.
+                "text": ref_text or title,
+                "title": title,
                 "type": ref_item.get("type"),
             },
         }
