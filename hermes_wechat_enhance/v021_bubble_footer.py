@@ -1,8 +1,9 @@
 """Hermes v0.21 Weixin bubble counters and runtime-model footers.
 
 The v0.21 adapter owns transport retries and durable delivery obligations.  This
-module only decorates each physical text bubble at the final adapter boundary,
-then commits its counter after the adapter reports a successful send.
+module decorates physical text bubbles at the final adapter boundary and counts
+successful media bubbles even though media intentionally has no textual footer.
+Counters are committed only after the adapter reports a successful send.
 """
 
 from __future__ import annotations
@@ -947,6 +948,7 @@ def patch_adapter(adapter: Any) -> bool:
     original_send_text_chunk = adapter._send_text_chunk
     original_split_text = adapter._split_text
     original_process_message = adapter._process_message
+    original_send_file = getattr(adapter, "_send_file", None)
     store = BubbleCounterStore(_counter_path())
     queue = PendingBubbleStore(_queue_path())
     quote_store = OutboundQuoteStore(_quote_cache_path())
@@ -1098,6 +1100,49 @@ def patch_adapter(adapter: Any) -> bool:
             _consume_completed_model(str(chat_id), model)
         return result
 
+    async def send_file(
+        _self: Any,
+        chat_id: str,
+        path: str,
+        caption: str,
+        force_file_attachment: bool = False,
+    ) -> str:
+        """Count each acknowledged media bubble at the physical send boundary.
+
+        Hermes runtimes that still pass captions directly to ``_send_file``
+        would otherwise send an unnumbered text bubble internally.  Route such
+        captions through the normal text path first, then count the media item
+        itself without adding a footer to binary content.
+        """
+        if original_send_file is None:
+            raise RuntimeError("unsupported WeixinAdapter; missing: _send_file")
+        if caption:
+            caption_result = await _self.send(
+                chat_id=chat_id,
+                content=caption,
+                metadata={"is_system": True, "source": "weixin-media-caption"},
+            )
+            if not getattr(caption_result, "success", False):
+                raise RuntimeError(
+                    str(getattr(caption_result, "error", "media caption delivery failed"))
+                )
+        lock = locks.setdefault(str(chat_id), asyncio.Lock())
+        async with lock:
+            account_id = str(getattr(_self, "_account_id", ""))
+            context_token = _self._token_store.get(account_id, str(chat_id))
+            count, generation = store.preview(account_id, str(chat_id), context_token)
+            message_id = await original_send_file(
+                chat_id,
+                path,
+                "",
+                force_file_attachment=force_file_attachment,
+            )
+            if not store.commit(account_id, str(chat_id), generation, count):
+                logger.warning(
+                    "Hermes WeChat Enhance: context changed during acknowledged media send; counter not committed"
+                )
+            return message_id
+
     async def drain_pending(_self: Any, chat_id: str) -> Dict[str, Any]:
         lock = locks.setdefault(str(chat_id), asyncio.Lock())
         account_id = str(getattr(_self, "_account_id", ""))
@@ -1194,6 +1239,8 @@ def patch_adapter(adapter: Any) -> bool:
     adapter.format_message = MethodType(format_message, adapter)
     adapter._split_text = MethodType(split_text, adapter)
     adapter._send_text_chunk = MethodType(send_text_chunk, adapter)
+    if original_send_file is not None:
+        adapter._send_file = MethodType(send_file, adapter)
     adapter.send = MethodType(send, adapter)
     adapter._drain_pending = MethodType(drain_pending, adapter)
     adapter._process_message = MethodType(process_message, adapter)
@@ -1208,6 +1255,7 @@ def patch_adapter(adapter: Any) -> bool:
         "_send_text_chunk": original_send_text_chunk,
         "_split_text": original_split_text,
         "_process_message": original_process_message,
+        "_send_file": original_send_file,
     }
     return True
 

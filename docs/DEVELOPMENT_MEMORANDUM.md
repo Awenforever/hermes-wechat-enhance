@@ -229,3 +229,25 @@ Regression coverage must prove full, title-only, and ID-only references; cache
 survival across restart; 64-bit server IDs preserved as strings; handled and
 unhandled leading ``@`` commands; authorization; and no change to slash-command
 Context Token/FIFO ordering.
+
+## 2026-10-08 — Physical bubble counters include media
+
+The visible counter is a conversation delivery sequence, not a text-only
+sequence. Every acknowledged physical Weixin bubble consumes exactly one
+number, including image, video, voice, and document bubbles. Binary media never
+receives a textual footer; its consumption becomes visible in the next text
+bubble's number. A media caption is a separate physical text bubble and is
+therefore numbered separately before the media item.
+
+Count at the final `_send_file` transport boundary only after its awaited send
+returns successfully. Use the same per-chat lock as text counters so concurrent
+text and media cannot preview the same number. If a runtime passes a caption
+inside `_send_file`, route it through the ordinary text path first and clear the
+internal caption, preventing an invisible unnumbered text send. Upload or send
+failure must not commit a number.
+
+Regression coverage must prove text → media → text numbering, multiple media
+items, caption-plus-media semantics, failed media without a gap, and persistence
+across adapter restart. Tests that exercise only public `send_document` are not
+sufficient because runtime compatibility layers may replace that method; the
+physical `_send_file` boundary is the stable invariant.

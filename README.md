@@ -6,7 +6,7 @@
 
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.21.3%2C%20%3C0.22-5965f2)](https://github.com/NousResearch/hermes-agent)
 [![Channel](https://img.shields.io/badge/channel-Weixin-07c160)](#what-it-does)
-[![Release](https://img.shields.io/badge/release-2.3.0-7950f2)](plugin.yaml)
+[![Release](https://img.shields.io/badge/release-2.4.0-7950f2)](plugin.yaml)
 [![License](https://img.shields.io/badge/license-MIT-2f9e44)](LICENSE)
 
 [简体中文](README_CN.md) · [Install](#install) · [Configure](#configure) · [Troubleshoot](#troubleshoot)
@@ -25,7 +25,7 @@ channel, pairing, and profile configuration.
 | Capability | Guarantee |
 |---|---|
 | **Truthful model footer** | Model-written bubbles show the actual routed/fallback model; Hermes-owned controls show `hermes`. |
-| **Acknowledged counter** | A number is committed only after Weixin confirms delivery. Failed attempts do not consume it. |
+| **Acknowledged counter** | Every delivered text or media bubble consumes one number. Media stays visually clean; the next text footer reflects it. Failed attempts consume nothing. |
 | **Consistent multipart replies** | Every physical bubble in a split response keeps the same model identity and gets its own counter. |
 | **Durable FIFO recovery** | Failed bubbles survive restart and are delivered before newer replies. |
 | **Automatic Context Token refresh** | Every inbound Weixin message refreshes the reply window before deduplication. |

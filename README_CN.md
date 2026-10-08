@@ -6,7 +6,7 @@
 
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.21.3%2C%20%3C0.22-5965f2)](https://github.com/NousResearch/hermes-agent)
 [![微信](https://img.shields.io/badge/通道-Weixin-07c160)](#核心能力)
-[![版本](https://img.shields.io/badge/版本-2.3.0-7950f2)](plugin.yaml)
+[![版本](https://img.shields.io/badge/版本-2.4.0-7950f2)](plugin.yaml)
 [![许可证](https://img.shields.io/badge/许可证-MIT-2f9e44)](LICENSE)
 
 [English](README.md) · [快速安装](#快速安装) · [个性化配置](#个性化配置) · [故障排查](#故障排查)
@@ -24,7 +24,7 @@ Hermes WeChat Enhance 是 Hermes 的微信通道增强插件。它为每个真�
 | 能力 | 能得到什么 |
 |---|---|
 | **真实模型尾注** | 模型正文显示实际路由或 fallback 模型；Hermes 控制消息显示 `hermes`。 |
-| **确认后才计数** | 只有微信确认送达才提交序号；失败和重试不会提前消耗编号。 |
+| **确认后才计数** | 文本、图片和文件等每个实际送达的气泡都占一个序号；媒体本身不加尾注，后续文本会体现正确计数，失败发送不占号。 |
 | **多气泡一致归因** | 长回复拆成多个气泡后，每个气泡都保留正确模型名称并独立计数。 |
 | **持久 FIFO 恢复** | 发送失败的气泡跨重启保存，恢复时永远排在新回复之前。 |
 | **自动刷新 Context Token** | 每一条微信入站消息都会在去重前刷新回复窗口。 |
