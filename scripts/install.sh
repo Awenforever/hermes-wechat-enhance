@@ -496,7 +496,13 @@ install_hooks() {
 }
 
 verify_install() {
-  HERMES_HOME="$HERMES_HOME_DIR" python3 "$SKILL_DIR/scripts/verify-self-install.py"
+  # Plugin-manager installs legitimately keep a current copy under plugins/
+  # while the lifecycle installer verifies the canonical skills/ copy. Pin
+  # bootstrap resolution to the copy being installed so a sibling copy cannot
+  # make an otherwise correct upgrade fail verification.
+  HERMES_HOME="$HERMES_HOME_DIR" \
+  HERMES_WECHAT_ENHANCE_SOURCE_DIR="$SKILL_DIR" \
+  python3 "$SKILL_DIR/scripts/verify-self-install.py"
 }
 
 main() {

@@ -406,3 +406,9 @@ instead of trusting arbitrary Hook emitters.
 The event is intentionally plugin-neutral. WeChat Enhance never imports or
 assumes Email Watchdog (or any other consumer) is installed. Unhandled quoted
 messages continue through the normal Hermes conversation pipeline.
+
+During lifecycle verification, bootstrap resolution is explicitly pinned to
+the source copy currently being installed. Hermes plugin-manager deployments
+normally contain both `plugins/hermes-wechat-enhance` and
+`skills/hermes-wechat-enhance`; the mere presence of the sibling copy must not
+make a valid install or upgrade fail.
