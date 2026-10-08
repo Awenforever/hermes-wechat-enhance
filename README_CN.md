@@ -6,7 +6,7 @@
 
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.21.3%2C%20%3C0.22-5965f2)](https://github.com/NousResearch/hermes-agent)
 [![微信](https://img.shields.io/badge/通道-Weixin-07c160)](#核心能力)
-[![版本](https://img.shields.io/badge/版本-2.1.16-7950f2)](plugin.yaml)
+[![版本](https://img.shields.io/badge/版本-2.2.0-7950f2)](plugin.yaml)
 [![许可证](https://img.shields.io/badge/许可证-MIT-2f9e44)](LICENSE)
 
 [English](README.md) · [快速安装](#快速安装) · [个性化配置](#个性化配置) · [故障排查](#故障排查)
@@ -32,6 +32,7 @@ Hermes WeChat Enhance 是 Hermes 的微信通道增强插件。它为每个真�
 | **斜杠命令可重复** | 新发送的 `/approve`、`/continue` 等不会因文字相同而被误去重；相同 message ID 的重放仍会拦截。 |
 | **Markdown 安全传输** | 不再按显示宽度破坏 Markdown 源码行、列表或超链接。 |
 | **启动就绪通知** | Gateway 恢复后可主动告知用户已经可以继续使用。 |
+| **安全引用动作** | 将已授权用户的“当前文字”和“被引用气泡”作为结构化事件交给可选插件；无人处理时仍进入普通对话。 |
 
 微信气泡末尾会显示：
 
@@ -49,6 +50,9 @@ Hermes WeChat Enhance 是 Hermes 的微信通道增强插件。它为每个真�
 本插件只负责微信传输层，不替用户选择模型，不负责微信登录或配对，也不生成业务
 内容。模型仍由 Hermes 统一配置，认证和配对仍属于当前 Hermes Profile。只要原有
 Profile 健康，安装或升级本插件不需要重新扫码、重新配对。
+
+引用动作桥接是通用通道能力，不依赖任何业务插件；未安装消费者时不会改变普通
+微信对话行为。
 
 ## 环境要求
 

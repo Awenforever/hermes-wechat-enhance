@@ -42,6 +42,101 @@ TURN_MODEL_TTL_SECONDS = 6 * 3600
 MAX_TRANSIENT_DRAIN_RETRIES = 4
 
 
+def normalize_weixin_inbound_reference(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Return current text and quoted-message metadata without concatenating them.
+
+    Tencent places the user's newly typed text in ``text_item.text`` and the
+    quoted bubble in ``ref_msg.message_item``.  Keeping those two planes
+    separate lets optional plugins consume quote-based actions without parsing
+    a display string or coupling WeChat Enhance to any particular plugin.
+    """
+    item_list = message.get("item_list") or []
+    for item in item_list:
+        if not isinstance(item, dict) or not isinstance(item.get("text_item"), dict):
+            continue
+        current_text = str((item.get("text_item") or {}).get("text") or "")
+        ref = item.get("ref_msg") if isinstance(item.get("ref_msg"), dict) else {}
+        ref_item = ref.get("message_item") if isinstance(ref.get("message_item"), dict) else {}
+        ref_text = ""
+        if ref_item:
+            try:
+                from gateway.platforms.weixin import _extract_text
+
+                ref_text = str(_extract_text([ref_item]) or "")
+            except Exception:
+                nested = ref_item.get("text_item") if isinstance(ref_item.get("text_item"), dict) else {}
+                ref_text = str(nested.get("text") or "")
+        return {
+            "text": current_text,
+            "reference": {
+                "present": bool(ref_item),
+                "message_id": str(
+                    ref_item.get("msg_id")
+                    or ref_item.get("message_id")
+                    or ref.get("message_id")
+                    or ""
+                ),
+                "text": ref_text,
+                "title": str(ref.get("title") or ""),
+                "type": ref_item.get("type"),
+            },
+        }
+    return {"text": "", "reference": {"present": False, "message_id": "", "text": "", "title": "", "type": None}}
+
+
+async def _emit_inbound_action(adapter: Any, message: Dict[str, Any], normalized: Dict[str, Any]) -> bool:
+    """Offer an authorized inbound message to independent optional plugins."""
+    reference = normalized.get("reference") if isinstance(normalized.get("reference"), dict) else {}
+    if not reference.get("present"):
+        return False
+    try:
+        from gateway.platforms.weixin import _guess_chat_type
+        from gateway.run import _gateway_runner_ref
+
+        sender_id = str(message.get("from_user_id") or "").strip()
+        chat_type, chat_id = _guess_chat_type(message, getattr(adapter, "_account_id", ""))
+        allowed = adapter._is_group_allowed(chat_id) if chat_type == "group" else adapter._is_dm_intake_allowed(sender_id)
+        if not allowed:
+            return False
+        runner = _gateway_runner_ref()
+        hooks = getattr(runner, "hooks", None) if runner is not None else None
+        if hooks is None:
+            return False
+        context = {
+            "platform": "weixin",
+            "authorized": True,
+            "authorization_source": "weixin-adapter-allowlist",
+            "user_id": sender_id,
+            "chat_id": str(chat_id),
+            "chat_type": str(chat_type),
+            "message_id": str(message.get("message_id") or ""),
+            "message": str(normalized.get("text") or ""),
+            "reference": dict(reference),
+        }
+        results = await hooks.emit_collect("message:inbound", context)
+        for result in results:
+            if not isinstance(result, dict) or str(result.get("decision") or "").lower() != "handled":
+                continue
+            response = str(result.get("message") or "").strip()
+            if response:
+                metadata = {
+                    "is_system": True,
+                    "model_name": "hermes",
+                    "source": str(result.get("source") or "inbound-action"),
+                }
+                if result.get("delivery_id"):
+                    metadata["_delivery_id"] = str(result["delivery_id"])
+                await adapter.send(
+                    str(chat_id),
+                    response,
+                    metadata=metadata,
+                )
+            return True
+    except Exception:
+        logger.exception("Hermes WeChat Enhance: optional inbound action dispatch failed")
+    return False
+
+
 async def _set_context_token(store: Any, account_id: str, chat_id: str, token: str) -> None:
     """Support both synchronous and asynchronous Hermes token stores."""
     result = store.set(account_id, chat_id, token)
@@ -868,7 +963,10 @@ def patch_adapter(adapter: Any) -> bool:
             drain_result = await drain_pending(_self, sender_id)
             refresh_runtime_status({"adapters": {"weixin": _self}})
 
+        normalized = normalize_weixin_inbound_reference(message)
         text = str(_extract_text(message.get("item_list") or []) or "")
+        if await _emit_inbound_action(_self, message, normalized):
+            return None
         if text.strip() != "/continue":
             if drain_result and int(drain_result.get("sent", 0)):
                 logger.warning(

@@ -391,3 +391,18 @@ Stable markers:
 HERMES_WECHAT_GIT_METADATA_PRESERVATION_V1
 HERMES_WECHAT_EXACT_FILE_BACKUP_RESTORE_V1
 ```
+
+## Structured inbound references
+
+Weixin keeps newly typed text and the quoted bubble in separate fields:
+`text_item.text` and `ref_msg.message_item`. The v2.2 runtime normalizes those
+fields and emits the generic `message:inbound` Hook event after Context Token
+refresh and FIFO resume. Optional plugins may return a `handled` decision.
+
+Only an adapter-authorized sender reaches this event. The context carries
+`authorized: true` plus an authorization source so consumers can fail closed
+instead of trusting arbitrary Hook emitters.
+
+The event is intentionally plugin-neutral. WeChat Enhance never imports or
+assumes Email Watchdog (or any other consumer) is installed. Unhandled quoted
+messages continue through the normal Hermes conversation pipeline.
