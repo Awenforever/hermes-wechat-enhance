@@ -100,6 +100,17 @@ def snapshot(
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text("utf-8"))
         if manifest.get("active") is True:
+            if int(manifest.get("version") or 0) < 3:
+                for key in (
+                    "files", "git_present", "pre_git_head", "pre_git_clean",
+                    "installed_git_head",
+                ):
+                    manifest.pop(key, None)
+                manifest["version"] = 3
+                manifest["core_mutation"] = False
+                remove_path(root / "backups" / "gateway")
+                atomic_json(manifest_path, manifest)
+                print("INSTALL_STATE_MIGRATED_TO_HOOK_ONLY")
             print("INSTALL_STATE_REUSED")
             return
 

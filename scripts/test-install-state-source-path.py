@@ -103,6 +103,28 @@ def main() -> int:
             "canonical source backup missing",
         )
 
+        # Upgrading from a pre-3.0 transaction retires only obsolete Core
+        # backup metadata; the saved hook/source rollback remains intact.
+        manifest["version"] = 2
+        manifest["files"] = {"gateway/run.py": {"pre_sha256": "old"}}
+        manifest["git_present"] = True
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        obsolete = manifest_path.parent / "backups" / "gateway" / "gateway"
+        obsolete.mkdir(parents=True)
+        (obsolete / "run.py").write_text("obsolete", encoding="utf-8")
+        migrated = subprocess.run(
+            [
+                sys.executable, str(manager), "snapshot", "--gateway", str(gateway),
+                "--home", str(home), "--hook", str(hook), "--source", str(source),
+            ],
+            check=False, text=True, capture_output=True,
+        )
+        require(migrated.returncode == 0, migrated.stderr)
+        require("INSTALL_STATE_MIGRATED_TO_HOOK_ONLY" in migrated.stdout, "old transaction not migrated")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        require(manifest["version"] == 3 and "files" not in manifest, "legacy Core metadata survived")
+        require(not (manifest_path.parent / "backups" / "gateway").exists(), "legacy Core backup survived")
+
         print("INSTALL_STATE_SOURCE_PATH_REGRESSION_OK")
     return 0
 
