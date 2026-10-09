@@ -44,6 +44,11 @@ if str(_SKILL_DIR) not in sys.path:
     sys.path.insert(0, str(_SKILL_DIR))
 
 from hermes_wechat_enhance.peer import resolve_weixin_peer
+from hermes_wechat_enhance.lifecycle import (
+    boot_identity,
+    record_startup_accepted,
+    startup_already_accepted,
+)
 from hermes_wechat_enhance.settings import configured_bool, startup_ready_message
 from hermes_wechat_enhance.store import MessageStore
 from hermes_wechat_enhance.v021_bubble_footer import (
@@ -86,6 +91,10 @@ async def _send_startup_ready(context: dict):
     ready = startup_ready_message("♻️ Gateway online — Hermes is back and ready.")
     if ready is None:
         log.warning("Hermes WeChat Enhance: startup ready notification disabled")
+        return
+    identity = boot_identity()
+    if startup_already_accepted(identity):
+        log.warning("Hermes WeChat Enhance: startup ready already accepted for this boot")
         return
     adapters = context.get("adapters") if isinstance(context, dict) else None
     if not adapters:
@@ -141,6 +150,7 @@ async def _send_startup_ready(context: dict):
                 except Exception:
                     pending_after = pending_before
             if getattr(result, "success", False):
+                record_startup_accepted(identity, queued=pending_after > 0)
                 if pending_after > 0:
                     log.warning(
                         "Hermes WeChat Enhance: startup ready notification queued "

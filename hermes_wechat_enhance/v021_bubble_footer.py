@@ -679,6 +679,23 @@ def patch_stream_consumer() -> bool:
     except (ImportError, AttributeError):
         return False
     installed = False
+
+    def bind_origin(consumer: Any, model: Any) -> None:
+        """Bind proven model provenance to one concrete stream consumer.
+
+        The consumer is the stable delivery object for a turn, including a
+        mid-run ``/steer``.  Keep the provenance on that object instead of
+        relying on the mutable per-chat registry at send time.  Re-applying it
+        to metadata also survives core paths that rebuild the metadata dict.
+        """
+        normalized = _safe_model(model)
+        if normalized == "hermes":
+            return
+        setattr(consumer, "_hermes_wechat_model_origin", normalized)
+        metadata = dict(getattr(consumer, "metadata", None) or {})
+        metadata.update({"actor": "model", "model_name": normalized})
+        consumer.metadata = metadata
+
     if not getattr(GatewayStreamConsumer, "_hermes_wechat_model_origin_v1", False):
         original_init = GatewayStreamConsumer.__init__
 
@@ -687,6 +704,7 @@ def patch_stream_consumer() -> bool:
             adapter = kwargs.get("adapter") or (args[0] if args else None)
             chat_id = kwargs.get("chat_id") or (args[1] if len(args) > 1 else "")
             name = str(getattr(adapter, "name", "") or "").lower()
+            pending = None
             if "weixin" in name:
                 pending = _peek_turn_model(str(chat_id))
                 if pending and not pending[1]:
@@ -694,9 +712,34 @@ def patch_stream_consumer() -> bool:
                     metadata.update({"actor": "model", "model_name": pending[0]})
                     kwargs["metadata"] = metadata
             original_init(self, *args, **kwargs)
+            if "weixin" in name and pending and not pending[1]:
+                bind_origin(self, pending[0])
 
         GatewayStreamConsumer.__init__ = wrapped
         GatewayStreamConsumer._hermes_wechat_model_origin_v1 = True
+        installed = True
+
+    # Every ordinary/fallback/final stream rail obtains its metadata through
+    # this method.  Make the consumer-owned provenance authoritative here so a
+    # steer, boundary transition, or core metadata rebuild cannot silently
+    # downgrade model prose to the fail-closed ``hermes`` label.
+    metadata_method = getattr(GatewayStreamConsumer, "_metadata_for_send", None)
+    if (
+        callable(metadata_method)
+        and not getattr(GatewayStreamConsumer, "_hermes_wechat_send_origin_v1", False)
+    ):
+        @functools.wraps(metadata_method)
+        def wrapped_metadata(self: Any, *args: Any, **kwargs: Any) -> Any:
+            value = metadata_method(self, *args, **kwargs)
+            model = getattr(self, "_hermes_wechat_model_origin", None)
+            if not model:
+                return value
+            metadata = dict(value or {})
+            metadata.update({"actor": "model", "model_name": _safe_model(model)})
+            return metadata
+
+        GatewayStreamConsumer._metadata_for_send = wrapped_metadata
+        GatewayStreamConsumer._hermes_wechat_send_origin_v1 = True
         installed = True
 
     # Hermes v0.21's approval/clarification boundary has a fallback send rail
@@ -837,29 +880,64 @@ def patch_turn_runner_status() -> bool:
         from gateway.run_turn_runner import TurnRunner
     except (ImportError, AttributeError):
         return False
-    if getattr(TurnRunner, "_hermes_wechat_interim_origin_v1", False):
-        return False
+    installed = False
     original = getattr(TurnRunner, "_send_status_text", None)
     if not callable(original):
-        return False
+        return installed
 
-    @functools.wraps(original)
-    def wrapped(self: Any, text: str, metadata: Any, log_message: str) -> Any:
-        ctx = getattr(self, "_ctx", None)
-        source = getattr(ctx, "source", None)
-        platform_obj = getattr(source, "platform", "")
-        platform = str(getattr(platform_obj, "value", platform_obj) or "").lower()
-        if platform == "weixin" and log_message == "interim_assistant_callback scheduling error":
-            chat_id = str(getattr(source, "chat_id", "") or "")
-            pending = _peek_turn_model(chat_id)
-            if pending:
-                metadata = dict(metadata or {})
-                metadata.update({"actor": "model", "model_name": pending[0]})
-        return original(self, text, metadata, log_message)
+    if not getattr(TurnRunner, "_hermes_wechat_interim_origin_v1", False):
+        @functools.wraps(original)
+        def wrapped(self: Any, text: str, metadata: Any, log_message: str) -> Any:
+            ctx = getattr(self, "_ctx", None)
+            source = getattr(ctx, "source", None)
+            platform_obj = getattr(source, "platform", "")
+            platform = str(getattr(platform_obj, "value", platform_obj) or "").lower()
+            if platform == "weixin" and log_message == "interim_assistant_callback scheduling error":
+                chat_id = str(getattr(source, "chat_id", "") or "")
+                pending = _peek_turn_model(chat_id)
+                if pending:
+                    metadata = dict(metadata or {})
+                    metadata.update({"actor": "model", "model_name": pending[0]})
+            return original(self, text, metadata, log_message)
 
-    TurnRunner._send_status_text = wrapped
-    TurnRunner._hermes_wechat_interim_origin_v1 = True
-    return True
+        TurnRunner._send_status_text = wrapped
+        TurnRunner._hermes_wechat_interim_origin_v1 = True
+        installed = True
+
+    # ``TurnRunner._finish_stream_consumer`` is the last synchronous boundary
+    # before the authoritative final response is queued to the stream consumer.
+    # Update the consumer with the post-fallback model here; _run_agent_inner
+    # and agent:end both occur after this boundary and are too late for a fast
+    # final send.
+    finish = getattr(TurnRunner, "_finish_stream_consumer", None)
+    if callable(finish) and not getattr(TurnRunner, "_hermes_wechat_final_origin_v1", False):
+        @functools.wraps(finish)
+        def wrapped_finish(self: Any, result: Any, agent_history: Any, stream_consumer: Any) -> Any:
+            if stream_consumer is not None:
+                ctx = getattr(self, "_ctx", None)
+                source = getattr(ctx, "source", None)
+                platform_obj = getattr(source, "platform", "")
+                platform = str(getattr(platform_obj, "value", platform_obj) or "").lower()
+                if platform == "weixin":
+                    agent_holder = getattr(ctx, "agent_holder", None) or []
+                    agent = agent_holder[0] if agent_holder else None
+                    model = (
+                        getattr(agent, "model", None)
+                        or (result.get("model") if isinstance(result, dict) else None)
+                        or getattr(stream_consumer, "_hermes_wechat_model_origin", None)
+                    )
+                    normalized = _safe_model(model)
+                    if normalized != "hermes":
+                        setattr(stream_consumer, "_hermes_wechat_model_origin", normalized)
+                        metadata = dict(getattr(stream_consumer, "metadata", None) or {})
+                        metadata.update({"actor": "model", "model_name": normalized})
+                        stream_consumer.metadata = metadata
+            return finish(self, result, agent_history, stream_consumer)
+
+        TurnRunner._finish_stream_consumer = wrapped_finish
+        TurnRunner._hermes_wechat_final_origin_v1 = True
+        installed = True
+    return installed
 
 
 def _counter_path() -> Path:
@@ -1285,6 +1363,9 @@ async def install_v021_bubble_footer_hook(
     model_route_installed = patch_gateway_runner(runner)
     stream_origin_installed = patch_stream_consumer()
     interim_origin_installed = patch_turn_runner_status()
+    from hermes_wechat_enhance.lifecycle import patch_core_weixin_startup_notifications
+
+    startup_owner_installed = patch_core_weixin_startup_notifications(runner)
 
     from hermes_wechat_enhance.slash_command_dedup import patch_weixin_adapter
 
@@ -1336,6 +1417,7 @@ async def install_v021_bubble_footer_hook(
         "model_route": model_route_installed,
         "stream_origin": stream_origin_installed,
         "interim_origin": interim_origin_installed,
+        "startup_owner": startup_owner_installed,
         "errors": errors,
         "capabilities": {
             "bubble_footer": True,
@@ -1346,6 +1428,9 @@ async def install_v021_bubble_footer_hook(
             "stream_boundary_model_origin": True,
             "nonstream_interim_model_origin": True,
             "pre_delivery_final_model_origin": True,
+            "consumer_owned_stream_model_origin": True,
+            "fallback_model_before_stream_finalize": True,
+            "sole_weixin_startup_ready_owner": True,
             "fresh_slash_command_content_dedup_exemption": True,
         },
         "pending_bubbles": pending,

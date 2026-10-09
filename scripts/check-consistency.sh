@@ -7,7 +7,7 @@ cd "$ROOT"
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 
 grep -q 'requires_hermes: ">=0.21.3,<0.22"' plugin.yaml || fail "unsupported Hermes range"
-grep -q 'version: 3.0.1' plugin.yaml || fail "release version mismatch"
+grep -q 'version: 3.1.0' plugin.yaml || fail "release version mismatch"
 grep -q 'install_v021_bubble_footer_hook' hooks/hermes-wechat-enhance/handler.py || fail "current hook missing"
 
 if grep -RInE 'v0\.18|v018|MessageSendQueue|ReplyBudgetStore|legacy_runtime_compat|current_official_runtime_compat' \

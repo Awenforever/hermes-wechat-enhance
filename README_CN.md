@@ -6,7 +6,7 @@
 
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.21.3%2C%20%3C0.22-5965f2)](https://github.com/NousResearch/hermes-agent)
 [![微信](https://img.shields.io/badge/通道-Weixin-07c160)](#核心能力)
-[![版本](https://img.shields.io/badge/版本-3.0.1-7950f2)](plugin.yaml)
+[![版本](https://img.shields.io/badge/版本-3.1.0-7950f2)](plugin.yaml)
 [![许可证](https://img.shields.io/badge/许可证-MIT-2f9e44)](LICENSE)
 
 [English](README.md) · [快速安装](#快速安装) · [个性化配置](#个性化配置) · [故障排查](#故障排查)
@@ -95,12 +95,15 @@ plugins:
 
 | 配置项 | 默认值 | 作用 |
 |---|---:|---|
-| `startup_notification` | `true` | Gateway 启动后发送就绪消息。 |
+| `startup_notification` | `true` | 每次 Gateway 进程启动后发送一条可持久排队的就绪消息。 |
 | `startup_message` | 如上 | 自定义就绪消息正文。 |
 | `capture_messages` | `true` | 保存有界的本地收发审计副本。 |
 
 兼容环境变量 `HERMES_WEIXIN_STARTUP_READY_NOTIFY` 优先级更高：`1` 使用默认文案，
 `0/false/off` 关闭，其他非空字符串会直接作为自定义文案。
+
+插件启用时只在内存中抑制 Hermes 核心重复的微信启动通知，不修改核心文件或用户
+配置；Hermes 核心的 shutdown 通知仍保持启用。
 
 ## 日常使用
 

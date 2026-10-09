@@ -20,6 +20,7 @@ async def main() -> None:
         from gateway.config import PlatformConfig
         from gateway.platforms.weixin import WeixinAdapter
         from hermes_wechat_enhance.v021_bubble_footer import (
+            _remember_model,
             _set_context_token,
             patch_adapter,
             patch_stream_consumer,
@@ -75,6 +76,26 @@ async def main() -> None:
         control = await adapter.send("boundary-peer", "confirmation prompt")
         assert control.success
         assert sent[-1][1].endswith("`hermes`")
+
+        # Real consumer contract for a mid-run /steer: even when Core rebuilds
+        # the metadata dict, the model origin remains bound to this concrete
+        # consumer and is re-applied at the physical send boundary.
+        _remember_model("steer-peer", "deepseek-flash")
+        steer_consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="steer-peer",
+            metadata={},
+        )
+        assert steer_consumer._hermes_wechat_model_origin == "deepseek-flash"
+        steer_consumer.metadata = {}
+        steer_metadata = steer_consumer._metadata_for_send(final=True)
+        assert steer_metadata["actor"] == "model"
+        assert steer_metadata["model_name"] == "deepseek-flash"
+        steered_final = await adapter.send(
+            "steer-peer", "final after steer", metadata=steer_metadata
+        )
+        assert steered_final.success
+        assert sent[-1][1].endswith("`deepseek-flash`")
 
         body = "z" * 3900
         chunks = adapter._split_text(body)

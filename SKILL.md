@@ -59,6 +59,9 @@ Persistent user data under
 - Pending sends survive restart and are released in strict FIFO order.
 - Startup-ready notification is enabled by default and may be explicitly
   disabled or customized by the user.
+- The plugin is the sole Weixin startup-ready owner while active. It suppresses
+  only Core's duplicate startup sends in memory; it must not disable Core's
+  shared restart-notification setting because that would also silence shutdown.
 - Quoted and leading `@` actions are offered to independently installed
   consumers; unhandled input continues to Hermes normally.
 

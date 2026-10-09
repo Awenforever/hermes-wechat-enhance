@@ -110,6 +110,25 @@ status traffic or chat-wide active-model inference.
 Stable runtime markers: `_hermes_wechat_interim_origin_v1` and
 `_hermes_wechat_model_route_v4`.
 
+### A final answer after `/steer` showed `hermes`
+
+The route model was copied into consumer metadata only at construction time.
+A mid-run `/steer` is Hermes-owned control traffic inside the same model turn;
+Core may rebuild delivery metadata before the authoritative final send. The
+continued model prose then lost explicit provenance and fell closed to
+`hermes`.
+
+The concrete `GatewayStreamConsumer` is the stable delivery object for that
+turn. Bind the resolved model to the consumer itself, re-apply it at every
+`_metadata_for_send` boundary, and refresh it with the post-fallback agent model
+inside `TurnRunner._finish_stream_consumer`, before finalization is queued.
+`agent:end` and response-prefix matching are compatibility fallbacks, not the
+primary stream attribution protocol. A `/steer` acknowledgement remains
+`hermes`; continued and final model prose retains the actual model.
+
+Stable runtime markers: `_hermes_wechat_send_origin_v1` and
+`_hermes_wechat_final_origin_v1`.
+
 ### Repeated `/approve` or `/continue` was lost
 
 The sender+content fingerprint treated a fresh identical slash command as a
@@ -172,6 +191,21 @@ authorization to silence a user-facing lifecycle event. Suppression may be used
 only when the user explicitly requests a silent restart, and the sentinel must
 be scoped to that single restart and verified as consumed afterwards.
 
+### Core and plugin both sent the same ready message
+
+Current Hermes has native planned-restart notifications, but its single
+`gateway_restart_notification` option controls both startup and shutdown.
+Persistently setting it to false removes the duplicate at the cost of silently
+removing the shutdown half of the lifecycle contract. It also does not cover
+cold starts or crash recovery where no planned marker exists.
+
+While active, the plugin owns Weixin startup readiness for every Gateway
+process start and records an acknowledged/FIFO-accepted per-boot receipt. It
+wraps only Core's two startup-notification methods and temporarily suppresses
+Weixin inside those calls; other platforms, Core files, persisted config, and
+Core shutdown notifications remain untouched. Never solve this incident by
+writing `gateway_restart_notification=false`.
+
 ### Markdown links and list items developed blank lines
 
 The core formatter hard-wrapped source at a visual width. Weixin treats source
@@ -215,6 +249,12 @@ No release is acceptable unless tests prove all of these together:
 - fresh repeated slash commands pass; exact message-ID replay does not;
 - long Markdown link/list lines remain unbroken at the transport boundary;
 - startup-ready uses explicit `hermes` metadata and acknowledged delivery;
+- repeated startup-hook dispatch in one process yields one accepted ready
+  obligation, while a new process produces a new ready notice;
+- Core's Weixin startup sends are suppressed without changing the shared
+  option, and the option is restored before any later shutdown;
+- a `/steer` acknowledgement is `hermes`, while continued/final model output
+  retains the consumer's actual post-fallback model;
 - install is idempotent, uninstall fails closed, and user state is preserved.
 
 Run both the simulated matrix and the real Hermes v0.21 adapter/stream-consumer

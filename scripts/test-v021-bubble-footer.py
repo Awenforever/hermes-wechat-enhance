@@ -125,6 +125,14 @@ async def main():
                 self.chat_id = chat_id
                 self.metadata = metadata
 
+            def _metadata_for_send(self, **_kwargs):
+                return dict(self.metadata or {})
+
+            async def send_final(self, text):
+                return await self.adapter.send(
+                    self.chat_id, text, metadata=self._metadata_for_send(final=True)
+                )
+
             async def _finalize_boundary_stream(self, _reason):
                 # Mirror Hermes v0.21's exceptional fallback rail: the
                 # pre-prompt model text is sent without consumer metadata.
@@ -136,13 +144,19 @@ async def main():
 
         class FakeTurnRunner:
             def __init__(self, adapter, source):
-                self._ctx = types.SimpleNamespace(source=source)
+                self._ctx = types.SimpleNamespace(
+                    source=source,
+                    agent_holder=[types.SimpleNamespace(model="deepseek-flash")],
+                )
                 self.adapter = adapter
 
             def _send_status_text(self, text, metadata, log_message):
                 return asyncio.create_task(
                     self.adapter.send(self._ctx.source.chat_id, text, metadata=metadata)
                 )
+
+            def _finish_stream_consumer(self, result, _agent_history, stream_consumer):
+                return result, stream_consumer
 
         turn_runner_module.TurnRunner = FakeTurnRunner
         platforms = types.ModuleType("gateway.platforms")
@@ -234,6 +248,27 @@ async def main():
         result = await adapter.send("peer", "clarification prompt")
         assert result.success
         assert adapter.sent[-1][1].endswith("`hermes`")
+
+        # /steer is a Hermes-owned control send inside the same running turn.
+        # It must not detach provenance from the concrete stream consumer, even
+        # if core rebuilds the consumer metadata before the final send.
+        consumer.metadata = {}
+        result = await adapter.send("peer", "steer queued")
+        assert result.success
+        assert adapter.sent[-1][1].endswith("`hermes`")
+        result = await consumer.send_final("final answer after steer")
+        assert result.success
+        assert adapter.sent[-1][1].endswith("`deepseek-flash`")
+
+        # The last pre-finalization boundary owns fallback truth.  Updating the
+        # concrete consumer here must make the authoritative final response use
+        # the actual fallback model, not the initially routed model.
+        fallback_runner = FakeTurnRunner(adapter, Source())
+        fallback_runner._ctx.agent_holder[0].model = "qwen3.6-chat"
+        fallback_runner._finish_stream_consumer({}, [], consumer)
+        result = await consumer.send_final("final answer after fallback")
+        assert result.success
+        assert adapter.sent[-1][1].endswith("`qwen3.6-chat`")
         for content in ("commentary one", "commentary two"):
             result = await adapter.send("peer", content, metadata=consumer.metadata)
             assert result.success
@@ -248,13 +283,16 @@ async def main():
         result = await adapter.send("peer", "final answer")
         assert result.success
         turn_bubbles = adapter.sent[before:]
-        assert len(turn_bubbles) == 10
+        assert len(turn_bubbles) == 13
         assert turn_bubbles[0][1].endswith("`deepseek-flash`")
         assert turn_bubbles[1][1].endswith("`hermes`")
         assert turn_bubbles[2][1].endswith("`deepseek-flash`")
         assert turn_bubbles[3][1].endswith("`hermes`")
-        assert all(item[1].endswith("`deepseek-flash`") for item in turn_bubbles[4:6])
-        assert all(item[1].endswith("`hermes`") for item in turn_bubbles[6:9])
+        assert turn_bubbles[4][1].endswith("`hermes`")
+        assert turn_bubbles[5][1].endswith("`deepseek-flash`")
+        assert turn_bubbles[6][1].endswith("`qwen3.6-chat`")
+        assert all(item[1].endswith("`qwen3.6-chat`") for item in turn_bubbles[7:9])
+        assert all(item[1].endswith("`hermes`") for item in turn_bubbles[9:12])
         assert turn_bubbles[-1][1].endswith("`deepseek-flash`")
 
         # The runner result is available before the asynchronously scheduled

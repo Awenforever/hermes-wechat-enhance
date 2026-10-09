@@ -6,7 +6,7 @@
 
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.21.3%2C%20%3C0.22-5965f2)](https://github.com/NousResearch/hermes-agent)
 [![Channel](https://img.shields.io/badge/channel-Weixin-07c160)](#what-it-does)
-[![Release](https://img.shields.io/badge/release-3.0.1-7950f2)](plugin.yaml)
+[![Release](https://img.shields.io/badge/release-3.1.0-7950f2)](plugin.yaml)
 [![License](https://img.shields.io/badge/license-MIT-2f9e44)](LICENSE)
 
 [简体中文](README_CN.md) · [Install](#install) · [Configure](#configure) · [Troubleshoot](#troubleshoot)
@@ -101,13 +101,17 @@ plugins:
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| `startup_notification` | `true` | Send a ready message after Gateway startup. |
+| `startup_notification` | `true` | Send one durable ready message after every Gateway process start. |
 | `startup_message` | shown above | Customize the ready message. |
 | `capture_messages` | `true` | Keep a bounded local audit copy of inbound and outbound messages. |
 
 `HERMES_WEIXIN_STARTUP_READY_NOTIFY` takes precedence: `1` selects the default
 message, `0`/`false`/`off` disables it, and another non-empty value becomes the
 custom message.
+
+While active, the plugin suppresses only Hermes Core's duplicate Weixin
+startup sends in memory. It does not modify Core or its configuration, and
+Core shutdown notifications remain enabled.
 
 ## Everyday use
 
