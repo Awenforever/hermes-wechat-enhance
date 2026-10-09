@@ -4,6 +4,32 @@ Internal engineering memorandum. Keep incident history, attribution rules,
 compatibility traps, and regression obligations here rather than turning the
 public README into a development log.
 
+## 2026-10-08 — current-Hermes-only architecture
+
+The public plugin no longer supports historical Hermes Core releases. This is
+an architectural boundary, not merely a documentation change:
+
+- runtime installation is hook-only and must leave Hermes Core byte-identical;
+- source hashes must never be used to guess runtime capabilities;
+- historical Core queues, budgets, patch series, and their contract tests must
+  not appear in distributable code;
+- `scripts/verify-self-install.py` is the single authoritative verifier and
+  probes the live API surface needed by the current hook;
+- dropping old Core support does **not** authorize dropping plugin state.
+  Counters, pending FIFO entries, quote records, authorization, audit records,
+  pairing, profile data, and configuration remain upgrade-preserved;
+- startup-ready delivery is enabled by default. Deployment tooling must not
+  create hidden one-shot suppression sentinels;
+- repository HEAD, installed source, active hook, and runtime receipt are
+  distinct layers and must all be checked after an upgrade;
+- an optional four-plugin release pack must live outside every individual
+  plugin repository, avoiding circular self-pins.
+
+Regression releases must test all inbound Context Token refresh, silent
+`/continue` FIFO drain, repeated slash-command exemption, provider message-ID
+replay rejection, per-ack text/media counting, truthful per-bubble model
+attribution, quoted-action interoperability, and startup-ready notification.
+
 ## Non-negotiable invariants
 
 1. **Attribute the physical bubble, not the chat.** Model identity comes from

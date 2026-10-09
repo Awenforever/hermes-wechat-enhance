@@ -6,7 +6,7 @@
 
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.21.3%2C%20%3C0.22-5965f2)](https://github.com/NousResearch/hermes-agent)
 [![微信](https://img.shields.io/badge/通道-Weixin-07c160)](#核心能力)
-[![版本](https://img.shields.io/badge/版本-2.4.0-7950f2)](plugin.yaml)
+[![版本](https://img.shields.io/badge/版本-3.0.0-7950f2)](plugin.yaml)
 [![许可证](https://img.shields.io/badge/许可证-MIT-2f9e44)](LICENSE)
 
 [English](README.md) · [快速安装](#快速安装) · [个性化配置](#个性化配置) · [故障排查](#故障排查)
@@ -91,7 +91,6 @@ plugins:
         startup_notification: true
         startup_message: "♻️ Gateway online — Hermes is back and ready."
         capture_messages: true
-        legacy_runtime_compat: false
 ```
 
 | 配置项 | 默认值 | 作用 |
@@ -99,7 +98,6 @@ plugins:
 | `startup_notification` | `true` | Gateway 启动后发送就绪消息。 |
 | `startup_message` | 如上 | 自定义就绪消息正文。 |
 | `capture_messages` | `true` | 保存有界的本地收发审计副本。 |
-| `legacy_runtime_compat` | `false` | 仅供 v0.18 遗留迁移；v0.21 不得开启。 |
 
 兼容环境变量 `HERMES_WEIXIN_STARTUP_READY_NOTIFY` 优先级更高：`1` 使用默认文案，
 `0/false/off` 关闭，其他非空字符串会直接作为自定义文案。
@@ -121,17 +119,6 @@ hermes wechat-enhance status
 ```
 
 正常升级不会删除运行队列、计数、审计记录、微信配对、授权或 Profile 配置。
-
-## 从 Hermes v0.18 迁移
-
-先备份 `HERMES_HOME`，安装当前插件，然后归档旧队列：
-
-```bash
-hermes wechat-enhance migrate-v018
-```
-
-旧版积压会作为迁移档案保存，但**不会补发**。全新的 v0.21 安装必须保持
-`legacy_runtime_compat: false`。
 
 ## 数据与隐私
 

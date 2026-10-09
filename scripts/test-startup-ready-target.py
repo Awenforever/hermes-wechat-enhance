@@ -70,8 +70,7 @@ async def main() -> None:
         await module._send_startup_ready({"adapters": {"weixin": Adapter()}})
         assert calls[-1][1] == "custom ready"
 
-        # Consume both the corrected profile-relative path and the legacy
-        # 2.1.7 path so upgrades cannot leave a stale one-shot suppression.
+        # Historical deployment sentinels must never suppress a ready notice.
         for relative in (
             Path("wechat-enhance/suppress-startup-ready-once"),
             Path(".hermes/wechat-enhance/suppress-startup-ready-once"),
@@ -81,31 +80,7 @@ async def main() -> None:
             sentinel.touch()
             before = len(calls)
             await module._send_startup_ready({"adapters": {"weixin": Adapter()}})
-            assert len(calls) == before
-            assert not sentinel.exists()
-
-        # A root-owned or otherwise undeletable sentinel suppresses exactly
-        # once. Its receipt prevents permanent suppression on every restart.
-        sentinel = home / "wechat-enhance" / "suppress-startup-ready-once"
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.touch()
-        original_unlink = Path.unlink
-
-        def guarded_unlink(path, *args, **kwargs):
-            if path == sentinel:
-                raise PermissionError("fixture-owned sentinel")
-            return original_unlink(path, *args, **kwargs)
-
-        Path.unlink = guarded_unlink
-        try:
-            before = len(calls)
-            await module._send_startup_ready({"adapters": {"weixin": Adapter()}})
-            assert len(calls) == before
-            await module._send_startup_ready({"adapters": {"weixin": Adapter()}})
             assert len(calls) == before + 1
-        finally:
-            Path.unlink = original_unlink
-            sentinel.unlink(missing_ok=True)
         print("WECHAT_STARTUP_TARGET_INHERIT_TEST=PASS")
 
 

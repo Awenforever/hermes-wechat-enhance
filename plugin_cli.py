@@ -198,37 +198,10 @@ def _runtime_status() -> dict:
 
 def register_cli(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="wechat_enhance_action")
-    actions.add_parser("status", help="Show install and legacy-queue status")
+    actions.add_parser("status", help="Show current runtime status")
     actions.add_parser("install-hook", help="Install or refresh the profile-scoped gateway hook")
     actions.add_parser("uninstall-hook", help="Remove owned hook code while preserving all user state")
-    migrate = actions.add_parser("migrate-v018", help="Archive and retire v0.18 queued messages")
-    migrate.add_argument("--queue-file", default=None, help="Legacy queue JSON path")
     parser.set_defaults(func=wechat_enhance_command)
-
-
-def _read_queue_count(path: Path) -> int:
-    if not path.is_file():
-        return 0
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return -1
-    if isinstance(payload, dict):
-        entries = payload.get("entries", payload.get("queue", payload))
-        if isinstance(entries, list):
-            return len(entries)
-        if isinstance(entries, dict):
-            return sum(len(value) if isinstance(value, list) else 1 for value in entries.values())
-    return 0
-
-
-def _legacy_queue_path(explicit: str | None = None) -> Path:
-    if explicit:
-        return Path(explicit).expanduser()
-    configured = os.environ.get("HERMES_WECHAT_QUEUE_FILE", "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    return _hermes_home() / "weixin_budget" / "message_send_queue.json"
 
 
 def _install_hook() -> int:
@@ -309,47 +282,13 @@ def _uninstall_hook() -> int:
     return 0
 
 
-def _migrate(queue_path: Path) -> int:
-    count = _read_queue_count(queue_path)
-    if not queue_path.exists():
-        print(json.dumps({"ok": True, "legacy_queue": str(queue_path), "discarded": 0, "backup": None}))
-        return 0
-    archive_dir = _hermes_home() / "migration-archive" / "hermes-wechat-enhance-v018"
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = archive_dir / f"{queue_path.name}.{stamp}.not-replayed"
-    shutil.copy2(queue_path, backup)
-    queue_path.unlink()
-    receipt = archive_dir / f"migration-{stamp}.json"
-    receipt.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "source": str(queue_path),
-                "backup": str(backup),
-                "discarded_without_replay": count,
-                "migrated_at": datetime.now(timezone.utc).isoformat(),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    print(json.dumps({"ok": True, "legacy_queue": str(queue_path), "discarded": count, "backup": str(backup)}))
-    return 0
-
-
 def wechat_enhance_command(args: argparse.Namespace) -> int:
     action = getattr(args, "wechat_enhance_action", None)
     if action == "install-hook":
         return _install_hook()
     if action == "uninstall-hook":
         return _uninstall_hook()
-    if action == "migrate-v018":
-        return _migrate(_legacy_queue_path(getattr(args, "queue_file", None)))
     if action in {None, "status"}:
-        queue = _legacy_queue_path()
         runtime = _runtime_status()
         capabilities = runtime.get("capabilities") if isinstance(runtime.get("capabilities"), dict) else {}
         runtime_active = (
@@ -368,9 +307,7 @@ def wechat_enhance_command(args: argparse.Namespace) -> int:
                     "hook_installed": (_hook_target() / "HOOK.yaml").is_file(),
                     "runtime_active": runtime_active,
                     "runtime": runtime,
-                    "legacy_queue": str(queue),
-                    "legacy_queue_entries": _read_queue_count(queue),
-                    "v021_native_context_tokens": True,
+                    "current_hermes_contract": True,
                 },
                 indent=2,
             )

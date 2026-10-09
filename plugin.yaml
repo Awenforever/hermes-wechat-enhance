@@ -1,5 +1,5 @@
 name: hermes-wechat-enhance
-version: 2.4.0
+version: 3.0.0
 manifest_version: 1
 api_version: 1
 description: Reliable Weixin delivery, durable FIFO resume, acknowledged text/media bubble counters, model tags, audit, and migration support.
@@ -21,7 +21,3 @@ config_schema:
     type: str
     default: "♻️ Gateway online — Hermes is back and ready."
     description: Optional custom text for the startup-ready notification.
-  legacy_runtime_compat:
-    type: bool
-    default: false
-    description: Enable the v0.18 compatibility shim; never enable on Hermes v0.21.

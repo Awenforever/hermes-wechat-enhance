@@ -6,26 +6,12 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
 
 # HERMES_WECHAT_TRANSACTION_SNAPSHOT_SOURCE_PATH_V2
-# HERMES_WECHAT_GIT_METADATA_PRESERVATION_V1
-# HERMES_WECHAT_EXACT_FILE_BACKUP_RESTORE_V1
-TOUCHED = (
-    "gateway/platforms/weixin.py",
-    "gateway/platforms/base.py",
-    "gateway/run.py",
-)
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+# HERMES_WECHAT_HOOK_ONLY_TRANSACTION_V1
 
 TRANSIENT_TREE_PARTS = {
     "__pycache__",
@@ -84,16 +70,6 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
     path.chmod(0o600)
 
-def run_git(gateway: Path, *args: str) -> tuple[int, str]:
-    process = subprocess.run(
-        ["git", "-C", str(gateway), *args],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    return process.returncode, process.stdout.strip()
-
 def state_paths(home: Path) -> tuple[Path, Path]:
     root = home / ".hermes" / "wechat-enhance" / "install-state"
     return root, root / "manifest.json"
@@ -129,20 +105,6 @@ def snapshot(
 
     remove_path(root)
     backups = root / "backups"
-    files: dict[str, dict[str, Any]] = {}
-    for relative in TOUCHED:
-        gateway_file = gateway / relative
-        if not gateway_file.is_file():
-            raise SystemExit(
-                f"missing gateway source file: {gateway_file}"
-            )
-        destination = backups / "gateway" / relative
-        copy_path(gateway_file, destination)
-        files[relative] = {
-            "pre_sha256": sha256_file(gateway_file),
-            "backup": str(destination.relative_to(root)),
-        }
-
     hook_existed = hook.exists() or hook.is_symlink()
     if hook_existed:
         copy_path(hook, backups / "hook")
@@ -151,23 +113,18 @@ def snapshot(
     if source_existed:
         copy_path(source, backups / "source")
 
-    git_rc, pre_head = run_git(gateway, "rev-parse", "HEAD")
-    status_rc, pre_status = run_git(gateway, "status", "--porcelain")
     manifest = {
-        "version": 2,
+        "version": 3,
         "active": True,
         "installed_recorded": False,
         "gateway": str(gateway),
         "hook": str(hook),
         "source": str(source),
-        "files": files,
         "hook_existed": hook_existed,
         "hook_pre_hash": tree_hash(hook),
         "source_existed": source_existed,
         "source_pre_hash": tree_hash(source),
-        "git_present": git_rc == 0,
-        "pre_git_head": pre_head if git_rc == 0 else None,
-        "pre_git_clean": status_rc == 0 and not pre_status,
+        "core_mutation": False,
     }
     atomic_json(manifest_path, manifest)
     print("INSTALL_STATE_SNAPSHOT_OK")
@@ -182,12 +139,8 @@ def record_installed(
     if not manifest_path.exists():
         raise SystemExit("install state manifest missing")
     manifest = json.loads(manifest_path.read_text("utf-8"))
-    for relative, entry in manifest["files"].items():
-        entry["installed_sha256"] = sha256_file(gateway / relative)
     manifest["hook_installed_hash"] = tree_hash(hook)
     manifest["source_installed_hash"] = tree_hash(source)
-    git_rc, installed_head = run_git(gateway, "rev-parse", "HEAD")
-    manifest["installed_git_head"] = installed_head if git_rc == 0 else None
     manifest["installed_recorded"] = True
     atomic_json(manifest_path, manifest)
     print("INSTALL_STATE_RECORDED_OK")
@@ -201,11 +154,6 @@ def restore_files(
 ) -> None:
     if not force:
         divergences = []
-        for relative, entry in manifest["files"].items():
-            current = gateway / relative
-            current_hash = sha256_file(current) if current.is_file() else None
-            if current_hash not in {entry.get("pre_sha256"), entry.get("installed_sha256")}:
-                divergences.append(relative)
         current_hook_hash = tree_hash(Path(manifest["hook"]))
         if current_hook_hash not in {
             manifest.get("hook_pre_hash"),
@@ -220,24 +168,10 @@ def restore_files(
         }:
             divergences.append("source")
 
-        if manifest.get("git_present") is True:
-            git_rc, current_head = run_git(gateway, "rev-parse", "HEAD")
-            allowed_heads = {
-                manifest.get("pre_git_head"),
-                manifest.get("installed_git_head"),
-            }
-            if git_rc != 0 or current_head not in allowed_heads:
-                divergences.append("git-head")
-
         if divergences:
             raise SystemExit(
                 "SOURCE_DIVERGED; refusing restore: " + ",".join(divergences)
             )
-
-    # The pre-install working tree may intentionally differ from Git HEAD.
-    # Restore the exact transaction snapshots and leave Git metadata untouched.
-    for relative, entry in manifest["files"].items():
-        copy_path(root / entry["backup"], gateway / relative)
 
     hook = Path(manifest["hook"])
     remove_path(hook)
@@ -249,8 +183,6 @@ def restore_files(
     if manifest.get("source_existed"):
         copy_path(root / "backups" / "source", source)
 
-    if manifest.get("git_present") is not True:
-        remove_path(gateway / ".git")
 
 def restore(
     gateway: Path,
@@ -285,9 +217,7 @@ def status(home: Path) -> None:
             {
                 "active": manifest.get("active"),
                 "installed_recorded": manifest.get("installed_recorded"),
-                "git_present": manifest.get("git_present"),
-                "pre_git_clean": manifest.get("pre_git_clean"),
-                "file_count": len(manifest.get("files") or {}),
+                "core_mutation": False,
                 "hook_existed": manifest.get("hook_existed"),
                 "source_existed": manifest.get("source_existed"),
             },

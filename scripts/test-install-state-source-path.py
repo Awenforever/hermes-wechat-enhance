@@ -25,17 +25,7 @@ def main() -> int:
         hook = home / "hooks" / "hermes-wechat-enhance"
         source = home / "skills" / "hermes-wechat-enhance"
 
-        for relative in (
-            "gateway/platforms/weixin.py",
-            "gateway/platforms/base.py",
-            "gateway/run.py",
-        ):
-            target = gateway / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(
-                f"fixture:{relative}\n",
-                encoding="utf-8",
-            )
+        gateway.mkdir(parents=True)
 
         hook.mkdir(parents=True)
         (hook / "handler.py").write_text(
@@ -101,6 +91,8 @@ def main() -> int:
             manifest["source_existed"] is True,
             "existing canonical source not recorded",
         )
+        require(manifest.get("core_mutation") is False, "hook-only marker missing")
+        require("files" not in manifest, "Hermes Core files must not enter plugin transaction state")
         require(
             (
                 manifest_path.parent

@@ -6,7 +6,7 @@
 
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.21.3%2C%20%3C0.22-5965f2)](https://github.com/NousResearch/hermes-agent)
 [![Channel](https://img.shields.io/badge/channel-Weixin-07c160)](#what-it-does)
-[![Release](https://img.shields.io/badge/release-2.4.0-7950f2)](plugin.yaml)
+[![Release](https://img.shields.io/badge/release-3.0.0-7950f2)](plugin.yaml)
 [![License](https://img.shields.io/badge/license-MIT-2f9e44)](LICENSE)
 
 [简体中文](README_CN.md) · [Install](#install) · [Configure](#configure) · [Troubleshoot](#troubleshoot)
@@ -97,7 +97,6 @@ plugins:
         startup_notification: true
         startup_message: "♻️ Gateway online — Hermes is back and ready."
         capture_messages: true
-        legacy_runtime_compat: false
 ```
 
 | Setting | Default | Meaning |
@@ -105,7 +104,6 @@ plugins:
 | `startup_notification` | `true` | Send a ready message after Gateway startup. |
 | `startup_message` | shown above | Customize the ready message. |
 | `capture_messages` | `true` | Keep a bounded local audit copy of inbound and outbound messages. |
-| `legacy_runtime_compat` | `false` | Legacy v0.18 migration only; never enable on v0.21. |
 
 `HERMES_WEIXIN_STARTUP_READY_NOTIFY` takes precedence: `1` selects the default
 message, `0`/`false`/`off` disables it, and another non-empty value becomes the
@@ -129,17 +127,6 @@ hermes wechat-enhance status
 
 Queues, counters, audit data, pairing, authorization, and profile configuration
 live outside plugin source and are retained across a normal upgrade.
-
-## Migrate from Hermes v0.18
-
-Back up `HERMES_HOME`, install the current plugin, then archive the legacy queue:
-
-```bash
-hermes wechat-enhance migrate-v018
-```
-
-Legacy pending messages are archived and **not replayed**. New v0.21 installs
-must leave `legacy_runtime_compat` disabled.
 
 ## Data and privacy
 
