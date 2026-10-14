@@ -34,6 +34,23 @@ FOOTER_RESERVE = 160
 _ACTIVE_MODEL: contextvars.ContextVar[str] = contextvars.ContextVar(
     "hermes_wechat_v021_active_model", default="hermes"
 )
+_TRANSPORT_BINDING = contextvars.ContextVar('hermes_wechat_transport_binding', default=None)
+
+
+def _transport_binding(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    value = (metadata or {}).get('_hermes_transport_binding_v1')
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{64}', value):
+        raise ValueError('invalid opaque transport observation binding')
+    return value
+
+
+def _owned_transport_binding(adapter: Any, chat_id: str) -> Optional[str]:
+    scope = _TRANSPORT_BINDING.get()
+    if scope is not None and scope[:3] == (asyncio.current_task(), adapter, str(chat_id)):
+        return scope[3]
+    return None
 _STREAM_BOUNDARY_MODEL: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "hermes_wechat_v021_stream_boundary_model", default=None
 )
@@ -483,6 +500,7 @@ class PendingBubbleStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.RLock()
+        self.receipts_available = True
         self._initialize()
 
     @contextmanager
@@ -513,8 +531,23 @@ class PendingBubbleStore:
                 );
                 CREATE INDEX IF NOT EXISTS pending_bubbles_fifo
                 ON pending_bubbles(account_key, chat_key, seq);
+                CREATE TABLE IF NOT EXISTS transport_receipts_v1 (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    occurrence_id TEXT NOT NULL UNIQUE,
+                    account_key TEXT NOT NULL,
+                    chat_key TEXT NOT NULL,
+                    binding TEXT NOT NULL,
+                    client_reference TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    observed_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS transport_receipts_binding
+                ON transport_receipts_v1(account_key,chat_key,binding,seq);
                 """
             )
+            columns = {row['name'] for row in connection.execute('PRAGMA table_info(pending_bubbles)')}
+            if 'transport_binding' not in columns:
+                connection.execute('ALTER TABLE pending_bubbles ADD COLUMN transport_binding TEXT')
         with suppress(OSError):
             os.chmod(self.path, 0o600)
 
@@ -522,7 +555,7 @@ class PendingBubbleStore:
     def _keys(account_id: str, chat_id: str) -> tuple[str, str]:
         return (_chat_key(account_id, "<account>"), _chat_key(account_id, chat_id))
 
-    def enqueue(self, account_id: str, chat_id: str, client_id: str, chunk: str, model: str, error: str = "") -> int:
+    def enqueue(self, account_id: str, chat_id: str, client_id: str, chunk: str, model: str, error: str = "", *, binding: Optional[str] = None) -> int:
         account_key, chat_key = self._keys(account_id, chat_id)
         with self._lock, self._connect() as connection:
             pending = connection.execute(
@@ -532,14 +565,64 @@ class PendingBubbleStore:
             if int(pending) >= 500:
                 raise RuntimeError("durable Weixin queue capacity reached (500)")
             connection.execute(
-                "INSERT OR IGNORE INTO pending_bubbles(account_key,chat_key,client_id,chunk,model,enqueued_at,last_error) VALUES(?,?,?,?,?,?,?)",
-                (account_key, chat_key, str(client_id), str(chunk), _safe_model(model), time.time(), str(error)[:500]),
+                "INSERT OR IGNORE INTO pending_bubbles(account_key,chat_key,client_id,chunk,model,enqueued_at,last_error,transport_binding) VALUES(?,?,?,?,?,?,?,?)",
+                (account_key, chat_key, str(client_id), str(chunk), _safe_model(model), time.time(), str(error)[:500], binding),
             )
+            owned = connection.execute('SELECT account_key,chat_key,transport_binding FROM pending_bubbles WHERE client_id=?', (str(client_id),)).fetchone()
+            if owned and tuple(owned) == (account_key, chat_key, binding):
+                self._record_receipt(connection, account_id, chat_id, client_id, binding, 'queued')
+            elif binding is not None:
+                self.receipts_available = False
             row = connection.execute(
                 "SELECT COUNT(*) FROM pending_bubbles WHERE account_key=? AND chat_key=?",
                 (account_key, chat_key),
             ).fetchone()
             return int(row[0])
+
+    def _record_receipt(self, connection, account_id, chat_id, client_id, binding, phase):
+        if binding is None:
+            return
+        try:
+            if not re.fullmatch(r'[0-9a-f]{64}', binding) or phase not in ('queued','acknowledged'):
+                raise ValueError('invalid receipt binding/phase')
+            account_key, chat_key = self._keys(account_id, chat_id)
+            reference = hashlib.sha256(json.dumps([binding,account_key,chat_key,str(client_id)], separators=(',', ':')).encode()).hexdigest()
+            occurrence = hashlib.sha256((reference + ':' + phase).encode()).hexdigest()
+            connection.execute('INSERT OR IGNORE INTO transport_receipts_v1(occurrence_id,account_key,chat_key,binding,client_reference,phase,observed_at) VALUES(?,?,?,?,?,?,?)',
+                (occurrence,account_key,chat_key,binding,reference,phase,time.time()))
+            # This is bounded telemetry, not a complete eternal delivery inventory.
+            connection.execute('DELETE FROM transport_receipts_v1 WHERE observed_at < ?', (time.time() - 7 * 86400,))
+            connection.execute('DELETE FROM transport_receipts_v1 WHERE seq NOT IN (SELECT seq FROM transport_receipts_v1 ORDER BY seq DESC LIMIT 10000)')
+        except Exception:
+            # A metadata failure must never retry or replace physical delivery.
+            self.receipts_available = False
+
+    def record_acknowledgement(self, account_id, chat_id, client_id, binding, *, queued_seq=None):
+        if binding is None and queued_seq is None:
+            return
+        try:
+            with self._lock, self._connect() as connection:
+                self._record_receipt(connection, account_id, chat_id, client_id, binding, 'acknowledged')
+                if queued_seq is not None:
+                    connection.execute('DELETE FROM pending_bubbles WHERE seq=?', (int(queued_seq),))
+        except Exception:
+            self.receipts_available = False
+            if queued_seq is not None:
+                # Preserve the pre-existing drain's queue-removal behavior.
+                self.remove(queued_seq)
+
+    def read_receipts(self, account_id, chat_id, binding, *, after_sequence=0, limit=128):
+        if not isinstance(binding, str) or not re.fullmatch(r'[0-9a-f]{64}', binding):
+            raise ValueError('invalid receipt binding')
+        if type(after_sequence) is not int or after_sequence < 0 or type(limit) is not int or not 1 <= limit <= 1024:
+            raise ValueError('invalid receipt page')
+        account_key, chat_key = self._keys(account_id, chat_id)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute('SELECT seq,occurrence_id,client_reference,phase,observed_at FROM transport_receipts_v1 WHERE account_key=? AND chat_key=? AND binding=? AND seq>? ORDER BY seq LIMIT ?',
+                (account_key,chat_key,binding,after_sequence,limit)).fetchall()
+        return {'version':1, 'records':[dict(row) for row in rows],
+                'available':self.receipts_available, 'complete_inventory_proven':False,
+                'external_delivery_proven':False, 'canonical_quote_mapping_proven':False}
 
     def peek(self, account_id: str, chat_id: str) -> Optional[Dict[str, Any]]:
         account_key, chat_key = self._keys(account_id, chat_id)
@@ -1370,7 +1453,8 @@ def patch_adapter(adapter: Any) -> bool:
             # never stall unrelated sessions.
             if await asyncio.to_thread(queue.count, account_id, str(chat_id)):
                 pending = await asyncio.to_thread(
-                    queue.enqueue, account_id, str(chat_id), client_id, chunk, model
+                    queue.enqueue, account_id, str(chat_id), client_id, chunk, model,
+                    binding=_owned_transport_binding(_self, chat_id)
                 )
                 logger.warning(
                     "Hermes WeChat Enhance: queued bubble behind existing FIFO backlog peer=%s pending=%d",
@@ -1391,7 +1475,8 @@ def patch_adapter(adapter: Any) -> bool:
                 )
             except Exception as exc:
                 pending = await asyncio.to_thread(
-                    queue.enqueue, account_id, str(chat_id), client_id, chunk, model, str(exc)
+                    queue.enqueue, account_id, str(chat_id), client_id, chunk, model, str(exc),
+                    binding=_owned_transport_binding(_self, chat_id)
                 )
                 logger.warning(
                     "Hermes WeChat Enhance: physical bubble queued after delivery failure peer=%s pending=%d error=%s",
@@ -1405,6 +1490,10 @@ def patch_adapter(adapter: Any) -> bool:
                 # None), so only self-healing errors spawn a deferred drain.
                 schedule_retry(_self, str(chat_id), exc)
                 return
+            await asyncio.to_thread(
+                queue.record_acknowledgement, account_id, str(chat_id), client_id,
+                _owned_transport_binding(_self, chat_id)
+            )
             committed = await asyncio.to_thread(
                 store.commit, account_id, str(chat_id), generation, count
             )
@@ -1420,8 +1509,10 @@ def patch_adapter(adapter: Any) -> bool:
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
+        binding = _transport_binding(metadata)
         model, completed = _resolve_model(str(chat_id), content, metadata)
         token = _ACTIVE_MODEL.set(model)
+        binding_token = _TRANSPORT_BINDING.set((asyncio.current_task(), _self, str(chat_id), binding))
         try:
             result = await original_send(
                 chat_id=chat_id,
@@ -1430,6 +1521,7 @@ def patch_adapter(adapter: Any) -> bool:
                 metadata=metadata,
             )
         finally:
+            _TRANSPORT_BINDING.reset(binding_token)
             _ACTIVE_MODEL.reset(token)
         # The completed turn model is intentionally NOT consumed here.  A long
         # final answer is delivered as several physical bubbles; popping the
@@ -1524,7 +1616,11 @@ def patch_adapter(adapter: Any) -> bool:
                     store.commit, account_id, str(chat_id), generation, count
                 ):
                     logger.warning("Hermes WeChat Enhance: context changed during FIFO drain; counter not committed")
-                await asyncio.to_thread(queue.remove, int(item["seq"]))
+                await asyncio.to_thread(
+                    queue.record_acknowledgement, account_id, str(chat_id),
+                    str(item['client_id']), item.get('transport_binding'),
+                    queued_seq=int(item['seq'])
+                )
                 sent += 1
         return {"ok": True, "sent": sent, "pending": 0}
 
@@ -1606,6 +1702,7 @@ def patch_adapter(adapter: Any) -> bool:
     adapter._drain_pending = MethodType(drain_pending, adapter)
     adapter._process_message = MethodType(process_message, adapter)
     adapter._hermes_wechat_v021_pending_queue = queue
+    adapter._hermes_transport_receipts_v1 = queue
     adapter._hermes_wechat_v021_quote_store = quote_store
     adapter._hermes_wechat_v021_quote_capture = quote_capture
     adapter._hermes_wechat_v021_retry_tasks = retry_tasks
