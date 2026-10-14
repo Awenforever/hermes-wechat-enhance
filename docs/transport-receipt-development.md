@@ -36,6 +36,15 @@ bounded to seven days / 10,000 records, and reads always explicitly deny complet
 inventory, external user delivery and canonical quote mapping. This is not an
 exactly-once transport or an eternal delivery history.
 
+The ledger now has a persistent random epoch and a SQLite AUTOINCREMENT high-water
+sequence. Read pages obtain epoch/high-water/records in one read transaction.
+Reopen preserves the epoch; a newly created database gets another. Consumers must
+reject an unexpected epoch, a high-water mark below their saved cursor or a row
+beyond the declared high-water mark. This detects reconstruction/observable
+rollback, not every coordinated backup restore or malicious SQLite modification.
+Producer upgrades and paired consumer-data migration still need explicit
+qualification before production activation; do not silently reset consumer cursors.
+
 Critical limitations: a crash after physical IO before the local acknowledgement
 transaction remains ambiguous under the existing queue's retry behavior. Client
 references are not server-assigned quote IDs. There is no submission-complete,
