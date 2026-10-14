@@ -45,6 +45,19 @@ rollback, not every coordinated backup restore or malicious SQLite modification.
 Producer upgrades and paired consumer-data migration still need explicit
 qualification before production activation; do not silently reset consumer cursors.
 
+Experimental `_hermes_transport_withdraw_binding_v1(chat_id,binding)` accepts only
+a trusted-host request; it does not itself authenticate the user. It persists a
+route-scoped deny before waiting for the physical-send lock. Pending matching rows
+are removed by the host, while unrelated rows retain FIFO order. The drain checks
+the deny between physical sends, so one already in-flight chunk may finish but
+later matching chunks are suppressed. Future submissions under that same binding
+are also suppressed after reopen. `withdrawn` is a local queue/suppression phase,
+not remote recall or user feedback. Reported removal count covers only that call's
+cleanup, not all removals by the drain. Durable denies are bounded at 10,000 and
+never automatically evicted; reaching the cap refuses a new request. Their secure
+retention/erasure, controlled upgrade, write failure and background lifetime still
+need qualification. No production pause handler is automatically registered.
+
 Critical limitations: a crash after physical IO before the local acknowledgement
 transaction remains ambiguous under the existing queue's retry behavior. Client
 references are not server-assigned quote IDs. There is no submission-complete,
