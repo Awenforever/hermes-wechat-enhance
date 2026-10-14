@@ -34,6 +34,7 @@ async def main(root, adapter_type=fixtures.FakeAdapter):
     assert [r['phase'] for r in read(other)['records']] == ['queued']
     # Reopen durable state and drain in a DIFFERENT task with no inherited scope.
     restored = PendingBubbleStore(ledger.path)
+    assert restored.publisher_epoch == ledger.publisher_epoch
     assert restored.peek(adapter._account_id, 'peer')['transport_binding'] == binding
     await asyncio.create_task(adapter._drain_pending('peer'), context=__import__('contextvars').Context())
     assert len(adapter.sent) == 2 and ledger.count(adapter._account_id, 'peer') == 0
@@ -77,6 +78,7 @@ async def main(root, adapter_type=fixtures.FakeAdapter):
     await adapter._drain_pending('peer')
     assert len(adapter.sent) == physical + 1
     assert not adapter._hermes_wechat_v021_retry_tasks
+    assert PendingBubbleStore(root/'fresh-ledger.sqlite3').publisher_epoch != ledger.publisher_epoch
 
 
 def legacy_migration(root):

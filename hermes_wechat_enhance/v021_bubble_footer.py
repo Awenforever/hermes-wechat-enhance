@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -356,8 +357,13 @@ class PendingBubbleStore:
                 );
                 CREATE INDEX IF NOT EXISTS transport_receipts_binding
                 ON transport_receipts_v1(account_key,chat_key,binding,seq);
+                CREATE TABLE IF NOT EXISTS transport_receipt_meta_v1 (
+                    name TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
+            connection.execute('INSERT OR IGNORE INTO transport_receipt_meta_v1(name,value) VALUES(?,?)',('epoch',secrets.token_hex(32)))
             columns = {row['name'] for row in connection.execute('PRAGMA table_info(pending_bubbles)')}
             if 'transport_binding' not in columns:
                 connection.execute('ALTER TABLE pending_bubbles ADD COLUMN transport_binding TEXT')
@@ -424,6 +430,14 @@ class PendingBubbleStore:
                 # Preserve the pre-existing drain's queue-removal behavior.
                 self.remove(queued_seq)
 
+    @property
+    def publisher_epoch(self):
+        with self._lock, self._connect() as connection:
+            row = connection.execute('SELECT value FROM transport_receipt_meta_v1 WHERE name=?',('epoch',)).fetchone()
+        if row is None or not re.fullmatch(r'[0-9a-f]{64}',row['value']):
+            raise RuntimeError('transport ledger epoch unavailable')
+        return row['value']
+
     def read_receipts(self, account_id, chat_id, binding, *, after_sequence=0, limit=128):
         if not isinstance(binding, str) or not re.fullmatch(r'[0-9a-f]{64}', binding):
             raise ValueError('invalid receipt binding')
@@ -431,9 +445,14 @@ class PendingBubbleStore:
             raise ValueError('invalid receipt page')
         account_key, chat_key = self._keys(account_id, chat_id)
         with self._lock, self._connect() as connection:
+            connection.execute('BEGIN')
+            epoch = connection.execute('SELECT value FROM transport_receipt_meta_v1 WHERE name=?',('epoch',)).fetchone()
+            high_water = connection.execute('SELECT seq FROM sqlite_sequence WHERE name=?',('transport_receipts_v1',)).fetchone()
             rows = connection.execute('SELECT seq,occurrence_id,client_reference,phase,observed_at FROM transport_receipts_v1 WHERE account_key=? AND chat_key=? AND binding=? AND seq>? ORDER BY seq LIMIT ?',
                 (account_key,chat_key,binding,after_sequence,limit)).fetchall()
         return {'version':1, 'records':[dict(row) for row in rows],
+                'publisher_epoch':epoch['value'] if epoch else None,
+                'high_water_sequence':int(high_water['seq']) if high_water else 0,
                 'available':self.receipts_available, 'complete_inventory_proven':False,
                 'external_delivery_proven':False, 'canonical_quote_mapping_proven':False}
 
