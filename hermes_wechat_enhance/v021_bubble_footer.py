@@ -548,6 +548,13 @@ class PendingBubbleStore:
                     name TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS transport_withdrawals_v1 (
+                    account_key TEXT NOT NULL,
+                    chat_key TEXT NOT NULL,
+                    binding TEXT NOT NULL,
+                    requested_at REAL NOT NULL,
+                    PRIMARY KEY(account_key,chat_key,binding)
+                );
                 """
             )
             connection.execute('INSERT OR IGNORE INTO transport_receipt_meta_v1(name,value) VALUES(?,?)',('epoch',secrets.token_hex(32)))
@@ -589,7 +596,7 @@ class PendingBubbleStore:
         if binding is None:
             return
         try:
-            if not re.fullmatch(r'[0-9a-f]{64}', binding) or phase not in ('queued','acknowledged'):
+            if not re.fullmatch(r'[0-9a-f]{64}', binding) or phase not in ('queued','acknowledged','withdrawn'):
                 raise ValueError('invalid receipt binding/phase')
             account_key, chat_key = self._keys(account_id, chat_id)
             reference = hashlib.sha256(json.dumps([binding,account_key,chat_key,str(client_id)], separators=(',', ':')).encode()).hexdigest()
@@ -602,6 +609,37 @@ class PendingBubbleStore:
         except Exception:
             # A metadata failure must never retry or replace physical delivery.
             self.receipts_available = False
+
+    def request_withdrawal(self, account_id, chat_id, binding):
+        """Trusted host request, not a grant. Preserve the deny across restart."""
+        if not isinstance(binding,str) or not re.fullmatch(r'[0-9a-f]{64}',binding):
+            raise ValueError('invalid withdrawal binding')
+        keys = self._keys(account_id,chat_id)
+        with self._lock,self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            exists = connection.execute('SELECT 1 FROM transport_withdrawals_v1 WHERE account_key=? AND chat_key=? AND binding=?',(*keys,binding)).fetchone()
+            if exists is None:
+                if connection.execute('SELECT COUNT(*) FROM transport_withdrawals_v1').fetchone()[0] >= 10000:
+                    raise RuntimeError('withdrawal retention capacity reached; explicit reconciliation required')
+                connection.execute('INSERT INTO transport_withdrawals_v1 VALUES(?,?,?,?)',(*keys,binding,time.time()))
+
+    def withdrawal_requested(self, account_id, chat_id, binding):
+        if binding is None:
+            return False
+        with self._lock,self._connect() as connection:
+            return connection.execute('SELECT 1 FROM transport_withdrawals_v1 WHERE account_key=? AND chat_key=? AND binding=?',(*self._keys(account_id,chat_id),binding)).fetchone() is not None
+
+    def withdraw_pending(self, account_id, chat_id, binding):
+        keys = self._keys(account_id,chat_id)
+        with self._lock,self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            if not connection.execute('SELECT 1 FROM transport_withdrawals_v1 WHERE account_key=? AND chat_key=? AND binding=?',(*keys,binding)).fetchone():
+                raise RuntimeError('durable withdrawal request required')
+            rows = connection.execute('SELECT seq,client_id FROM pending_bubbles WHERE account_key=? AND chat_key=? AND transport_binding=? ORDER BY seq',(*keys,binding)).fetchall()
+            for row in rows:
+                self._record_receipt(connection,account_id,chat_id,row['client_id'],binding,'withdrawn')
+                connection.execute('DELETE FROM pending_bubbles WHERE seq=?',(row['seq'],))
+            return len(rows)
 
     def record_acknowledgement(self, account_id, chat_id, client_id, binding, *, queued_seq=None):
         if binding is None and queued_seq is None:
@@ -1466,6 +1504,11 @@ def patch_adapter(adapter: Any) -> bool:
         lock = locks.setdefault(str(chat_id), asyncio.Lock())
         async with lock:
             account_id = str(getattr(_self, "_account_id", ""))
+            binding = _owned_transport_binding(_self,chat_id)
+            if queue.withdrawal_requested(account_id,str(chat_id),binding):
+                with queue._connect() as connection:
+                    queue._record_receipt(connection,account_id,str(chat_id),client_id,binding,'withdrawn')
+                return
             model = _safe_model(_ACTIVE_MODEL.get())
             # The sqlite queue and counter stores do blocking disk I/O; keep it
             # off the gateway event loop so a slow disk or lock contention can
@@ -1607,6 +1650,9 @@ def patch_adapter(adapter: Any) -> bool:
                 item = await asyncio.to_thread(queue.peek, account_id, str(chat_id))
                 if not item:
                     break
+                if queue.withdrawal_requested(account_id,str(chat_id),item.get('transport_binding')):
+                    queue.withdraw_pending(account_id,str(chat_id),item['transport_binding'])
+                    continue
                 context_token = _self._token_store.get(account_id, str(chat_id))
                 count, generation = await asyncio.to_thread(
                     store.preview, account_id, str(chat_id), context_token
@@ -1642,6 +1688,20 @@ def patch_adapter(adapter: Any) -> bool:
                 )
                 sent += 1
         return {"ok": True, "sent": sent, "pending": 0}
+
+    async def withdraw_binding(_self: Any, chat_id: str, binding: str):
+        """Host-controlled withdrawal; caller must authorize it independently.
+
+        Persist before waiting for physical IO so later drain iterations observe
+        the deny. An already in-flight physical send is never cancelled/recalled.
+        """
+        account_id = str(getattr(_self,'_account_id',''))
+        queue.request_withdrawal(account_id,str(chat_id),binding)
+        lock = locks.setdefault(str(chat_id),asyncio.Lock())
+        async with lock:
+            removed = queue.withdraw_pending(account_id,str(chat_id),binding)
+        return {'removed_count':removed,'observation_available':queue.receipts_available,
+                'already_sent_possible':True,'external_recall_proven':False}
 
     async def process_message(_self: Any, message: Dict[str, Any]) -> Any:
         try:
@@ -1722,6 +1782,7 @@ def patch_adapter(adapter: Any) -> bool:
     adapter._process_message = MethodType(process_message, adapter)
     adapter._hermes_wechat_v021_pending_queue = queue
     adapter._hermes_transport_receipts_v1 = queue
+    adapter._hermes_transport_withdraw_binding_v1 = MethodType(withdraw_binding,adapter)
     adapter._hermes_wechat_v021_quote_store = quote_store
     adapter._hermes_wechat_v021_quote_capture = quote_capture
     adapter._hermes_wechat_v021_retry_tasks = retry_tasks
