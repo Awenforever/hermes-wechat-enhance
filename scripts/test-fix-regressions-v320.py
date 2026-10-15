@@ -1,7 +1,8 @@
 """Same-path regressions for the v3.2.0 round.
 
 Covers three changes shipped together:
-  1. Context-fill pie in the bubble footer (single monochrome glyph, inline-code).
+  1. Context-fill progress bar in the bubble footer (Block Elements, constant
+     width, inline-code).
   2. FIFO drain anti-stranding: connectivity errors classify as transient, and
      ANY enqueue is guaranteed a bounded future drain attempt (probe).
   3. Blocking sqlite/JSONL I/O moved off the gateway event loop (asyncio.to_thread).
@@ -45,31 +46,40 @@ def set_fill(chat: str, used: int, limit: int) -> None:
     M._remember_context_fill(chat, used, limit)
 
 
-print("== 1. context pie mapping ==")
-cases = [(5, 100, "○"), (25, 100, "◔"), (50, 100, "◑"), (75, 100, "◕"), (100, 100, "●")]
-for used, limit, glyph in cases:
+print("== 1. context bar mapping (constant 8-char width) ==")
+cases = [
+    (5, 100, "▍░░░░░░░"),
+    (6, 100, "▌░░░░░░░"),
+    (25, 100, "██░░░░░░"),
+    (50, 100, "████░░░░"),
+    (75, 100, "██████░░"),
+    (100, 100, "████████"),
+]
+for used, limit, want in cases:
     set_fill("chatA", used, limit)
-    check(f"ratio {used}/{limit} -> {glyph}", M.context_pie("chatA") == glyph)
+    got = M.context_bar("chatA")
+    check(f"ratio {used}/{limit} -> {want}", got == want)
+    check(f"ratio {used}/{limit} width==8", len(got) == M.CONTEXT_BAR_CELLS)
 set_fill("chatA", 0, 100)
-check("zero used = no API reading -> unknown", M.context_pie("chatA") == "")
+check("zero used = no API reading -> unknown", M.context_bar("chatA") == "")
 M._CONTEXT_FILL.clear()
-check("unknown chat -> empty", M.context_pie("chatUnknown") == "")
-os.environ["HERMES_WECHAT_FOOTER_CONTEXT_PIE"] = "0"
+check("unknown chat -> empty", M.context_bar("chatUnknown") == "")
+os.environ["HERMES_WECHAT_FOOTER_CONTEXT_BAR"] = "0"
 set_fill("chatA", 100, 100)
-check("env disable -> empty", M.context_pie("chatA") == "")
-os.environ.pop("HERMES_WECHAT_FOOTER_CONTEXT_PIE", None)
+check("env disable -> empty", M.context_bar("chatA") == "")
+os.environ.pop("HERMES_WECHAT_FOOTER_CONTEXT_BAR", None)
 M._remember_context_fill("chatBad", 0, 0)
-check("zero/zero ignored", M.context_pie("chatBad") == "")
+check("zero/zero ignored", M.context_bar("chatBad") == "")
 
-print("== 2. footer decoration wraps pie in inline code ==")
+print("== 2. footer decoration wraps bar in inline code ==")
 set_fill("chatB", 100, 100)
 decorated = M._decorate_footer("hello", 3, "deepseek-flash", "chatB")
 check("footer keeps count+model spans", "`3` `deepseek-flash`" in decorated)
-check("footer appends pie span", decorated.endswith("`●`"))
+check("footer appends bar span", decorated.endswith("`████████`"))
 check("footer separator preserved", "\n\n---\n\n" in decorated)
 M._CONTEXT_FILL.clear()
 decorated_none = M._decorate_footer("hello", 3, "deepseek-flash", "chatB")
-check("no pie when unknown -> unchanged footer", decorated_none.endswith("`deepseek-flash`"))
+check("no bar when unknown -> unchanged footer", decorated_none.endswith("`deepseek-flash`"))
 
 print("== 3. connectivity errors classify as transient ==")
 connect_err = "Cannot connect to host ilinkai.weixin.qq.com:443 ssl:default [None]"

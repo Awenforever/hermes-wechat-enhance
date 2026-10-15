@@ -45,13 +45,19 @@ MAX_DRAIN_PROBES = 3
 DRAIN_PROBE_DELAY_SECONDS = 45.0
 
 # Per-chat context-window fill captured from the turn result at the runner
-# boundary (``last_prompt_tokens`` / ``context_length``), rendered as a single
-# monochrome pie glyph in the bubble footer.  Monochrome Geometric Shapes are
-# used deliberately: colour emoji (clock faces) break monospace inline-code
-# alignment in WeChat.  Set HERMES_WECHAT_FOOTER_CONTEXT_PIE=0 to disable.
+# boundary (``last_prompt_tokens`` / ``context_length``), rendered as a compact
+# horizontal progress bar in the bubble footer.  The bar uses only Block
+# Elements (U+2588 full, U+2591 empty, U+258F..U+2589 eighth partials): one
+# Unicode range so every cell is monospace-width-uniform in WeChat inline code
+# (the earlier 5-glyph pie mixed Geometric Shapes of differing widths and had
+# only 5 granularity steps).  8 cells x 8 eighths = 64 fill levels at a constant
+# 8-char width.  Set HERMES_WECHAT_FOOTER_CONTEXT_BAR=0 to disable.
 _CONTEXT_FILL: Dict[str, tuple[int, int, float]] = {}
 _CONTEXT_FILL_LOCK = threading.RLock()
-CONTEXT_PIE_GLYPHS = ("○", "◔", "◑", "◕", "●")
+CONTEXT_BAR_CELLS = 8
+CONTEXT_BAR_FULL = "█"
+CONTEXT_BAR_EMPTY = "░"
+CONTEXT_BAR_PARTIALS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
 
 
 def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> None:
@@ -73,9 +79,13 @@ def _prune_context_fill() -> None:
         _CONTEXT_FILL.pop(key, None)
 
 
-def context_pie(chat_id: str) -> str:
-    """Return the single-glyph context-fill pie for a chat, or "" when unknown."""
-    if os.environ.get("HERMES_WECHAT_FOOTER_CONTEXT_PIE", "1").strip().lower() in {"0", "false", "no", "off"}:
+def context_bar(chat_id: str) -> str:
+    """Return the constant-width context-fill progress bar, or "" when unknown."""
+    env = os.environ.get(
+        "HERMES_WECHAT_FOOTER_CONTEXT_BAR",
+        os.environ.get("HERMES_WECHAT_FOOTER_CONTEXT_PIE", "1"),
+    )
+    if env.strip().lower() in {"0", "false", "no", "off"}:
         return ""
     with _CONTEXT_FILL_LOCK:
         entry = _CONTEXT_FILL.get(str(chat_id))
@@ -83,29 +93,27 @@ def context_pie(chat_id: str) -> str:
         return ""
     used, limit, _ts = entry
     ratio = max(0.0, min(1.0, used / limit)) if limit else 0.0
-    if ratio < 0.125:
-        index = 0
-    elif ratio < 0.375:
-        index = 1
-    elif ratio < 0.625:
-        index = 2
-    elif ratio < 0.875:
-        index = 3
-    else:
-        index = 4
-    return CONTEXT_PIE_GLYPHS[index]
+    total = ratio * CONTEXT_BAR_CELLS
+    full = int(total)
+    sub = round((total - full) * 8)
+    if sub >= 8:
+        full += 1
+        sub = 0
+    partial = CONTEXT_BAR_PARTIALS[sub]
+    empty = CONTEXT_BAR_CELLS - full - (1 if sub else 0)
+    return CONTEXT_BAR_FULL * full + partial + CONTEXT_BAR_EMPTY * empty
 
 
 def _decorate_footer(chunk: str, count: int, model: str, chat_id: str) -> str:
-    """Assemble the bubble footer: count, model, and optional context pie.
+    """Assemble the bubble footer: count, model, and optional context bar.
 
     Every token is wrapped in its own inline-code span, matching the existing
     count/model presentation the user asked to preserve.
     """
     footer = f"`{count}` `{model}`"
-    pie = context_pie(chat_id)
-    if pie:
-        footer = f"{footer} `{pie}`"
+    bar = context_bar(chat_id)
+    if bar:
+        footer = f"{footer} `{bar}`"
     return f"{chunk}\n\n---\n\n{footer}"
 
 
@@ -967,7 +975,7 @@ def patch_gateway_runner(runner: Any) -> bool:
                 response = _delivery_shaped_response(platform_obj, response)
                 _remember_model(chat_id, model, completed=True, response=response)
                 # The turn result carries the API-reported context fill and the
-                # resolved context-window limit; capture both for the footer pie.
+                # resolved context-window limit; capture both for the footer bar.
                 _remember_context_fill(
                     chat_id,
                     result.get("last_prompt_tokens"),
