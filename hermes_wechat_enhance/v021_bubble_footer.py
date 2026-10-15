@@ -41,6 +41,72 @@ _TURN_MODELS: Dict[str, tuple[str, float, bool, str]] = {}
 _TURN_MODELS_LOCK = threading.RLock()
 TURN_MODEL_TTL_SECONDS = 6 * 3600
 MAX_TRANSIENT_DRAIN_RETRIES = 4
+MAX_DRAIN_PROBES = 3
+DRAIN_PROBE_DELAY_SECONDS = 45.0
+
+# Per-chat context-window fill captured from the turn result at the runner
+# boundary (``last_prompt_tokens`` / ``context_length``), rendered as a single
+# monochrome pie glyph in the bubble footer.  Monochrome Geometric Shapes are
+# used deliberately: colour emoji (clock faces) break monospace inline-code
+# alignment in WeChat.  Set HERMES_WECHAT_FOOTER_CONTEXT_PIE=0 to disable.
+_CONTEXT_FILL: Dict[str, tuple[int, int, float]] = {}
+_CONTEXT_FILL_LOCK = threading.RLock()
+CONTEXT_PIE_GLYPHS = ("○", "◔", "◑", "◕", "●")
+
+
+def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> None:
+    try:
+        used_i = int(used or 0)
+        limit_i = int(limit or 0)
+    except (TypeError, ValueError):
+        return
+    if used_i <= 0 or limit_i <= 0:
+        return
+    with _CONTEXT_FILL_LOCK:
+        _CONTEXT_FILL[str(chat_id)] = (used_i, limit_i, time.time())
+        _prune_context_fill()
+
+
+def _prune_context_fill() -> None:
+    cutoff = time.time() - TURN_MODEL_TTL_SECONDS
+    for key in [k for k, v in _CONTEXT_FILL.items() if v[2] < cutoff]:
+        _CONTEXT_FILL.pop(key, None)
+
+
+def context_pie(chat_id: str) -> str:
+    """Return the single-glyph context-fill pie for a chat, or "" when unknown."""
+    if os.environ.get("HERMES_WECHAT_FOOTER_CONTEXT_PIE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return ""
+    with _CONTEXT_FILL_LOCK:
+        entry = _CONTEXT_FILL.get(str(chat_id))
+    if not entry:
+        return ""
+    used, limit, _ts = entry
+    ratio = max(0.0, min(1.0, used / limit)) if limit else 0.0
+    if ratio < 0.125:
+        index = 0
+    elif ratio < 0.375:
+        index = 1
+    elif ratio < 0.625:
+        index = 2
+    elif ratio < 0.875:
+        index = 3
+    else:
+        index = 4
+    return CONTEXT_PIE_GLYPHS[index]
+
+
+def _decorate_footer(chunk: str, count: int, model: str, chat_id: str) -> str:
+    """Assemble the bubble footer: count, model, and optional context pie.
+
+    Every token is wrapped in its own inline-code span, matching the existing
+    count/model presentation the user asked to preserve.
+    """
+    footer = f"`{count}` `{model}`"
+    pie = context_pie(chat_id)
+    if pie:
+        footer = f"{footer} `{pie}`"
+    return f"{chunk}\n\n---\n\n{footer}"
 
 
 def normalize_weixin_inbound_reference(
@@ -200,6 +266,13 @@ def _transient_retry_delay(adapter: Any, error: Any, attempt: int) -> Optional[f
         for marker in (
             "cooldown", "rate limit", "rate-limit", "429", "temporar",
             "timeout", "timed out", "connection reset", "connection aborted",
+            # Connectivity / DNS / TLS-connect failures self-heal once the
+            # network blip passes.  Production stranded a 5-bubble backlog for
+            # ~21 minutes because "Cannot connect to host ... ssl:default"
+            # matched none of the markers above and schedule_retry no-opped.
+            "cannot connect", "connect to host", "connector", "server disconnected",
+            "name or service", "dns", "unreachable", "connection refused",
+            "ssl", "eof occurred", "socket", "network",
         )
     )
     if not transient:
@@ -214,6 +287,25 @@ def _transient_retry_delay(adapter: Any, error: Any, attempt: int) -> Optional[f
         remaining = max(remaining, float(match.group(1)))
     backoff = min(120.0, 2.0 * (2 ** max(0, int(attempt) - 1)))
     return max(0.05, remaining + 0.25, backoff)
+
+
+def _drain_delay(adapter: Any, error: Any, attempt: int) -> Optional[float]:
+    """Return the delay before the next deferred FIFO drain attempt.
+
+    Guarantees that ANY enqueued backlog gets a future drain attempt, not just
+    errors the transient classifier recognises.  Production stranded a backlog
+    for ~21 minutes when a connect failure fell outside the classifier and
+    ``schedule_retry`` no-opped, leaving the next inbound message as the only
+    drain trigger.  Unrecognised/permanent-classified errors therefore still
+    probe a bounded number of times; truly terminal failures stop after the
+    probe cap and still drain on the next fresh inbound token as before.
+    """
+    delay = _transient_retry_delay(adapter, error, attempt)
+    if delay is not None:
+        return delay
+    if int(attempt) <= MAX_DRAIN_PROBES:
+        return DRAIN_PROBE_DELAY_SECONDS
+    return None
 
 
 class BubbleCounterStore:
@@ -874,6 +966,13 @@ def patch_gateway_runner(runner: Any) -> bool:
                 response = result.get("final_response") or result.get("response") or ""
                 response = _delivery_shaped_response(platform_obj, response)
                 _remember_model(chat_id, model, completed=True, response=response)
+                # The turn result carries the API-reported context fill and the
+                # resolved context-window limit; capture both for the footer pie.
+                _remember_context_fill(
+                    chat_id,
+                    result.get("last_prompt_tokens"),
+                    result.get("context_length"),
+                )
             return result
 
         runner._run_agent_inner = wrapped_run
@@ -1054,7 +1153,7 @@ def patch_adapter(adapter: Any) -> bool:
         current = retry_tasks.get(key)
         if current is not None and not current.done():
             return True
-        first_delay = _transient_retry_delay(_self, error, 1)
+        first_delay = _drain_delay(_self, error, 1)
         if first_delay is None:
             return False
 
@@ -1075,7 +1174,7 @@ def patch_adapter(adapter: Any) -> bool:
                             int(result.get("pending", 0)),
                         )
                         return
-                    next_delay = _transient_retry_delay(
+                    next_delay = _drain_delay(
                         _self, result.get("error"), attempt + 1
                     )
                     if next_delay is None:
@@ -1132,18 +1231,23 @@ def patch_adapter(adapter: Any) -> bool:
         async with lock:
             account_id = str(getattr(_self, "_account_id", ""))
             model = _safe_model(_ACTIVE_MODEL.get())
-            if queue.count(account_id, str(chat_id)):
-                pending = queue.enqueue(account_id, str(chat_id), client_id, chunk, model)
+            # The sqlite queue and counter stores do blocking disk I/O; keep it
+            # off the gateway event loop so a slow disk or lock contention can
+            # never stall unrelated sessions.
+            if await asyncio.to_thread(queue.count, account_id, str(chat_id)):
+                pending = await asyncio.to_thread(
+                    queue.enqueue, account_id, str(chat_id), client_id, chunk, model
+                )
                 logger.warning(
                     "Hermes WeChat Enhance: queued bubble behind existing FIFO backlog peer=%s pending=%d",
                     hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
                     pending,
                 )
                 return
-            count, generation = store.preview(
-                account_id, str(chat_id), context_token
+            count, generation = await asyncio.to_thread(
+                store.preview, account_id, str(chat_id), context_token
             )
-            decorated = f"{chunk}\n\n---\n\n`{count}` `{model}`"
+            decorated = _decorate_footer(chunk, count, model, str(chat_id))
             try:
                 await original_send_text_chunk(
                     chat_id=chat_id,
@@ -1152,7 +1256,9 @@ def patch_adapter(adapter: Any) -> bool:
                     client_id=client_id,
                 )
             except Exception as exc:
-                pending = queue.enqueue(account_id, str(chat_id), client_id, chunk, model, str(exc))
+                pending = await asyncio.to_thread(
+                    queue.enqueue, account_id, str(chat_id), client_id, chunk, model, str(exc)
+                )
                 logger.warning(
                     "Hermes WeChat Enhance: physical bubble queued after delivery failure peer=%s pending=%d error=%s",
                     hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
@@ -1165,11 +1271,8 @@ def patch_adapter(adapter: Any) -> bool:
                 # None), so only self-healing errors spawn a deferred drain.
                 schedule_retry(_self, str(chat_id), exc)
                 return
-            committed = store.commit(
-                account_id,
-                str(chat_id),
-                generation,
-                count,
+            committed = await asyncio.to_thread(
+                store.commit, account_id, str(chat_id), generation, count
             )
             if not committed:
                 logger.warning(
@@ -1233,14 +1336,18 @@ def patch_adapter(adapter: Any) -> bool:
         async with lock:
             account_id = str(getattr(_self, "_account_id", ""))
             context_token = _self._token_store.get(account_id, str(chat_id))
-            count, generation = store.preview(account_id, str(chat_id), context_token)
+            count, generation = await asyncio.to_thread(
+                store.preview, account_id, str(chat_id), context_token
+            )
             message_id = await original_send_file(
                 chat_id,
                 path,
                 "",
                 force_file_attachment=force_file_attachment,
             )
-            if not store.commit(account_id, str(chat_id), generation, count):
+            if not await asyncio.to_thread(
+                store.commit, account_id, str(chat_id), generation, count
+            ):
                 logger.warning(
                     "Hermes WeChat Enhance: context changed during acknowledged media send; counter not committed"
                 )
@@ -1252,12 +1359,14 @@ def patch_adapter(adapter: Any) -> bool:
         sent = 0
         async with lock:
             while True:
-                item = queue.peek(account_id, str(chat_id))
+                item = await asyncio.to_thread(queue.peek, account_id, str(chat_id))
                 if not item:
                     break
                 context_token = _self._token_store.get(account_id, str(chat_id))
-                count, generation = store.preview(account_id, str(chat_id), context_token)
-                decorated = f"{item['chunk']}\n\n---\n\n`{count}` `{_safe_model(item['model'])}`"
+                count, generation = await asyncio.to_thread(
+                    store.preview, account_id, str(chat_id), context_token
+                )
+                decorated = _decorate_footer(item["chunk"], count, _safe_model(item["model"]), str(chat_id))
                 try:
                     await original_send_text_chunk(
                         chat_id=str(chat_id),
@@ -1266,18 +1375,22 @@ def patch_adapter(adapter: Any) -> bool:
                         client_id=str(item["client_id"]),
                     )
                 except Exception as exc:
-                    queue.record_failure(int(item["seq"]), str(exc))
+                    await asyncio.to_thread(
+                        queue.record_failure, int(item["seq"]), str(exc)
+                    )
                     scheduled = schedule_retry(_self, str(chat_id), exc)
                     return {
                         "ok": False,
                         "sent": sent,
-                        "pending": queue.count(account_id, str(chat_id)),
+                        "pending": await asyncio.to_thread(queue.count, account_id, str(chat_id)),
                         "error": str(exc),
                         "retry_scheduled": scheduled,
                     }
-                if not store.commit(account_id, str(chat_id), generation, count):
+                if not await asyncio.to_thread(
+                    store.commit, account_id, str(chat_id), generation, count
+                ):
                     logger.warning("Hermes WeChat Enhance: context changed during FIFO drain; counter not committed")
-                queue.remove(int(item["seq"]))
+                await asyncio.to_thread(queue.remove, int(item["seq"]))
                 sent += 1
         return {"ok": True, "sent": sent, "pending": 0}
 
