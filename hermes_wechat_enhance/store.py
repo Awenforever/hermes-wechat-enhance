@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Audit capture is owner-only and size-bounded.  The JSONL store sits outside
+# core's ``security.redact_secrets`` egress path, so it hardens itself: 0600 file
+# mode, core redaction applied to persisted content, and rotation of the audit
+# log (never the pending queue, whose loss would drop undelivered bubbles).
+AUDIT_MAX_BYTES = max(0, int(os.environ.get("HERMES_WECHAT_AUDIT_MAX_BYTES", str(5 * 1024 * 1024))))
+AUDIT_BACKUP_COUNT = max(0, int(os.environ.get("HERMES_WECHAT_AUDIT_BACKUP_COUNT", "2")))
 
 
 class MessageStore:
@@ -30,7 +40,7 @@ class MessageStore:
 
     def append(self, message: Dict[str, Any]) -> Dict[str, Any]:
         record = self._normalize_message(message)
-        self._append_jsonl(self.messages_path, record)
+        self._append_jsonl(self.messages_path, record, rotate=True)
         return record
 
     def append_inbound(self, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -63,7 +73,7 @@ class MessageStore:
         record = {
             "message_id": str(extra.pop("message_id", "") or uuid.uuid4()),
             "user_id": user_id,
-            "content": self._clip(content, 500),
+            "content": self._clip(self._redact(content), 500),
             "timestamp": self._now(),
             **extra,
         }
@@ -152,24 +162,91 @@ class MessageStore:
             "chat_id": str(message.get("chat_id") or ""),
             "session_id": str(message.get("session_id") or ""),
             "direction": self._direction(message.get("direction")),
-            "content": self._clip(message.get("content", ""), 500),
+            "content": self._clip(self._redact(message.get("content", "")), 500),
             "timestamp": str(message.get("timestamp") or self._now()),
             "model_name": str(message.get("model_name") or ""),
         }
 
-    def _append_jsonl(self, path: Path, record: Dict[str, Any]) -> None:
+    def _append_jsonl(self, path: Path, record: Dict[str, Any], *, rotate: bool = False) -> None:
         with self._lock:
             path.parent.mkdir(parents=True, exist_ok=True)
+            if rotate:
+                self._rotate_if_needed(path)
+            self._ensure_private(path)
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     def _rewrite_jsonl(self, path: Path, rows: Iterable[Dict[str, Any]]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as fh:
-            for row in rows:
-                fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-        tmp_path.replace(path)
+        with self._lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = Path(f"{path}.tmp")
+            fd = os.open(str(tmp_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            os.chmod(tmp_path, 0o600)
+            tmp_path.replace(path)
+
+    @staticmethod
+    def _ensure_private(path: Path) -> None:
+        """Create audit files owner-only (0600) and tighten any pre-existing 0644.
+
+        The production audit log shipped world-readable while every sibling state
+        file was 0600, exposing plaintext secrets a user pasted into WeChat to any
+        local account.  Best-effort: a chmod failure is logged, never raised, so
+        auditing degrades gracefully instead of breaking the send path.
+        """
+        try:
+            if path.exists():
+                if path.stat().st_mode & 0o077:
+                    os.chmod(path, 0o600)
+            else:
+                fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+                os.close(fd)
+        except OSError as exc:
+            logger.warning("Hermes WeChat Enhance: could not enforce 0600 on %s: %s", path.name, exc)
+
+    @staticmethod
+    def _rotate_if_needed(path: Path) -> None:
+        """Rotate the audit log once it exceeds AUDIT_MAX_BYTES, keeping N backups.
+
+        Only the append-only audit log rotates.  The pending queue must never
+        rotate away undelivered bubbles, so callers pass rotate=False for it.
+        """
+        if AUDIT_MAX_BYTES <= 0 or AUDIT_BACKUP_COUNT <= 0:
+            return
+        try:
+            if not path.exists() or path.stat().st_size <= AUDIT_MAX_BYTES:
+                return
+            oldest = Path(f"{path}.{AUDIT_BACKUP_COUNT}")
+            if oldest.exists():
+                oldest.unlink()
+            for index in range(AUDIT_BACKUP_COUNT - 1, 0, -1):
+                src = Path(f"{path}.{index}")
+                if src.exists():
+                    src.replace(Path(f"{path}.{index + 1}"))
+            path.replace(Path(f"{path}.1"))
+        except OSError as exc:
+            logger.warning("Hermes WeChat Enhance: audit rotation failed for %s: %s", path.name, exc)
+
+    @staticmethod
+    def _redact(value: Any) -> str:
+        """Apply core's egress secret redaction before persisting audit content.
+
+        The plugin store is outside core's ``security.redact_secrets`` path, so
+        without this a pasted token would be written to disk verbatim.  Falls back
+        to the raw text if the core redactor is unavailable so auditing still works.
+        """
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        try:
+            from agent.redact import redact_for_egress
+        except (ImportError, AttributeError):
+            return text
+        try:
+            return redact_for_egress(text)
+        except Exception:
+            return text
+
 
     def _read_jsonl(self, path: Path) -> Iterable[Dict[str, Any]]:
         if not path.exists():

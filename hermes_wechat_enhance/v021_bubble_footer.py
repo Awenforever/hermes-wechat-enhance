@@ -551,6 +551,27 @@ def _response_signature(value: Any) -> str:
     return str(value or "").strip()[:500]
 
 
+def _delivery_shaped_response(platform_obj: Any, response: Any) -> Any:
+    """Return ``response`` as the platform will physically deliver it.
+
+    Weixin does not surface raw agent text: core rewrites secrets and provider
+    errors before send (``_gateway_surface_passes_raw_text`` is False), so the
+    provenance signature recorded at the runner boundary must be the sanitized
+    body that actually reaches the footer.  Recording the raw text instead made
+    the prefix match fail whenever redaction altered the first 500 chars, and the
+    genuine model final fell back to ``hermes``.  Falls back to the raw value if
+    the core sanitizer is unavailable so provenance still binds on prefix match.
+    """
+    try:
+        from gateway.run import _sanitize_gateway_final_response
+    except (ImportError, AttributeError):
+        return response
+    try:
+        return _sanitize_gateway_final_response(platform_obj, response)
+    except Exception:
+        return response
+
+
 def _remember_model(
     chat_id: str,
     model: Any,
@@ -600,13 +621,6 @@ def _peek_turn_model(chat_id: str) -> Optional[tuple[str, bool, str]]:
             _TURN_MODELS.pop(str(chat_id), None)
             return None
         return model, completed, response
-
-
-def _consume_completed_model(chat_id: str, model: str) -> None:
-    with _TURN_MODELS_LOCK:
-        entry = _TURN_MODELS.get(str(chat_id))
-        if entry and entry[0] == model and entry[2]:
-            _TURN_MODELS.pop(str(chat_id), None)
 
 
 def _is_system(metadata: Dict[str, Any]) -> bool:
@@ -858,6 +872,7 @@ def patch_gateway_runner(runner: Any) -> bool:
                     or (pending[0] if pending else None)
                 )
                 response = result.get("final_response") or result.get("response") or ""
+                response = _delivery_shaped_response(platform_obj, response)
                 _remember_model(chat_id, model, completed=True, response=response)
             return result
 
@@ -1144,6 +1159,11 @@ def patch_adapter(adapter: Any) -> bool:
                     pending,
                     exc,
                 )
+                # A transient transport failure must not strand the backlog until
+                # the next inbound happens to arrive.  schedule_retry is a no-op
+                # for permanent/budget failures (_transient_retry_delay returns
+                # None), so only self-healing errors spawn a deferred drain.
+                schedule_retry(_self, str(chat_id), exc)
                 return
             committed = store.commit(
                 account_id,
@@ -1174,8 +1194,13 @@ def patch_adapter(adapter: Any) -> bool:
             )
         finally:
             _ACTIVE_MODEL.reset(token)
-        if completed and getattr(result, "success", False):
-            _consume_completed_model(str(chat_id), model)
+        # The completed turn model is intentionally NOT consumed here.  A long
+        # final answer is delivered as several physical bubbles; popping the
+        # registry after the first left every later bubble of the same turn
+        # (and any interim rail-B commentary) falling back to ``hermes``.  The
+        # entry is prefix-matched against outgoing content, so control traffic
+        # still cannot borrow it, and the next turn's runtime resolve overwrites
+        # it while TURN_MODEL_TTL_SECONDS bounds staleness.
         return result
 
     async def send_file(
@@ -1265,31 +1290,43 @@ def patch_adapter(adapter: Any) -> bool:
         if not sender_id or sender_id == str(getattr(_self, "_account_id", "")):
             return await original_process_message(message)
 
+        # Resolve the physical send destination first.  The FIFO backlog is
+        # enqueued under the destination chat id that core's send passes to
+        # _send_text_chunk (effective_chat_id), so the drain must use that same
+        # key.  For a DM effective_chat_id == sender_id (no behaviour change);
+        # for a group it is the room id, which is why draining by sender_id
+        # previously stranded group backlogs until an explicit /continue.
+        chat_type, effective_chat_id = _guess_chat_type(message, getattr(_self, "_account_id", ""))
+        drain_key = str(effective_chat_id or sender_id)
+
         # A fresh context_token accompanies every inbound Weixin message.  Persist
-        # it before content/message dedup so even an upstream retry renews the
-        # reply window, then resume any durable FIFO backlog with that token.
+        # it under the sender (exactly as core does) before content/message dedup
+        # so even an upstream retry renews the reply window.
         context_token = str(message.get("context_token") or "").strip()
-        drain_result: Optional[Dict[str, Any]] = None
         if context_token:
             await _set_context_token(_self._token_store, _self._account_id, sender_id, context_token)
-            drain_result = await drain_pending(_self, sender_id)
-            refresh_runtime_status({"adapters": {"weixin": _self}})
 
-        chat_type, effective_chat_id = _guess_chat_type(message, getattr(_self, "_account_id", ""))
+        # Resume the durable FIFO backlog on EVERY inbound, not only when a token
+        # arrives.  drain_pending reuses the last stored token and fails closed
+        # (re-queues + bounded backoff) when none is valid, so a tokenless inbound
+        # can still recover a backlog that an earlier transient failure stranded.
+        drain_result = await drain_pending(_self, drain_key)
+        refresh_runtime_status({"adapters": {"weixin": _self}})
+
         normalized = normalize_weixin_inbound_reference(
             message,
             quote_store=quote_store,
             account_id=str(getattr(_self, "_account_id", "")),
-            chat_id=str(effective_chat_id or sender_id),
+            chat_id=drain_key,
         )
         text = str(_extract_text(message.get("item_list") or []) or "")
         if await _emit_inbound_action(_self, message, normalized):
             return None
         if text.strip() != "/continue":
-            if drain_result and int(drain_result.get("sent", 0)):
+            if int(drain_result.get("sent", 0)):
                 logger.warning(
                     "Hermes WeChat Enhance: inbound token resumed FIFO peer=%s sent=%d pending=%d ok=%s",
-                    hashlib.sha256(sender_id.encode()).hexdigest()[:12],
+                    hashlib.sha256(drain_key.encode()).hexdigest()[:12],
                     int(drain_result.get("sent", 0)),
                     int(drain_result.get("pending", 0)),
                     bool(drain_result.get("ok")),
@@ -1304,13 +1341,12 @@ def patch_adapter(adapter: Any) -> bool:
                 return None
         elif not _self._is_dm_intake_allowed(sender_id):
             return None
-        result = drain_result or await drain_pending(_self, sender_id)
         logger.warning(
             "Hermes WeChat Enhance: /continue handled locally peer=%s sent=%d pending=%d ok=%s",
-            hashlib.sha256(sender_id.encode()).hexdigest()[:12],
-            int(result.get("sent", 0)),
-            int(result.get("pending", 0)),
-            bool(result.get("ok")),
+            hashlib.sha256(drain_key.encode()).hexdigest()[:12],
+            int(drain_result.get("sent", 0)),
+            int(drain_result.get("pending", 0)),
+            bool(drain_result.get("ok")),
         )
         return None
 
