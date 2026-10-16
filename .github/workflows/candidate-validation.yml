@@ -335,7 +335,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
-          python-version: '3.13'
+          python-version: '3.14'
       - name: Install official Hermes dependencies
         run: python -m pip install -e ./upstream-hermes
       - name: Native adapter regressions (synthetic profiles, fake physical IO)
@@ -364,7 +364,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
-          python-version: '3.13'
+          python-version: '3.14'
       - run: python -m pip install -e ./upstream-hermes
       - name: Actual installer, upgrade, uninstall and reinstall (no Gateway)
         env:
