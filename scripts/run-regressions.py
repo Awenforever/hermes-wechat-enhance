@@ -23,7 +23,7 @@ PURE = (
 )
 NATIVE = ('test-v021-native-contract.py', 'test-v021-real-adapter.py',
           'test-fix-regressions-q1q2q5.py', 'test-fix-regressions-v320.py',
-          'test-context-fill-call-boundary.py')
+          'test-context-fill-call-boundary.py','test-final-origin-producer.py')
 
 
 def main():

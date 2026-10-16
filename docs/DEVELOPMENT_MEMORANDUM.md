@@ -1,5 +1,42 @@
 # Hermes WeChat Enhance — Development Memorandum
 
+## 2026-10-16 — final result precedes agent:end when follow-ups are queued
+
+Production3.4.1 physically sent a genuine model final with a `hermes` footer.
+Read-only session/quote evidence and the21:09:52 queued-follow-up log establish
+that this is not a model change: Core calls `_run_agent_deliver_first_response`
+inside `_run_agent_inner`, before the outer wrapper or `agent:end` can record
+completion. The existing final wrapper bound only a non-null stream consumer;
+the no-consumer branch was missed. Earlier passing tests did not exercise this
+ordering through real Core delivery. Hook presence/errors=[] was insufficient.
+
+3.4.2 records at the actual TurnRunner result-production boundary, whether a
+consumer exists or not. The real executing agent supplies the fallback-aware
+model. Account/peer/full-body SHA256 receipts are immutable across changes to
+the next turn's mutable chat registry. They contain no response body or token,
+expire after300 seconds and are bounded at256 entries. Core's own attachment
+stripper and media-path repair supply actual delivery shapes; no text-pattern
+classifier decides whether prose "looks like a model". System metadata takes
+precedence. Conflicting model receipts or declared-model messages with missing
+provenance return `unknown-model` and a diagnostic, never last-model guessing.
+
+The old unmarked-control fallback remains a compatibility convention, not proof
+that every future unmarked send is system-owned. There is no universal guarantee
+for arbitrary future Core/plugin send paths without a typed producer contract.
+Do not claim otherwise. New producer boundary readiness is measured separately
+in runtime capabilities; inability to install it is an explicit startup error.
+
+Regression `test-final-origin-producer.py` uses actual TurnRunner, GatewayRunner
+queued branch, notification delivery/ledger and WeixinAdapter; only physical
+transport is fake. It runs without agent:end/completed-wrapper metadata and
+replaces chat state before delivery. The same test on unmodified3.4.1 fails at
+the first real bubble with `hermes`; fixed code passes. Cases cover fallback,
+multi-bubble finals, attachment-marker extraction, controls, separate accounts,
+full-body vs prefix collisions, missing/ambiguous model evidence and failed/
+interrupted/incomplete results. It is required in native CI and install verify.
+This closes the observed contract gap, not a claim of real endpoint acceptance
+or immunity to upstream changes. Do not force or fabricate production messages.
+
 ## 2026-10-16 — mixed-ownership hook lifecycle failure
 
 The approved NAS update was rolled back before activation after the old

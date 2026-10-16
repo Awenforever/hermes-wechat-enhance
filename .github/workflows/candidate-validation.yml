@@ -56,6 +56,7 @@ jobs:
               "scripts/test-transport-receipt-publisher.py",
               "scripts/test-transport-withdrawal.py",
               "scripts/test-context-fill-call-boundary.py",
+              "scripts/test-final-origin-producer.py",
               "scripts/test-restart-drain.py",
               "scripts/uninstall.sh",
               "scripts/update.sh",

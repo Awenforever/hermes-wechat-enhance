@@ -65,6 +65,12 @@ if args.workspace is not None:
     # Seed the actual old queue implementation in a separate interpreter.
     code = "from pathlib import Path; from hermes_wechat_enhance.v021_bubble_footer import PendingBubbleStore; import os; q=PendingBubbleStore(Path(os.environ['HERMES_HOME'])/'plugin-data/hermes-wechat-enhance/send-queue.sqlite3'); q.enqueue('synthetic-account','synthetic-peer','legacy-client','preserve legacy body','synthetic-old-model')"
     subprocess.run([sys.executable, '-B', '-c', code], env=env, check=True)
+    # Reproduce an existing user's immediately previous public installation,
+    # not only the much older baseline. State must survive both update steps.
+    installed, manifest, name = _install_plugin_core(origin, force=True,
+        ref='3377fdab46fea91dfbb4001bd4725047a83ef85b', scan_decision_cb=lambda result: True)
+    assert manifest['version'] == '3.4.1'
+    invoke_hook(installed, '_install_hook', env)
     installed, manifest, name = _install_plugin_core(origin, force=True,
         ref=args.revision, scan_decision_cb=lambda result: True)
     assert manifest['version'] == expected_version
