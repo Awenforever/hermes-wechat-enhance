@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -34,6 +35,23 @@ FOOTER_RESERVE = 160
 _ACTIVE_MODEL: contextvars.ContextVar[str] = contextvars.ContextVar(
     "hermes_wechat_v021_active_model", default="hermes"
 )
+_TRANSPORT_BINDING = contextvars.ContextVar('hermes_wechat_transport_binding', default=None)
+
+
+def _transport_binding(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    value = (metadata or {}).get('_hermes_transport_binding_v1')
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{64}', value):
+        raise ValueError('invalid opaque transport observation binding')
+    return value
+
+
+def _owned_transport_binding(adapter: Any, chat_id: str) -> Optional[str]:
+    scope = _TRANSPORT_BINDING.get()
+    if scope is not None and scope[:3] == (asyncio.current_task(), adapter, str(chat_id)):
+        return scope[3]
+    return None
 _STREAM_BOUNDARY_MODEL: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "hermes_wechat_v021_stream_boundary_model", default=None
 )
@@ -41,6 +59,168 @@ _TURN_MODELS: Dict[str, tuple[str, float, bool, str]] = {}
 _TURN_MODELS_LOCK = threading.RLock()
 TURN_MODEL_TTL_SECONDS = 6 * 3600
 MAX_TRANSIENT_DRAIN_RETRIES = 4
+MAX_DRAIN_PROBES = 3
+DRAIN_PROBE_DELAY_SECONDS = 45.0
+DRAIN_BACKOFF_CEILING_SECONDS = 120.0
+COOLDOWN_RESUME_JITTER_SECONDS = 0.05
+
+# Per-chat context-window fill captured from the turn result at the runner
+# boundary (``last_prompt_tokens`` / ``context_length``), rendered as a compact
+# horizontal progress bar in the bubble footer.  The filled part uses Block
+# Elements (U+2588 full, U+258F..U+2589 eighth partials) and the unused part is
+# plain spaces; a single Unicode range for the fill keeps monospace glyph metrics
+# uniform in WeChat inline code.  No trailing cap glyph: the thinnest ``▏``
+# stretched the inline-code gray background past the track, so it read as extra
+# fill.  The fill is persisted to ``context-fill.json`` so a gateway restart does
+# not blank the indicator until a turn re-warms it.  8 cells x 8 eighths = 64
+# levels at a constant 8-char width.  HERMES_WECHAT_FOOTER_CONTEXT_BAR=0 disables.
+_CONTEXT_FILL: Dict[str, tuple[int, int, float]] = {}
+_CONTEXT_FILL_LOCK = threading.RLock()
+_CONTEXT_FILL_LOADED = False
+CONTEXT_BAR_CELLS = 8
+CONTEXT_BAR_FULL = "█"
+CONTEXT_BAR_BLANK = " "
+CONTEXT_BAR_PARTIALS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
+
+
+def _context_fill_path() -> Path:
+    root = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    return root / "plugin-data" / "hermes-wechat-enhance" / "context-fill.json"
+
+
+def _load_context_fill() -> None:
+    """Restore the last-known per-chat fill so restarts keep the bar visible."""
+    global _CONTEXT_FILL_LOADED
+    with _CONTEXT_FILL_LOCK:
+        if _CONTEXT_FILL_LOADED:
+            return
+        _CONTEXT_FILL_LOADED = True
+        try:
+            raw = json.loads(_context_fill_path().read_text(encoding="utf-8"))
+            cutoff = time.time() - TURN_MODEL_TTL_SECONDS
+            for chat, entry in (raw or {}).items():
+                used, limit, ts = (list(entry) + [0, 0, 0.0])[:3]
+                used, limit = int(used or 0), int(limit or 0)
+                if used > 0 and limit > 0 and float(ts or 0) >= cutoff:
+                    _CONTEXT_FILL[str(chat)] = (used, limit, float(ts))
+        except Exception:
+            pass
+
+
+def _save_context_fill() -> None:
+    try:
+        path = _context_fill_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _CONTEXT_FILL_LOCK:
+            snapshot = {k: list(v) for k, v in _CONTEXT_FILL.items()}
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> None:
+    try:
+        used_i = int(used or 0)
+        limit_i = int(limit or 0)
+    except (TypeError, ValueError):
+        return
+    if used_i <= 0 or limit_i <= 0:
+        return
+    with _CONTEXT_FILL_LOCK:
+        _CONTEXT_FILL[str(chat_id)] = (used_i, limit_i, time.time())
+        _prune_context_fill()
+    _save_context_fill()
+
+
+def _prune_context_fill() -> None:
+    cutoff = time.time() - TURN_MODEL_TTL_SECONDS
+    for key in [k for k, v in _CONTEXT_FILL.items() if v[2] < cutoff]:
+        _CONTEXT_FILL.pop(key, None)
+
+
+def _refresh_context_fill_from_cached_agent(runner: Any, source: Any, session_key: Optional[str] = None) -> None:
+    """Seed the footer fill from the live cached agent BEFORE the turn runs.
+
+    ``_remember_context_fill`` only fires at turn end, so an abrupt shrink such
+    as ``/compress`` leaves the next turn's bubbles showing the pre-compress
+    value.  The cached agent's context compressor already holds the post-
+    compress reading (the same one ``/status`` renders), so sample it at turn
+    start. SessionSource does not own a session_key: the runner call does.
+    A negative usage sentinel invalidates the old snapshot: compression made
+    that reading obsolete and no new provider usage is available yet.
+    """
+    try:
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        session_key = str(session_key or getattr(source, "session_key", "") or "")
+        if not chat_id or not session_key:
+            return
+        cache = getattr(runner, "_agent_cache", None)
+        if not cache:
+            return
+        lock = getattr(runner, "_agent_cache_lock", None)
+        if lock is not None:
+            with lock:
+                entry = cache.get(session_key)
+        else:
+            entry = cache.get(session_key)
+        agent = entry[0] if isinstance(entry, tuple) and entry else entry
+        comp = getattr(agent, "context_compressor", None)
+        if comp is None:
+            return
+        used = getattr(comp, "last_prompt_tokens", 0)
+        if int(used or 0) < 0:
+            _load_context_fill()
+            with _CONTEXT_FILL_LOCK:
+                _CONTEXT_FILL.pop(chat_id, None)
+            _save_context_fill()
+            return
+        _remember_context_fill(
+            chat_id,
+            used,
+            getattr(comp, "context_length", 0),
+        )
+    except Exception:
+        return
+
+
+def context_bar(chat_id: str) -> str:
+    """Return the constant-width context-fill progress bar, or "" when unknown."""
+    env = os.environ.get(
+        "HERMES_WECHAT_FOOTER_CONTEXT_BAR",
+        os.environ.get("HERMES_WECHAT_FOOTER_CONTEXT_PIE", "1"),
+    )
+    if env.strip().lower() in {"0", "false", "no", "off"}:
+        return ""
+    _load_context_fill()
+    with _CONTEXT_FILL_LOCK:
+        entry = _CONTEXT_FILL.get(str(chat_id))
+    if not entry:
+        return ""
+    used, limit, _ts = entry
+    ratio = max(0.0, min(1.0, used / limit)) if limit else 0.0
+    total = ratio * CONTEXT_BAR_CELLS
+    full = int(total)
+    sub = round((total - full) * 8)
+    if sub >= 8:
+        full += 1
+        sub = 0
+    partial = CONTEXT_BAR_PARTIALS[sub]
+    blanks = CONTEXT_BAR_CELLS - full - (1 if partial else 0)
+    return CONTEXT_BAR_FULL * full + partial + CONTEXT_BAR_BLANK * blanks
+
+
+def _decorate_footer(chunk: str, count: int, model: str, chat_id: str) -> str:
+    """Assemble the bubble footer: count, model, and optional context bar.
+
+    Every token is wrapped in its own inline-code span, matching the existing
+    count/model presentation the user asked to preserve.
+    """
+    footer = f"`{count}` `{model}`"
+    bar = context_bar(chat_id)
+    if bar:
+        footer = f"{footer} `{bar}`"
+    return f"{chunk}\n\n---\n\n{footer}"
 
 
 def normalize_weixin_inbound_reference(
@@ -200,6 +380,13 @@ def _transient_retry_delay(adapter: Any, error: Any, attempt: int) -> Optional[f
         for marker in (
             "cooldown", "rate limit", "rate-limit", "429", "temporar",
             "timeout", "timed out", "connection reset", "connection aborted",
+            # Connectivity / DNS / TLS-connect failures self-heal once the
+            # network blip passes.  Production stranded a 5-bubble backlog for
+            # ~21 minutes because "Cannot connect to host ... ssl:default"
+            # matched none of the markers above and schedule_retry no-opped.
+            "cannot connect", "connect to host", "connector", "server disconnected",
+            "name or service", "dns", "unreachable", "connection refused",
+            "ssl", "eof occurred", "socket", "network",
         )
     )
     if not transient:
@@ -212,8 +399,32 @@ def _transient_retry_delay(adapter: Any, error: Any, attempt: int) -> Optional[f
     match = re.search(r"(?:cooldown[^0-9]*|retry(?:ing)?[^0-9]*)([0-9]+(?:\.[0-9]+)?)\s*s", folded)
     if match:
         remaining = max(remaining, float(match.group(1)))
+    if remaining > 0:
+        # An explicit cooldown IS the server-mandated backoff; resume right
+        # when it expires.  Stacking the exponential floor on top made a
+        # 0.01s cooldown wait ~2s, so a silent /continue looked dead.
+        return remaining + COOLDOWN_RESUME_JITTER_SECONDS
     backoff = min(120.0, 2.0 * (2 ** max(0, int(attempt) - 1)))
-    return max(0.05, remaining + 0.25, backoff)
+    return max(0.05, backoff)
+
+
+def _drain_delay(adapter: Any, error: Any, attempt: int) -> Optional[float]:
+    """Return the delay before the next deferred FIFO drain attempt.
+
+    Guarantees that ANY enqueued backlog gets a future drain attempt, not just
+    errors the transient classifier recognises.  Production stranded a backlog
+    for ~21 minutes when a connect failure fell outside the classifier and
+    ``schedule_retry`` no-opped, leaving the next inbound message as the only
+    drain trigger.  Unrecognised/permanent-classified errors therefore still
+    probe a bounded number of times; truly terminal failures stop after the
+    probe cap and still drain on the next fresh inbound token as before.
+    """
+    delay = _transient_retry_delay(adapter, error, attempt)
+    if delay is not None:
+        return delay
+    if int(attempt) <= MAX_DRAIN_PROBES:
+        return DRAIN_PROBE_DELAY_SECONDS
+    return None
 
 
 class BubbleCounterStore:
@@ -289,13 +500,14 @@ class PendingBubbleStore:
 
     Queueing at this boundary prevents a partially delivered multi-bubble reply
     from being replayed as one large duplicate.  Raw account and peer IDs are
-    never persisted; the queued message text is retained because it must later
-    be delivered verbatim.
+    hashed in queue rows. A separate private route table retains destination IDs
+    for autonomous restart recovery; it contains no credentials or tokens.
     """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.RLock()
+        self.receipts_available = True
         self._initialize()
 
     @contextmanager
@@ -326,8 +538,41 @@ class PendingBubbleStore:
                 );
                 CREATE INDEX IF NOT EXISTS pending_bubbles_fifo
                 ON pending_bubbles(account_key, chat_key, seq);
+                CREATE TABLE IF NOT EXISTS transport_receipts_v1 (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    occurrence_id TEXT NOT NULL UNIQUE,
+                    account_key TEXT NOT NULL,
+                    chat_key TEXT NOT NULL,
+                    binding TEXT NOT NULL,
+                    client_reference TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    observed_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS transport_receipts_binding
+                ON transport_receipts_v1(account_key,chat_key,binding,seq);
+                CREATE TABLE IF NOT EXISTS transport_receipt_meta_v1 (
+                    name TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS transport_withdrawals_v1 (
+                    account_key TEXT NOT NULL,
+                    chat_key TEXT NOT NULL,
+                    binding TEXT NOT NULL,
+                    requested_at REAL NOT NULL,
+                    PRIMARY KEY(account_key,chat_key,binding)
+                );
+                CREATE TABLE IF NOT EXISTS pending_routes_v1 (
+                    account_key TEXT NOT NULL,
+                    chat_key TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    PRIMARY KEY(account_key,chat_key)
+                );
                 """
             )
+            connection.execute('INSERT OR IGNORE INTO transport_receipt_meta_v1(name,value) VALUES(?,?)',('epoch',secrets.token_hex(32)))
+            columns = {row['name'] for row in connection.execute('PRAGMA table_info(pending_bubbles)')}
+            if 'transport_binding' not in columns:
+                connection.execute('ALTER TABLE pending_bubbles ADD COLUMN transport_binding TEXT')
         with suppress(OSError):
             os.chmod(self.path, 0o600)
 
@@ -335,7 +580,7 @@ class PendingBubbleStore:
     def _keys(account_id: str, chat_id: str) -> tuple[str, str]:
         return (_chat_key(account_id, "<account>"), _chat_key(account_id, chat_id))
 
-    def enqueue(self, account_id: str, chat_id: str, client_id: str, chunk: str, model: str, error: str = "") -> int:
+    def enqueue(self, account_id: str, chat_id: str, client_id: str, chunk: str, model: str, error: str = "", *, binding: Optional[str] = None) -> int:
         account_key, chat_key = self._keys(account_id, chat_id)
         with self._lock, self._connect() as connection:
             pending = connection.execute(
@@ -345,14 +590,140 @@ class PendingBubbleStore:
             if int(pending) >= 500:
                 raise RuntimeError("durable Weixin queue capacity reached (500)")
             connection.execute(
-                "INSERT OR IGNORE INTO pending_bubbles(account_key,chat_key,client_id,chunk,model,enqueued_at,last_error) VALUES(?,?,?,?,?,?,?)",
-                (account_key, chat_key, str(client_id), str(chunk), _safe_model(model), time.time(), str(error)[:500]),
+                "INSERT OR IGNORE INTO pending_bubbles(account_key,chat_key,client_id,chunk,model,enqueued_at,last_error,transport_binding) VALUES(?,?,?,?,?,?,?,?)",
+                (account_key, chat_key, str(client_id), str(chunk), _safe_model(model), time.time(), str(error)[:500], binding),
             )
+            connection.execute('INSERT OR REPLACE INTO pending_routes_v1 VALUES(?,?,?)',
+                               (account_key, chat_key, str(chat_id)))
+            owned = connection.execute('SELECT account_key,chat_key,transport_binding FROM pending_bubbles WHERE client_id=?', (str(client_id),)).fetchone()
+            if owned and tuple(owned) == (account_key, chat_key, binding):
+                self._record_receipt(connection, account_id, chat_id, client_id, binding, 'queued')
+            elif binding is not None:
+                self.receipts_available = False
             row = connection.execute(
                 "SELECT COUNT(*) FROM pending_bubbles WHERE account_key=? AND chat_key=?",
                 (account_key, chat_key),
             ).fetchone()
             return int(row[0])
+
+    def _record_receipt(self, connection, account_id, chat_id, client_id, binding, phase):
+        if binding is None:
+            return
+        try:
+            if not re.fullmatch(r'[0-9a-f]{64}', binding) or phase not in ('queued','acknowledged','withdrawn'):
+                raise ValueError('invalid receipt binding/phase')
+            account_key, chat_key = self._keys(account_id, chat_id)
+            reference = hashlib.sha256(json.dumps([binding,account_key,chat_key,str(client_id)], separators=(',', ':')).encode()).hexdigest()
+            occurrence = hashlib.sha256((reference + ':' + phase).encode()).hexdigest()
+            connection.execute('INSERT OR IGNORE INTO transport_receipts_v1(occurrence_id,account_key,chat_key,binding,client_reference,phase,observed_at) VALUES(?,?,?,?,?,?,?)',
+                (occurrence,account_key,chat_key,binding,reference,phase,time.time()))
+            # This is bounded telemetry, not a complete eternal delivery inventory.
+            connection.execute('DELETE FROM transport_receipts_v1 WHERE observed_at < ?', (time.time() - 7 * 86400,))
+            connection.execute('DELETE FROM transport_receipts_v1 WHERE seq NOT IN (SELECT seq FROM transport_receipts_v1 ORDER BY seq DESC LIMIT 10000)')
+        except Exception:
+            # A metadata failure must never retry or replace physical delivery.
+            self.receipts_available = False
+
+    def recover_routes(self, account_id, trusted_candidates=()):
+        """Recover exact owned routes only; never infer a peer from text/hash.
+
+        Legacy DM candidates come from Core's restored token keys, not tokens.
+        Missing legacy group destinations remain visible as unresolved counts.
+        """
+        account_key = self._keys(account_id, '')[0]
+        with self._lock, self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            for chat_id in trusted_candidates:
+                keys = self._keys(account_id, chat_id)
+                exists = connection.execute('SELECT 1 FROM pending_bubbles WHERE account_key=? AND chat_key=? LIMIT 1', keys).fetchone()
+                if exists:
+                    connection.execute('INSERT OR IGNORE INTO pending_routes_v1 VALUES(?,?,?)', (*keys, str(chat_id)))
+            # Route retention follows pending ownership, not an eternal roster.
+            connection.execute('DELETE FROM pending_routes_v1 WHERE NOT EXISTS (SELECT 1 FROM pending_bubbles p WHERE p.account_key=pending_routes_v1.account_key AND p.chat_key=pending_routes_v1.chat_key)')
+            rows = connection.execute('SELECT DISTINCT p.chat_key, r.chat_id FROM pending_bubbles p LEFT JOIN pending_routes_v1 r ON p.account_key=r.account_key AND p.chat_key=r.chat_key WHERE p.account_key=?', (account_key,)).fetchall()
+            routes, unresolved = [], 0
+            for row in rows:
+                chat = row['chat_id']
+                if isinstance(chat, str) and chat and self._keys(account_id, chat)[1] == row['chat_key']:
+                    routes.append(chat)
+                else:
+                    unresolved += 1
+            return routes, unresolved
+
+    def request_withdrawal(self, account_id, chat_id, binding):
+        """Trusted host request, not a grant. Preserve the deny across restart."""
+        if not isinstance(binding,str) or not re.fullmatch(r'[0-9a-f]{64}',binding):
+            raise ValueError('invalid withdrawal binding')
+        keys = self._keys(account_id,chat_id)
+        with self._lock,self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            exists = connection.execute('SELECT 1 FROM transport_withdrawals_v1 WHERE account_key=? AND chat_key=? AND binding=?',(*keys,binding)).fetchone()
+            if exists is None:
+                if connection.execute('SELECT COUNT(*) FROM transport_withdrawals_v1').fetchone()[0] >= 10000:
+                    raise RuntimeError('withdrawal retention capacity reached; explicit reconciliation required')
+                connection.execute('INSERT INTO transport_withdrawals_v1 VALUES(?,?,?,?)',(*keys,binding,time.time()))
+
+    def withdrawal_requested(self, account_id, chat_id, binding):
+        if binding is None:
+            return False
+        with self._lock,self._connect() as connection:
+            return connection.execute('SELECT 1 FROM transport_withdrawals_v1 WHERE account_key=? AND chat_key=? AND binding=?',(*self._keys(account_id,chat_id),binding)).fetchone() is not None
+
+    def record_suppressed(self, account_id, chat_id, client_id, binding):
+        with self._lock, self._connect() as connection:
+            self._record_receipt(connection, account_id, chat_id, client_id, binding, 'withdrawn')
+
+    def withdraw_pending(self, account_id, chat_id, binding):
+        keys = self._keys(account_id,chat_id)
+        with self._lock,self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            if not connection.execute('SELECT 1 FROM transport_withdrawals_v1 WHERE account_key=? AND chat_key=? AND binding=?',(*keys,binding)).fetchone():
+                raise RuntimeError('durable withdrawal request required')
+            rows = connection.execute('SELECT seq,client_id FROM pending_bubbles WHERE account_key=? AND chat_key=? AND transport_binding=? ORDER BY seq',(*keys,binding)).fetchall()
+            for row in rows:
+                self._record_receipt(connection,account_id,chat_id,row['client_id'],binding,'withdrawn')
+                connection.execute('DELETE FROM pending_bubbles WHERE seq=?',(row['seq'],))
+            return len(rows)
+
+    def record_acknowledgement(self, account_id, chat_id, client_id, binding, *, queued_seq=None):
+        if binding is None and queued_seq is None:
+            return
+        try:
+            with self._lock, self._connect() as connection:
+                self._record_receipt(connection, account_id, chat_id, client_id, binding, 'acknowledged')
+                if queued_seq is not None:
+                    connection.execute('DELETE FROM pending_bubbles WHERE seq=?', (int(queued_seq),))
+        except Exception:
+            self.receipts_available = False
+            if queued_seq is not None:
+                # Preserve the pre-existing drain's queue-removal behavior.
+                self.remove(queued_seq)
+
+    @property
+    def publisher_epoch(self):
+        with self._lock, self._connect() as connection:
+            row = connection.execute('SELECT value FROM transport_receipt_meta_v1 WHERE name=?',('epoch',)).fetchone()
+        if row is None or not re.fullmatch(r'[0-9a-f]{64}',row['value']):
+            raise RuntimeError('transport ledger epoch unavailable')
+        return row['value']
+
+    def read_receipts(self, account_id, chat_id, binding, *, after_sequence=0, limit=128):
+        if not isinstance(binding, str) or not re.fullmatch(r'[0-9a-f]{64}', binding):
+            raise ValueError('invalid receipt binding')
+        if type(after_sequence) is not int or after_sequence < 0 or type(limit) is not int or not 1 <= limit <= 1024:
+            raise ValueError('invalid receipt page')
+        account_key, chat_key = self._keys(account_id, chat_id)
+        with self._lock, self._connect() as connection:
+            connection.execute('BEGIN')
+            epoch = connection.execute('SELECT value FROM transport_receipt_meta_v1 WHERE name=?',('epoch',)).fetchone()
+            high_water = connection.execute('SELECT seq FROM sqlite_sequence WHERE name=?',('transport_receipts_v1',)).fetchone()
+            rows = connection.execute('SELECT seq,occurrence_id,client_reference,phase,observed_at FROM transport_receipts_v1 WHERE account_key=? AND chat_key=? AND binding=? AND seq>? ORDER BY seq LIMIT ?',
+                (account_key,chat_key,binding,after_sequence,limit)).fetchall()
+        return {'version':1, 'records':[dict(row) for row in rows],
+                'publisher_epoch':epoch['value'] if epoch else None,
+                'high_water_sequence':int(high_water['seq']) if high_water else 0,
+                'available':self.receipts_available, 'complete_inventory_proven':False,
+                'external_delivery_proven':False, 'canonical_quote_mapping_proven':False}
 
     def peek(self, account_id: str, chat_id: str) -> Optional[Dict[str, Any]]:
         account_key, chat_key = self._keys(account_id, chat_id)
@@ -551,6 +922,27 @@ def _response_signature(value: Any) -> str:
     return str(value or "").strip()[:500]
 
 
+def _delivery_shaped_response(platform_obj: Any, response: Any) -> Any:
+    """Return ``response`` as the platform will physically deliver it.
+
+    Weixin does not surface raw agent text: core rewrites secrets and provider
+    errors before send (``_gateway_surface_passes_raw_text`` is False), so the
+    provenance signature recorded at the runner boundary must be the sanitized
+    body that actually reaches the footer.  Recording the raw text instead made
+    the prefix match fail whenever redaction altered the first 500 chars, and the
+    genuine model final fell back to ``hermes``.  Falls back to the raw value if
+    the core sanitizer is unavailable so provenance still binds on prefix match.
+    """
+    try:
+        from gateway.run import _sanitize_gateway_final_response
+    except (ImportError, AttributeError):
+        return response
+    try:
+        return _sanitize_gateway_final_response(platform_obj, response)
+    except Exception:
+        return response
+
+
 def _remember_model(
     chat_id: str,
     model: Any,
@@ -600,13 +992,6 @@ def _peek_turn_model(chat_id: str) -> Optional[tuple[str, bool, str]]:
             _TURN_MODELS.pop(str(chat_id), None)
             return None
         return model, completed, response
-
-
-def _consume_completed_model(chat_id: str, model: str) -> None:
-    with _TURN_MODELS_LOCK:
-        entry = _TURN_MODELS.get(str(chat_id))
-        if entry and entry[0] == model and entry[2]:
-            _TURN_MODELS.pop(str(chat_id), None)
 
 
 def _is_system(metadata: Dict[str, Any]) -> bool:
@@ -838,7 +1223,12 @@ def patch_gateway_runner(runner: Any) -> bool:
     if callable(original_run):
         @functools.wraps(original_run)
         async def wrapped_run(*args: Any, **kwargs: Any):
-            result = await original_run(*args, **kwargs)
+            # original_run is already bound to runner. args[0] is the message,
+            # never self. Bind its actual signature for keyword/positional calls.
+            try:
+                call = inspect.signature(original_run).bind_partial(*args, **kwargs).arguments
+            except (TypeError, ValueError):
+                call = kwargs
             source = kwargs.get("source")
             if source is None:
                 source = next(
@@ -847,6 +1237,9 @@ def patch_gateway_runner(runner: Any) -> bool:
                 )
             platform_obj = getattr(source, "platform", "")
             platform = str(getattr(platform_obj, "value", platform_obj) or "").lower()
+            if platform == "weixin":
+                _refresh_context_fill_from_cached_agent(runner, source, call.get("session_key"))
+            result = await original_run(*args, **kwargs)
             if platform == "weixin" and isinstance(result, dict):
                 chat_id = str(getattr(source, "chat_id", "") or "")
                 pending = _peek_turn_model(chat_id)
@@ -858,7 +1251,15 @@ def patch_gateway_runner(runner: Any) -> bool:
                     or (pending[0] if pending else None)
                 )
                 response = result.get("final_response") or result.get("response") or ""
+                response = _delivery_shaped_response(platform_obj, response)
                 _remember_model(chat_id, model, completed=True, response=response)
+                # The turn result carries the API-reported context fill and the
+                # resolved context-window limit; capture both for the footer bar.
+                _remember_context_fill(
+                    chat_id,
+                    result.get("last_prompt_tokens"),
+                    result.get("context_length"),
+                )
             return result
 
         runner._run_agent_inner = wrapped_run
@@ -1033,44 +1434,78 @@ def patch_adapter(adapter: Any) -> bool:
     quote_capture = _install_outbound_quote_capture(adapter, quote_store)
     locks: Dict[str, asyncio.Lock] = {}
     retry_tasks: Dict[str, asyncio.Task[Any]] = {}
+    retry_deadlines: Dict[str, float] = {}
 
     def schedule_retry(_self: Any, chat_id: str, error: Any) -> bool:
         key = str(chat_id)
-        current = retry_tasks.get(key)
-        if current is not None and not current.done():
-            return True
-        first_delay = _transient_retry_delay(_self, error, 1)
+        first_delay = _drain_delay(_self, error, 1)
         if first_delay is None:
             return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+        wanted = loop.time() + first_delay
+        current = retry_tasks.get(key)
+        if current is not None and not current.done():
+            # Keep the in-flight worker unless this error promises a strictly
+            # sooner wake.  A non-transient failure schedules a long drain probe;
+            # a later explicit cooldown must be able to preempt it, or a silent
+            # /continue stays stranded behind that probe for its full delay.  A
+            # worker that is actively draining has a deadline already in the
+            # past, so preemption never cancels a drain in progress.
+            existing = retry_deadlines.get(key)
+            if existing is None or wanted >= existing - 1e-3:
+                return True
+            current.cancel()
 
         async def retry_worker() -> None:
             delay = first_delay
+            attempt = 0
             try:
-                for attempt in range(1, MAX_TRANSIENT_DRAIN_RETRIES + 1):
+                # The queue owns one invariant: while it is non-empty it keeps
+                # trying to drain itself, with no dependence on any inbound
+                # message.  A failed bubble stays in place (record_failure only
+                # bumps ``attempts``; ``client_id`` is UNIQUE and enqueue is
+                # INSERT OR IGNORE, so a retry can never duplicate a row) and a
+                # successful send is the only thing that dequeues it — so an
+                # unbounded loop cannot accumulate duplicates.  Backoff is capped
+                # at DRAIN_BACKOFF_CEILING_SECONDS so a rate-limited or down
+                # endpoint is probed at a bounded cadence; an explicit cooldown
+                # resumes fast instead of waiting for the ceiling.
+                while True:
+                    attempt += 1
+                    retry_deadlines[key] = loop.time() + delay
                     await asyncio.sleep(delay)
                     account_id = str(getattr(_self, "_account_id", ""))
-                    if not queue.count(account_id, key):
+                    if not await asyncio.to_thread(queue.count, account_id, key):
                         return
                     result = await drain_pending(_self, key)
                     if bool(result.get("ok")) or not int(result.get("pending", 0)):
                         logger.warning(
-                            "Hermes WeChat Enhance: deferred FIFO retry recovered peer=%s sent=%d pending=%d",
+                            "Hermes WeChat Enhance: deferred FIFO retry recovered peer=%s sent=%d pending=%d attempts=%d",
                             hashlib.sha256(key.encode()).hexdigest()[:12],
                             int(result.get("sent", 0)),
                             int(result.get("pending", 0)),
+                            attempt,
                         )
                         return
-                    next_delay = _transient_retry_delay(
-                        _self, result.get("error"), attempt + 1
-                    )
-                    if next_delay is None:
-                        return
-                    delay = next_delay
-                logger.warning(
-                    "Hermes WeChat Enhance: deferred FIFO retries exhausted peer=%s pending=%d; awaiting fresh inbound token",
-                    hashlib.sha256(key.encode()).hexdigest()[:12],
-                    queue.count(str(getattr(_self, "_account_id", "")), key),
-                )
+                    # Transient/cooldown errors carry their own bounded delay;
+                    # anything the classifier treats as permanent falls back to
+                    # the probe interval so nothing is ever stranded waiting for
+                    # the next inbound token.
+                    delay = _transient_retry_delay(_self, result.get("error"), attempt + 1)
+                    if delay is None:
+                        delay = DRAIN_PROBE_DELAY_SECONDS
+                    delay = min(delay, DRAIN_BACKOFF_CEILING_SECONDS)
+                    if attempt == MAX_TRANSIENT_DRAIN_RETRIES:
+                        logger.warning(
+                            "Hermes WeChat Enhance: deferred FIFO still pending after %d attempts peer=%s pending=%d; continuing with capped backoff (ceiling=%.0fs)",
+                            attempt,
+                            hashlib.sha256(key.encode()).hexdigest()[:12],
+                            int(result.get("pending", 0)),
+                            DRAIN_BACKOFF_CEILING_SECONDS,
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1078,7 +1513,9 @@ def patch_adapter(adapter: Any) -> bool:
             finally:
                 if retry_tasks.get(key) is asyncio.current_task():
                     retry_tasks.pop(key, None)
+                    retry_deadlines.pop(key, None)
 
+        retry_deadlines[key] = wanted
         retry_tasks[key] = asyncio.create_task(
             retry_worker(), name=f"hermes-wechat-fifo-retry-{hashlib.sha256(key.encode()).hexdigest()[:8]}"
         )
@@ -1116,19 +1553,29 @@ def patch_adapter(adapter: Any) -> bool:
         lock = locks.setdefault(str(chat_id), asyncio.Lock())
         async with lock:
             account_id = str(getattr(_self, "_account_id", ""))
+            binding = _owned_transport_binding(_self,chat_id)
+            if await asyncio.to_thread(queue.withdrawal_requested, account_id, str(chat_id), binding):
+                await asyncio.to_thread(queue.record_suppressed, account_id, str(chat_id), client_id, binding)
+                return
             model = _safe_model(_ACTIVE_MODEL.get())
-            if queue.count(account_id, str(chat_id)):
-                pending = queue.enqueue(account_id, str(chat_id), client_id, chunk, model)
+            # The sqlite queue and counter stores do blocking disk I/O; keep it
+            # off the gateway event loop so a slow disk or lock contention can
+            # never stall unrelated sessions.
+            if await asyncio.to_thread(queue.count, account_id, str(chat_id)):
+                pending = await asyncio.to_thread(
+                    queue.enqueue, account_id, str(chat_id), client_id, chunk, model,
+                    binding=_owned_transport_binding(_self, chat_id)
+                )
                 logger.warning(
                     "Hermes WeChat Enhance: queued bubble behind existing FIFO backlog peer=%s pending=%d",
                     hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
                     pending,
                 )
                 return
-            count, generation = store.preview(
-                account_id, str(chat_id), context_token
+            count, generation = await asyncio.to_thread(
+                store.preview, account_id, str(chat_id), context_token
             )
-            decorated = f"{chunk}\n\n---\n\n`{count}` `{model}`"
+            decorated = _decorate_footer(chunk, count, model, str(chat_id))
             try:
                 await original_send_text_chunk(
                     chat_id=chat_id,
@@ -1137,19 +1584,28 @@ def patch_adapter(adapter: Any) -> bool:
                     client_id=client_id,
                 )
             except Exception as exc:
-                pending = queue.enqueue(account_id, str(chat_id), client_id, chunk, model, str(exc))
+                pending = await asyncio.to_thread(
+                    queue.enqueue, account_id, str(chat_id), client_id, chunk, model, str(exc),
+                    binding=_owned_transport_binding(_self, chat_id)
+                )
                 logger.warning(
                     "Hermes WeChat Enhance: physical bubble queued after delivery failure peer=%s pending=%d error=%s",
                     hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
                     pending,
                     exc,
                 )
+                # A transient transport failure must not strand the backlog until
+                # the next inbound happens to arrive.  schedule_retry is a no-op
+                # for permanent/budget failures (_transient_retry_delay returns
+                # None), so only self-healing errors spawn a deferred drain.
+                schedule_retry(_self, str(chat_id), exc)
                 return
-            committed = store.commit(
-                account_id,
-                str(chat_id),
-                generation,
-                count,
+            await asyncio.to_thread(
+                queue.record_acknowledgement, account_id, str(chat_id), client_id,
+                _owned_transport_binding(_self, chat_id)
+            )
+            committed = await asyncio.to_thread(
+                store.commit, account_id, str(chat_id), generation, count
             )
             if not committed:
                 logger.warning(
@@ -1163,8 +1619,10 @@ def patch_adapter(adapter: Any) -> bool:
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
+        binding = _transport_binding(metadata)
         model, completed = _resolve_model(str(chat_id), content, metadata)
         token = _ACTIVE_MODEL.set(model)
+        binding_token = _TRANSPORT_BINDING.set((asyncio.current_task(), _self, str(chat_id), binding))
         try:
             result = await original_send(
                 chat_id=chat_id,
@@ -1173,9 +1631,15 @@ def patch_adapter(adapter: Any) -> bool:
                 metadata=metadata,
             )
         finally:
+            _TRANSPORT_BINDING.reset(binding_token)
             _ACTIVE_MODEL.reset(token)
-        if completed and getattr(result, "success", False):
-            _consume_completed_model(str(chat_id), model)
+        # The completed turn model is intentionally NOT consumed here.  A long
+        # final answer is delivered as several physical bubbles; popping the
+        # registry after the first left every later bubble of the same turn
+        # (and any interim rail-B commentary) falling back to ``hermes``.  The
+        # entry is prefix-matched against outgoing content, so control traffic
+        # still cannot borrow it, and the next turn's runtime resolve overwrites
+        # it while TURN_MODEL_TTL_SECONDS bounds staleness.
         return result
 
     async def send_file(
@@ -1208,14 +1672,18 @@ def patch_adapter(adapter: Any) -> bool:
         async with lock:
             account_id = str(getattr(_self, "_account_id", ""))
             context_token = _self._token_store.get(account_id, str(chat_id))
-            count, generation = store.preview(account_id, str(chat_id), context_token)
+            count, generation = await asyncio.to_thread(
+                store.preview, account_id, str(chat_id), context_token
+            )
             message_id = await original_send_file(
                 chat_id,
                 path,
                 "",
                 force_file_attachment=force_file_attachment,
             )
-            if not store.commit(account_id, str(chat_id), generation, count):
+            if not await asyncio.to_thread(
+                store.commit, account_id, str(chat_id), generation, count
+            ):
                 logger.warning(
                     "Hermes WeChat Enhance: context changed during acknowledged media send; counter not committed"
                 )
@@ -1227,12 +1695,17 @@ def patch_adapter(adapter: Any) -> bool:
         sent = 0
         async with lock:
             while True:
-                item = queue.peek(account_id, str(chat_id))
+                item = await asyncio.to_thread(queue.peek, account_id, str(chat_id))
                 if not item:
                     break
+                if await asyncio.to_thread(queue.withdrawal_requested, account_id, str(chat_id), item.get('transport_binding')):
+                    await asyncio.to_thread(queue.withdraw_pending, account_id, str(chat_id), item['transport_binding'])
+                    continue
                 context_token = _self._token_store.get(account_id, str(chat_id))
-                count, generation = store.preview(account_id, str(chat_id), context_token)
-                decorated = f"{item['chunk']}\n\n---\n\n`{count}` `{_safe_model(item['model'])}`"
+                count, generation = await asyncio.to_thread(
+                    store.preview, account_id, str(chat_id), context_token
+                )
+                decorated = _decorate_footer(item["chunk"], count, _safe_model(item["model"]), str(chat_id))
                 try:
                     await original_send_text_chunk(
                         chat_id=str(chat_id),
@@ -1241,20 +1714,55 @@ def patch_adapter(adapter: Any) -> bool:
                         client_id=str(item["client_id"]),
                     )
                 except Exception as exc:
-                    queue.record_failure(int(item["seq"]), str(exc))
+                    await asyncio.to_thread(
+                        queue.record_failure, int(item["seq"]), str(exc)
+                    )
                     scheduled = schedule_retry(_self, str(chat_id), exc)
                     return {
                         "ok": False,
                         "sent": sent,
-                        "pending": queue.count(account_id, str(chat_id)),
+                        "pending": await asyncio.to_thread(queue.count, account_id, str(chat_id)),
                         "error": str(exc),
                         "retry_scheduled": scheduled,
                     }
-                if not store.commit(account_id, str(chat_id), generation, count):
+                if not await asyncio.to_thread(
+                    store.commit, account_id, str(chat_id), generation, count
+                ):
                     logger.warning("Hermes WeChat Enhance: context changed during FIFO drain; counter not committed")
-                queue.remove(int(item["seq"]))
+                await asyncio.to_thread(
+                    queue.record_acknowledgement, account_id, str(chat_id),
+                    str(item['client_id']), item.get('transport_binding'),
+                    queued_seq=int(item['seq'])
+                )
                 sent += 1
         return {"ok": True, "sent": sent, "pending": 0}
+
+    async def recover_pending(_self: Any):
+        account_id = str(getattr(_self, '_account_id', ''))
+        prefix = account_id + ':'
+        cache = getattr(_self._token_store, '_cache', {})
+        candidates = tuple(key[len(prefix):] for key in cache
+                           if isinstance(key, str) and key.startswith(prefix)) if isinstance(cache, dict) else ()
+        routes, unresolved = await asyncio.to_thread(queue.recover_routes, account_id, candidates)
+        for chat in routes:
+            schedule_retry(_self, chat, 'startup recovery')
+        if unresolved:
+            logger.error('Hermes WeChat Enhance: %d legacy pending route(s) unresolved; preserving rows, explicit route reconciliation required', unresolved)
+        return {'scheduled_routes': len(routes), 'unresolved_routes': unresolved}
+
+    async def withdraw_binding(_self: Any, chat_id: str, binding: str):
+        """Host-controlled withdrawal; caller must authorize it independently.
+
+        Persist before waiting for physical IO so later drain iterations observe
+        the deny. An already in-flight physical send is never cancelled/recalled.
+        """
+        account_id = str(getattr(_self,'_account_id',''))
+        await asyncio.to_thread(queue.request_withdrawal, account_id, str(chat_id), binding)
+        lock = locks.setdefault(str(chat_id),asyncio.Lock())
+        async with lock:
+            removed = await asyncio.to_thread(queue.withdraw_pending, account_id, str(chat_id), binding)
+        return {'removed_count':removed,'observation_available':queue.receipts_available,
+                'already_sent_possible':True,'external_recall_proven':False}
 
     async def process_message(_self: Any, message: Dict[str, Any]) -> Any:
         try:
@@ -1265,31 +1773,43 @@ def patch_adapter(adapter: Any) -> bool:
         if not sender_id or sender_id == str(getattr(_self, "_account_id", "")):
             return await original_process_message(message)
 
+        # Resolve the physical send destination first.  The FIFO backlog is
+        # enqueued under the destination chat id that core's send passes to
+        # _send_text_chunk (effective_chat_id), so the drain must use that same
+        # key.  For a DM effective_chat_id == sender_id (no behaviour change);
+        # for a group it is the room id, which is why draining by sender_id
+        # previously stranded group backlogs until an explicit /continue.
+        chat_type, effective_chat_id = _guess_chat_type(message, getattr(_self, "_account_id", ""))
+        drain_key = str(effective_chat_id or sender_id)
+
         # A fresh context_token accompanies every inbound Weixin message.  Persist
-        # it before content/message dedup so even an upstream retry renews the
-        # reply window, then resume any durable FIFO backlog with that token.
+        # it under the sender (exactly as core does) before content/message dedup
+        # so even an upstream retry renews the reply window.
         context_token = str(message.get("context_token") or "").strip()
-        drain_result: Optional[Dict[str, Any]] = None
         if context_token:
             await _set_context_token(_self._token_store, _self._account_id, sender_id, context_token)
-            drain_result = await drain_pending(_self, sender_id)
-            refresh_runtime_status({"adapters": {"weixin": _self}})
 
-        chat_type, effective_chat_id = _guess_chat_type(message, getattr(_self, "_account_id", ""))
+        # Resume the durable FIFO backlog on EVERY inbound, not only when a token
+        # arrives.  drain_pending reuses the last stored token and fails closed
+        # (re-queues + bounded backoff) when none is valid, so a tokenless inbound
+        # can still recover a backlog that an earlier transient failure stranded.
+        drain_result = await drain_pending(_self, drain_key)
+        refresh_runtime_status({"adapters": {"weixin": _self}})
+
         normalized = normalize_weixin_inbound_reference(
             message,
             quote_store=quote_store,
             account_id=str(getattr(_self, "_account_id", "")),
-            chat_id=str(effective_chat_id or sender_id),
+            chat_id=drain_key,
         )
         text = str(_extract_text(message.get("item_list") or []) or "")
         if await _emit_inbound_action(_self, message, normalized):
             return None
         if text.strip() != "/continue":
-            if drain_result and int(drain_result.get("sent", 0)):
+            if int(drain_result.get("sent", 0)):
                 logger.warning(
                     "Hermes WeChat Enhance: inbound token resumed FIFO peer=%s sent=%d pending=%d ok=%s",
-                    hashlib.sha256(sender_id.encode()).hexdigest()[:12],
+                    hashlib.sha256(drain_key.encode()).hexdigest()[:12],
                     int(drain_result.get("sent", 0)),
                     int(drain_result.get("pending", 0)),
                     bool(drain_result.get("ok")),
@@ -1304,13 +1824,12 @@ def patch_adapter(adapter: Any) -> bool:
                 return None
         elif not _self._is_dm_intake_allowed(sender_id):
             return None
-        result = drain_result or await drain_pending(_self, sender_id)
         logger.warning(
             "Hermes WeChat Enhance: /continue handled locally peer=%s sent=%d pending=%d ok=%s",
-            hashlib.sha256(sender_id.encode()).hexdigest()[:12],
-            int(result.get("sent", 0)),
-            int(result.get("pending", 0)),
-            bool(result.get("ok")),
+            hashlib.sha256(drain_key.encode()).hexdigest()[:12],
+            int(drain_result.get("sent", 0)),
+            int(drain_result.get("pending", 0)),
+            bool(drain_result.get("ok")),
         )
         return None
 
@@ -1321,8 +1840,11 @@ def patch_adapter(adapter: Any) -> bool:
         adapter._send_file = MethodType(send_file, adapter)
     adapter.send = MethodType(send, adapter)
     adapter._drain_pending = MethodType(drain_pending, adapter)
+    adapter._hermes_wechat_recover_pending = MethodType(recover_pending, adapter)
     adapter._process_message = MethodType(process_message, adapter)
     adapter._hermes_wechat_v021_pending_queue = queue
+    adapter._hermes_transport_receipts_v1 = queue
+    adapter._hermes_transport_withdraw_binding_v1 = MethodType(withdraw_binding,adapter)
     adapter._hermes_wechat_v021_quote_store = quote_store
     adapter._hermes_wechat_v021_quote_capture = quote_capture
     adapter._hermes_wechat_v021_retry_tasks = retry_tasks
@@ -1378,6 +1900,9 @@ async def install_v021_bubble_footer_hook(
                 installed += 1
             else:
                 already += 1
+            recovery = await adapter._hermes_wechat_recover_pending()
+            if recovery['unresolved_routes']:
+                errors.append('legacy pending routes require explicit reconciliation')
             # The exemption is part of the live v0.21 startup contract, not a
             # standalone test utility.  Install it after the footer wrapper so
             # its task-local content-key scope reaches the official core

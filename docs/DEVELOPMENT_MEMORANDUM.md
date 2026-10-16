@@ -1,5 +1,63 @@
 # Hermes WeChat Enhance — Development Memorandum
 
+## 2026-10-16 — Qoder integration candidate (not production acceptance)
+
+The release integration branch descends from Qoder's v3.3.4 `f736dda`,
+then explicitly replays the three frozen transport-observation commits. The
+original Qoder and frozen branches remain intact. Keep the Qoder retry loop,
+deadline preemption, model provenance/control separation and off-loop SQLite
+operations. Queue acknowledgement and optional receipt are recorded together;
+receipt failure must not resend an already acknowledged physical bubble.
+
+Review found a v3.3.4 test/host mismatch: `_run_agent_inner` is a bound method,
+so its first argument is message, not runner; real SessionSource has no
+session_key, which is a separate runner argument. The old synthetic helper
+tests supplied both missing pieces and could not prove the live call boundary.
+Use the captured runner plus actual signature binding, and exercise both
+positional/keyword calls with Core's actual SessionSource. Compression sets
+last_prompt_tokens to -1: invalidate obsolete persisted fill, do not display
+the pre-compression ratio or invent a fresh provider measurement. The bar is
+absent until valid usage returns. This is not a claim of live client proof.
+
+Old transport tests incorrectly expected no retry task after manual drain;
+v3.3.3 intentionally leaves a sleeping autonomous probe until its deadline.
+Tests now explicitly own/cancel/await those sleeping tasks at teardown, after
+asserting zero pending and no duplicate physical send. Do not weaken runtime
+drain-until-empty to satisfy the old test.
+
+CI must verify current tracked layout, modes, all Python syntax and secrets,
+not a fixed historical Python file count or missing v2c scripts. Pure contracts
+run on 3.11/3.12/3.13; a separate pinned official-Core job runs native adapter
+contracts. Local Linux proof uses a retained Core, not a fresh public install.
+Windows pure contracts are not native Windows Gateway acceptance.
+
+Release remains pending fresh public-source lifecycle/upgrade evidence and
+remote CI. Natural cooldown/no-inbound recovery and post-compress client
+behavior still need real evidence; no artificial production messages, expired
+tokens, or forced cooldown were generated. Also explicitly review restart-time
+recovery of persisted routes: an empty in-memory retry task map after process
+restart is not proof that pre-existing durable pending rows self-drain.
+
+The candidate now adds private destination routing metadata atomically with
+enqueue, and schedules recovered routes at hook installation. New group/DM
+queues recover without inbound. Legacy hash-only queues migrate only when an
+exact trusted Core restored-token peer reproduces the stored route hash; unknown
+legacy destinations are retained and reported, never guessed or discarded.
+Routing IDs (not tokens) are stored in the private 0600 queue database; this is
+a privacy/storage change from legacy hash-only rows. Back up the whole database
+consistently, including new tables. The additive schema keeps legacy fields;
+code rollback does not imply safe data rollback over newer traffic.
+
+The no-inbound restart test uses an actual durable store/worker with fake
+physical IO. Its first Windows attempt exposed the test's own SQLite context
+manager not closing the connection; use contextlib.closing, not cleanup retries
+or ignoring Windows errors. Failed attempts remain failures.
+
+The transport observer/withdrawal API does not grant consent, authenticate
+callers, prove external delivery/read/quality, or activate Alive. A withdrawn
+pending item is local suppression, not remote recall. The unshipped Alive
+kernel remains separate; integration must not be represented as its deployment.
+
 Internal engineering memorandum. Keep incident history, attribution rules,
 compatibility traps, and regression obligations here rather than turning the
 public README into a development log.

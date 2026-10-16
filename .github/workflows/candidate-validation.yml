@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-      - wechat-enhance-v2c-sync-v4-docs-20260712-020736
+      - release/integrate-qoder-20261016
   pull_request:
     branches:
       - main
@@ -41,17 +41,22 @@ jobs:
               "README.md",
               "README_CN.md",
               "SKILL.md",
-              "CUSTOMIZATIONS.md",
-              "CANDIDATE_BASE.txt",
               "docs/PERSISTENCE_CONTRACT.md",
-              "docs/MAINTAINER_REFERENCE.md",
+              "docs/DEVELOPMENT_MEMORANDUM.md",
               "scripts/check-consistency.sh",
               "scripts/install.sh",
               "scripts/manage-install-state.py",
-              "scripts/test-context-token-kernel-contract.py",
-              "scripts/test-install-state-git-preservation.py",
               "scripts/test-install-state-source-path.py",
-              "scripts/test-reliable-delivery-contract.py",
+              "scripts/run-regressions.py",
+              "scripts/test-v021-bubble-footer.py",
+              "scripts/test-v021-native-contract.py",
+              "scripts/test-v021-real-adapter.py",
+              "scripts/test-fix-regressions-q1q2q5.py",
+              "scripts/test-fix-regressions-v320.py",
+              "scripts/test-transport-receipt-publisher.py",
+              "scripts/test-transport-withdrawal.py",
+              "scripts/test-context-fill-call-boundary.py",
+              "scripts/test-restart-drain.py",
               "scripts/uninstall.sh",
               "scripts/update.sh",
               "scripts/verify-persistence.py",
@@ -63,9 +68,8 @@ jobs:
               "scripts/check-consistency.sh",
               "scripts/install.sh",
               "scripts/manage-install-state.py",
-              "scripts/test-context-token-kernel-contract.py",
-              "scripts/test-install-state-git-preservation.py",
               "scripts/test-install-state-source-path.py",
+              "scripts/test-slash-command-dedup-hook.py",
               "scripts/uninstall.sh",
               "scripts/update.sh",
               "scripts/verify-self-install.py",
@@ -162,7 +166,7 @@ jobs:
               count += 1
 
           print(f"python_ast_file_count={count}")
-          if count != 12:
+          if count == 0:
               raise SystemExit(2)
 
           print("PYTHON_AST_ALL_FILES_OK")
@@ -313,5 +317,62 @@ jobs:
           PYTHONUTF8: "1"
         run: |
           set -Eeuo pipefail
-          python scripts/test-install-state-source-path.py
-          python scripts/test-install-state-git-preservation.py
+          python -B scripts/run-regressions.py
+
+  native-contracts:
+    name: Current official Hermes integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 1badde9053f80643d97834a9114ad4a7971e2996
+          path: upstream-hermes
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.14'
+      - name: Install official Hermes dependencies
+        run: python -m pip install -e ./upstream-hermes
+      - name: Native adapter regressions (synthetic profiles, fake physical IO)
+        env:
+          HERMES_HOME: ${{ runner.temp }}/native-home
+          HOME: ${{ runner.temp }}/private-home
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          mkdir -p "$HOME" "$HERMES_HOME"
+          python -B scripts/run-regressions.py --hermes-root "$GITHUB_WORKSPACE/upstream-hermes"
+
+  public-install-lifecycle:
+    name: Public Git lifecycle · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 1badde9053f80643d97834a9114ad4a7971e2996
+          path: upstream-hermes
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.14'
+      - run: python -m pip install -e ./upstream-hermes
+      - name: Actual installer, upgrade, uninstall and reinstall (no Gateway)
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python -B scripts/test-public-install-lifecycle.py --core "$GITHUB_WORKSPACE/upstream-hermes" --public-clone "$GITHUB_WORKSPACE" --revision "$(git rev-parse HEAD)"

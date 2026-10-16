@@ -6,7 +6,7 @@
 
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.21.3%2C%20%3C0.22-5965f2)](https://github.com/NousResearch/hermes-agent)
 [![Channel](https://img.shields.io/badge/channel-Weixin-07c160)](#what-it-does)
-[![Release](https://img.shields.io/badge/release-3.1.0-7950f2)](plugin.yaml)
+[![Release](https://img.shields.io/badge/release-3.4.0-7950f2)](plugin.yaml)
 [![License](https://img.shields.io/badge/license-MIT-2f9e44)](LICENSE)
 
 [简体中文](README_CN.md) · [Install](#install) · [Configure](#configure) · [Troubleshoot](#troubleshoot)
@@ -64,8 +64,8 @@ unhandled references continue to Hermes as ordinary chat.
 
 - Hermes `>=0.21.3,<0.22`
 - A configured Hermes Weixin channel
-- Python 3.11+
-- Linux, WSL2, or a Linux-based Docker/NAS deployment
+- The Python runtime required by current Hermes; do not downgrade it separately
+- Native Windows, Linux, WSL2, or a Linux-based Docker/NAS deployment
 
 ## Install
 
@@ -142,8 +142,10 @@ HERMES_HOME/
 ```
 
 Counter keys use irreversible hashes rather than raw Context Tokens or peer
-IDs. Audit records may contain message text and should be protected like chat
-backups. Docker deployments must mount `HERMES_HOME` on persistent storage.
+IDs. The FIFO retains pending text and destination IDs for restart recovery;
+quote mappings and audit records may also contain message text. Protect these
+like chat backups. Transport acknowledgement does not mean the recipient read
+the message. Docker deployments must mount `HERMES_HOME` on persistent storage.
 
 ## Troubleshoot
 
@@ -187,7 +189,7 @@ explicitly removes them after backup.
 
 - [`SKILL.md`](SKILL.md) — installation and automation contract
 - [`docs/PERSISTENCE_CONTRACT.md`](docs/PERSISTENCE_CONTRACT.md) — state ownership and rebuild rules
-- [`docs/MAINTAINER_REFERENCE.md`](docs/MAINTAINER_REFERENCE.md) — legacy and maintainer reference
+- [`docs/DEVELOPMENT_MEMORANDUM.md`](docs/DEVELOPMENT_MEMORANDUM.md) — internal maintainer memorandum
 
 Development incident history and regression invariants are intentionally kept
 outside this user-facing README.
