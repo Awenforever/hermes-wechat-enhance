@@ -61,7 +61,6 @@ _CONTEXT_FILL_LOADED = False
 CONTEXT_BAR_CELLS = 8
 CONTEXT_BAR_FULL = "█"
 CONTEXT_BAR_BLANK = " "
-CONTEXT_BAR_CAP = "▏"
 CONTEXT_BAR_PARTIALS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
 
 
@@ -144,7 +143,7 @@ def context_bar(chat_id: str) -> str:
         sub = 0
     partial = CONTEXT_BAR_PARTIALS[sub]
     blanks = CONTEXT_BAR_CELLS - full - (1 if partial else 0)
-    return CONTEXT_BAR_FULL * full + partial + CONTEXT_BAR_BLANK * blanks + CONTEXT_BAR_CAP
+    return CONTEXT_BAR_FULL * full + partial + CONTEXT_BAR_BLANK * blanks
 
 
 def _decorate_footer(chunk: str, count: int, model: str, chat_id: str) -> str:
