@@ -43,18 +43,19 @@ TURN_MODEL_TTL_SECONDS = 6 * 3600
 MAX_TRANSIENT_DRAIN_RETRIES = 4
 MAX_DRAIN_PROBES = 3
 DRAIN_PROBE_DELAY_SECONDS = 45.0
+DRAIN_BACKOFF_CEILING_SECONDS = 120.0
+COOLDOWN_RESUME_JITTER_SECONDS = 0.05
 
 # Per-chat context-window fill captured from the turn result at the runner
 # boundary (``last_prompt_tokens`` / ``context_length``), rendered as a compact
-# horizontal progress bar in the bubble footer.  The bar uses Block Elements
-# for the filled part (U+2588 full, U+258F..U+2589 eighth partials) and plain
-# spaces for the unused part, with a single thinnest ``▏`` pinned at the 100%
-# end so the track's full extent is always visible; one Unicode range for the
-# fill keeps monospace glyph metrics uniform in WeChat inline code.  The fill
-# is persisted to ``context-fill.json`` so a gateway restart does not blank the
-# indicator until a turn re-warms it.  8 fill cells x 8 eighths = 64 levels at
-# a constant 9-char width (8 fill + 1 cap).  HERMES_WECHAT_FOOTER_CONTEXT_BAR=0
-# disables.
+# horizontal progress bar in the bubble footer.  The filled part uses Block
+# Elements (U+2588 full, U+258F..U+2589 eighth partials) and the unused part is
+# plain spaces; a single Unicode range for the fill keeps monospace glyph metrics
+# uniform in WeChat inline code.  No trailing cap glyph: the thinnest ``▏``
+# stretched the inline-code gray background past the track, so it read as extra
+# fill.  The fill is persisted to ``context-fill.json`` so a gateway restart does
+# not blank the indicator until a turn re-warms it.  8 cells x 8 eighths = 64
+# levels at a constant 8-char width.  HERMES_WECHAT_FOOTER_CONTEXT_BAR=0 disables.
 _CONTEXT_FILL: Dict[str, tuple[int, int, float]] = {}
 _CONTEXT_FILL_LOCK = threading.RLock()
 _CONTEXT_FILL_LOADED = False
@@ -335,8 +336,13 @@ def _transient_retry_delay(adapter: Any, error: Any, attempt: int) -> Optional[f
     match = re.search(r"(?:cooldown[^0-9]*|retry(?:ing)?[^0-9]*)([0-9]+(?:\.[0-9]+)?)\s*s", folded)
     if match:
         remaining = max(remaining, float(match.group(1)))
+    if remaining > 0:
+        # An explicit cooldown IS the server-mandated backoff; resume right
+        # when it expires.  Stacking the exponential floor on top made a
+        # 0.01s cooldown wait ~2s, so a silent /continue looked dead.
+        return remaining + COOLDOWN_RESUME_JITTER_SECONDS
     backoff = min(120.0, 2.0 * (2 ** max(0, int(attempt) - 1)))
-    return max(0.05, remaining + 0.25, backoff)
+    return max(0.05, backoff)
 
 
 def _drain_delay(adapter: Any, error: Any, attempt: int) -> Optional[float]:
@@ -1197,20 +1203,48 @@ def patch_adapter(adapter: Any) -> bool:
     quote_capture = _install_outbound_quote_capture(adapter, quote_store)
     locks: Dict[str, asyncio.Lock] = {}
     retry_tasks: Dict[str, asyncio.Task[Any]] = {}
+    retry_deadlines: Dict[str, float] = {}
 
     def schedule_retry(_self: Any, chat_id: str, error: Any) -> bool:
         key = str(chat_id)
-        current = retry_tasks.get(key)
-        if current is not None and not current.done():
-            return True
         first_delay = _drain_delay(_self, error, 1)
         if first_delay is None:
             return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+        wanted = loop.time() + first_delay
+        current = retry_tasks.get(key)
+        if current is not None and not current.done():
+            # Keep the in-flight worker unless this error promises a strictly
+            # sooner wake.  A non-transient failure schedules a long drain probe;
+            # a later explicit cooldown must be able to preempt it, or a silent
+            # /continue stays stranded behind that probe for its full delay.  A
+            # worker that is actively draining has a deadline already in the
+            # past, so preemption never cancels a drain in progress.
+            existing = retry_deadlines.get(key)
+            if existing is None or wanted >= existing - 1e-3:
+                return True
+            current.cancel()
 
         async def retry_worker() -> None:
             delay = first_delay
+            attempt = 0
             try:
-                for attempt in range(1, MAX_TRANSIENT_DRAIN_RETRIES + 1):
+                # The queue owns one invariant: while it is non-empty it keeps
+                # trying to drain itself, with no dependence on any inbound
+                # message.  A failed bubble stays in place (record_failure only
+                # bumps ``attempts``; ``client_id`` is UNIQUE and enqueue is
+                # INSERT OR IGNORE, so a retry can never duplicate a row) and a
+                # successful send is the only thing that dequeues it — so an
+                # unbounded loop cannot accumulate duplicates.  Backoff is capped
+                # at DRAIN_BACKOFF_CEILING_SECONDS so a rate-limited or down
+                # endpoint is probed at a bounded cadence; an explicit cooldown
+                # resumes fast instead of waiting for the ceiling.
+                while True:
+                    attempt += 1
+                    retry_deadlines[key] = loop.time() + delay
                     await asyncio.sleep(delay)
                     account_id = str(getattr(_self, "_account_id", ""))
                     if not queue.count(account_id, key):
@@ -1218,23 +1252,29 @@ def patch_adapter(adapter: Any) -> bool:
                     result = await drain_pending(_self, key)
                     if bool(result.get("ok")) or not int(result.get("pending", 0)):
                         logger.warning(
-                            "Hermes WeChat Enhance: deferred FIFO retry recovered peer=%s sent=%d pending=%d",
+                            "Hermes WeChat Enhance: deferred FIFO retry recovered peer=%s sent=%d pending=%d attempts=%d",
                             hashlib.sha256(key.encode()).hexdigest()[:12],
                             int(result.get("sent", 0)),
                             int(result.get("pending", 0)),
+                            attempt,
                         )
                         return
-                    next_delay = _drain_delay(
-                        _self, result.get("error"), attempt + 1
-                    )
-                    if next_delay is None:
-                        return
-                    delay = next_delay
-                logger.warning(
-                    "Hermes WeChat Enhance: deferred FIFO retries exhausted peer=%s pending=%d; awaiting fresh inbound token",
-                    hashlib.sha256(key.encode()).hexdigest()[:12],
-                    queue.count(str(getattr(_self, "_account_id", "")), key),
-                )
+                    # Transient/cooldown errors carry their own bounded delay;
+                    # anything the classifier treats as permanent falls back to
+                    # the probe interval so nothing is ever stranded waiting for
+                    # the next inbound token.
+                    delay = _transient_retry_delay(_self, result.get("error"), attempt + 1)
+                    if delay is None:
+                        delay = DRAIN_PROBE_DELAY_SECONDS
+                    delay = min(delay, DRAIN_BACKOFF_CEILING_SECONDS)
+                    if attempt == MAX_TRANSIENT_DRAIN_RETRIES:
+                        logger.warning(
+                            "Hermes WeChat Enhance: deferred FIFO still pending after %d attempts peer=%s pending=%d; continuing with capped backoff (ceiling=%.0fs)",
+                            attempt,
+                            hashlib.sha256(key.encode()).hexdigest()[:12],
+                            int(result.get("pending", 0)),
+                            DRAIN_BACKOFF_CEILING_SECONDS,
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1242,7 +1282,9 @@ def patch_adapter(adapter: Any) -> bool:
             finally:
                 if retry_tasks.get(key) is asyncio.current_task():
                     retry_tasks.pop(key, None)
+                    retry_deadlines.pop(key, None)
 
+        retry_deadlines[key] = wanted
         retry_tasks[key] = asyncio.create_task(
             retry_worker(), name=f"hermes-wechat-fifo-retry-{hashlib.sha256(key.encode()).hexdigest()[:8]}"
         )

@@ -106,6 +106,15 @@ check("rate-limit still transient", M._transient_retry_delay(None, rate_err, 1) 
 permanent = "permanent budget exhausted forbidden 403"
 check("permanent still non-transient", M._transient_retry_delay(None, permanent, 1) is None)
 
+print("== 3b. explicit cooldown honored, not stacked under exponential backoff ==")
+short_cd = "iLink sendmessage rate limited; cooldown active for 0.01s"
+d_short = M._transient_retry_delay(None, short_cd, 1)
+check("0.01s cooldown resumes within 0.08s", d_short is not None and d_short <= 0.08)
+check("0.01s cooldown >= its own remaining", d_short is not None and d_short >= 0.01)
+d_long = M._transient_retry_delay(None, rate_err, 1)
+check("30s cooldown resumes at ~30s, not backoff", d_long is not None and 30.0 <= d_long <= 30.5)
+check("no-cooldown transient keeps exponential floor", M._transient_retry_delay(None, connect_err, 1) == 2.0)
+
 print("== 4. drain guarantee probes even for unclassified errors ==")
 check("probe delay for permanent at attempt 1", M._drain_delay(None, permanent, 1) == M.DRAIN_PROBE_DELAY_SECONDS)
 check("probe delay within cap", M._drain_delay(None, permanent, M.MAX_DRAIN_PROBES) == M.DRAIN_PROBE_DELAY_SECONDS)
@@ -135,6 +144,42 @@ async def _probe_thread() -> str:
 loop_thread = threading.current_thread().name
 worker_thread = asyncio.run(_probe_thread())
 check("to_thread runs off loop thread", worker_thread != loop_thread)
+
+print("== 6. queue is in-place: failures never duplicate; only success dequeues ==")
+from pathlib import Path  # noqa: E402
+
+_qpath = Path(os.path.join(_SANDBOX, "pending-inplace-test.sqlite3"))
+if _qpath.exists():
+    _qpath.unlink()
+Q = M.PendingBubbleStore(_qpath)
+# A first physical-send failure enqueues the bubble exactly once.
+Q.enqueue("acct", "peer", "client-1", "hello", "deepseek-flash", "boom")
+check("one enqueue -> depth 1", Q.count("acct", "peer") == 1)
+# The SAME client_id re-enqueued (upstream retry / re-entry) must not duplicate:
+# this is the accumulation bug the old retry cap was papering over.
+Q.enqueue("acct", "peer", "client-1", "hello", "deepseek-flash", "boom")
+check("same client_id re-enqueue idempotent (INSERT OR IGNORE + UNIQUE)", Q.count("acct", "peer") == 1)
+# peek never pops.
+_item = Q.peek("acct", "peer")
+check("peek returns the queued item", _item is not None and _item["client_id"] == "client-1")
+check("peek does not dequeue", Q.count("acct", "peer") == 1)
+# Repeated drain failures annotate in place; depth never grows.
+for _ in range(5):
+    _got = Q.peek("acct", "peer")
+    Q.record_failure(int(_got["seq"]), "cooldown active for 0.01s")
+check("5 failed drains -> still depth 1 (failure stays in place, no re-enqueue)", Q.count("acct", "peer") == 1)
+_after = Q.peek("acct", "peer")
+check("failures bump attempts in place", int(_after["attempts"]) == 5)
+# Only a successful send dequeues.
+Q.remove(int(_after["seq"]))
+check("success (remove) -> depth 0", Q.count("acct", "peer") == 0)
+
+print("== 7. drain worker is drain-until-empty and cooldown-preemptive ==")
+check("worker loops until the queue is empty", "while True:" in src)
+check("no bounded 'awaiting fresh inbound token' give-up", "awaiting fresh inbound token" not in src)
+check("backoff capped at DRAIN_BACKOFF_CEILING_SECONDS", "DRAIN_BACKOFF_CEILING_SECONDS" in src)
+check("a sooner retry preempts a longer-sleeping worker", "current.cancel()" in src)
+check("worker tracks a wake deadline for preemption", "retry_deadlines[key]" in src)
 
 print(f"\nRESULT pass={PASS} fail={FAIL}")
 sys.exit(1 if FAIL else 0)
