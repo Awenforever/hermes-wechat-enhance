@@ -132,7 +132,7 @@ async def t_q1_m2m4_redaction_signature(home: str):
     raw = (
         "## 诊断：PAT 权限不足\n\n"
         "你的 token `github_pat_11ABCDEFG_pa1bcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ` "
-        "缺少 org 级权限。经典 token（`ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab`）需要 repo+read:org。\n\n"
+        f"缺少 org 级权限。经典 token（`{'ghp_AB' + 'SYNTHETIC' * 4}`）需要 repo+read:org。\n\n"
         "| 场景 | 权限 |\n|---|---|\n| 读 issue | repo |\n"
     )
     shaped = _sanitize_gateway_final_response(PLAT, raw)
@@ -423,7 +423,7 @@ def t_q5_redaction(home: str):
     import hermes_wechat_enhance.store as st
 
     print("=== Q5: secrets redacted before persisting ===")
-    secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab"
+    secret = 'ghp_AB' + 'SYNTHETIC' * 4
     with tempfile.TemporaryDirectory(prefix="q5red-") as d:
         store = st.MessageStore(base_dir=d)
         store.append({"platform": "weixin", "user_id": PEER, "direction": "in",
