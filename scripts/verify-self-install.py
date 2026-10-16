@@ -53,6 +53,7 @@ def main():
     run_test("test-v021-real-adapter.py", "V021_REAL_WEIXIN_ADAPTER_TEST_OK", gateway_python=True)
     run_test("test-slash-command-dedup-hook.py", "SLASH_COMMAND_DEDUP_HOOK_TEST=PASS")
     run_test("test-startup-ready-target.py", "WECHAT_STARTUP_TARGET_INHERIT_TEST=PASS")
+    run_test('test-final-origin-producer.py','FINAL_ORIGIN_REAL_PRODUCER_QUEUE_SPLIT_ACCOUNT_OK',gateway_python=True)
     print(json.dumps({"ok": True, "contract": "HERMES_WECHAT_ENHANCE_CURRENT_V1", "core_mutation": False, "legacy_runtime": False}, sort_keys=True))
     print("SELF_INSTALL_VERIFY_OK")
 

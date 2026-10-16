@@ -58,6 +58,65 @@ _STREAM_BOUNDARY_MODEL: contextvars.ContextVar[Optional[str]] = contextvars.Cont
 _TURN_MODELS: Dict[str, tuple[str, float, bool, str]] = {}
 _TURN_MODELS_LOCK = threading.RLock()
 TURN_MODEL_TTL_SECONDS = 6 * 3600
+# Final results are immutable evidence, not a mutable per-chat "last model".
+# The account/peer/body digest survives a queued follow-up replacing turn state.
+# No response text or credential is retained here. All access shares the lock.
+_FINAL_ORIGINS: Dict[tuple[str, str, str], tuple[frozenset[str], float]] = {}
+FINAL_ORIGIN_TTL_SECONDS = 300
+FINAL_ORIGIN_LIMIT = 256
+
+
+def _final_origin_key(adapter: Any, chat_id: str, content: Any) -> Optional[tuple[str, str, str]]:
+    account = str(getattr(adapter, '_account_id', '') or '')
+    body = str(content or '').strip()
+    if not account or not chat_id or not body:
+        return None
+    return (hashlib.sha256(account.encode('utf-8',errors='surrogatepass')).hexdigest(), str(chat_id),
+        hashlib.sha256(body.encode('utf-8',errors='surrogatepass')).hexdigest())
+
+
+def _record_final_origin(adapter: Any, chat_id: str, model: Any, response: Any) -> None:
+    key = _final_origin_key(adapter, chat_id, response)
+    normalized = _safe_model(model)
+    if key is None or normalized == 'hermes':
+        return
+    now = time.monotonic()
+    with _TURN_MODELS_LOCK:
+        for old in [k for k, value in _FINAL_ORIGINS.items() if now-value[1] > FINAL_ORIGIN_TTL_SECONDS]:
+            _FINAL_ORIGINS.pop(old, None)
+        previous = _FINAL_ORIGINS.get(key)
+        models = (previous[0] if previous else frozenset()) | {normalized}
+        _FINAL_ORIGINS[key] = (frozenset(models), now)
+        while len(_FINAL_ORIGINS) > FINAL_ORIGIN_LIMIT:
+            _FINAL_ORIGINS.pop(next(iter(_FINAL_ORIGINS)))
+
+
+def _final_origin(adapter: Any, chat_id: str, content: str) -> Optional[str]:
+    key = _final_origin_key(adapter, chat_id, content)
+    if key is None:
+        return None
+    with _TURN_MODELS_LOCK:
+        entry = _FINAL_ORIGINS.get(key)
+        if entry is None:
+            return None
+        if time.monotonic()-entry[1] > FINAL_ORIGIN_TTL_SECONDS:
+            _FINAL_ORIGINS.pop(key, None)
+            return None
+        if len(entry[0]) != 1:
+            logger.error('Hermes WeChat Enhance: ambiguous final model evidence; refusing last-model inference')
+            return 'unknown-model'
+        return next(iter(entry[0]))
+
+
+def _record_final_delivery_shapes(adapter: Any, chat_id: str, model: Any, response: Any) -> None:
+    _record_final_origin(adapter, chat_id, model, response)
+    if adapter is not None and isinstance(response, str):
+        try:
+            from gateway.run import _strip_response_attachments_for_direct_send
+            visible = _strip_response_attachments_for_direct_send(response, adapter)
+        except (ImportError, AttributeError):
+            return
+        _record_final_origin(adapter, chat_id, model, visible)
 MAX_TRANSIENT_DRAIN_RETRIES = 4
 MAX_DRAIN_PROBES = 3
 DRAIN_PROBE_DELAY_SECONDS = 45.0
@@ -1016,6 +1075,7 @@ def _resolve_model(
     chat_id: str,
     content: str,
     metadata: Optional[Dict[str, Any]],
+    *, adapter: Any = None,
 ) -> tuple[str, bool]:
     meta = dict(metadata or {})
     if _is_system(meta):
@@ -1039,6 +1099,12 @@ def _resolve_model(
     boundary_model = _STREAM_BOUNDARY_MODEL.get()
     if boundary_model:
         return _safe_model(boundary_model), False
+    final_model = _final_origin(adapter, chat_id, content)
+    if final_model is not None:
+        return final_model, True
+    if str(meta.get('actor') or '').lower() == 'model':
+        logger.error('Hermes WeChat Enhance: model output has no model provenance')
+        return 'unknown-model', False
     # Unmarked sends are Hermes-owned control traffic by default.  The sole
     # exception is the completed agent result: agent:end supplies both the
     # actual fallback-aware model and a response prefix, which must match the
@@ -1311,9 +1377,33 @@ def patch_turn_runner_status() -> bool:
     # and agent:end both occur after this boundary and are too late for a fast
     # final send.
     finish = getattr(TurnRunner, "_finish_stream_consumer", None)
-    if callable(finish) and not getattr(TurnRunner, "_hermes_wechat_final_origin_v1", False):
+    if callable(finish) and not getattr(TurnRunner, "_hermes_wechat_final_origin_v2", False):
         @functools.wraps(finish)
         def wrapped_finish(self: Any, result: Any, agent_history: Any, stream_consumer: Any) -> Any:
+            # This boundary is reached before BOTH stream finalization and the
+            # queued-follow-up first-response send. _run_agent_inner/agent:end
+            # can occur after that send and cannot establish its provenance.
+            ctx = getattr(self, '_ctx', None)
+            source = getattr(ctx, 'source', None)
+            platform_obj = getattr(source, 'platform', '')
+            platform = str(getattr(platform_obj, 'value', platform_obj) or '').lower()
+            holder = getattr(ctx, 'agent_holder', None) or []
+            agent = holder[0] if holder else None
+            origin = None
+            if (platform == 'weixin' and isinstance(result, dict)
+                    and not result.get('failed') and not result.get('interrupted')
+                    and result.get('completed') is not False):
+                model = getattr(agent, 'model', None) or result.get('model') or result.get('model_name')
+                body = result.get('final_response')
+                if model and isinstance(body, str) and body.strip() and body != '(empty)':
+                    adapter = getattr(ctx, '_status_adapter', None) or getattr(self, 'adapter', None)
+                    if adapter is None:
+                        owner = getattr(self, '_runner', None)
+                        resolve = getattr(owner, '_delivery_adapter_for', None)
+                        if callable(resolve): adapter = resolve(source)
+                    chat_id = str(getattr(source, 'chat_id', '') or '')
+                    origin = (adapter, chat_id, model, platform_obj)
+                    _record_final_delivery_shapes(adapter, chat_id, model, _delivery_shaped_response(platform_obj, body))
             if stream_consumer is not None:
                 ctx = getattr(self, "_ctx", None)
                 source = getattr(ctx, "source", None)
@@ -1333,10 +1423,18 @@ def patch_turn_runner_status() -> bool:
                         metadata = dict(getattr(stream_consumer, "metadata", None) or {})
                         metadata.update({"actor": "model", "model_name": normalized})
                         stream_consumer.metadata = metadata
-            return finish(self, result, agent_history, stream_consumer)
+            value = finish(self, result, agent_history, stream_consumer)
+            if origin is not None:
+                adapter, chat_id, model, platform_obj = origin
+                # Core can canonicalize media paths inside finish(). Bind its
+                # actual rewritten body too, before a queued first send runs.
+                _record_final_delivery_shapes(adapter, chat_id, model,
+                    _delivery_shaped_response(platform_obj, result.get('final_response')))
+            return value
 
         TurnRunner._finish_stream_consumer = wrapped_finish
         TurnRunner._hermes_wechat_final_origin_v1 = True
+        TurnRunner._hermes_wechat_final_origin_v2 = True
         installed = True
     return installed
 
@@ -1620,7 +1718,7 @@ def patch_adapter(adapter: Any) -> bool:
         metadata: Optional[Dict[str, Any]] = None,
     ):
         binding = _transport_binding(metadata)
-        model, completed = _resolve_model(str(chat_id), content, metadata)
+        model, completed = _resolve_model(str(chat_id), content, metadata, adapter=_self)
         token = _ACTIVE_MODEL.set(model)
         binding_token = _TRANSPORT_BINDING.set((asyncio.current_task(), _self, str(chat_id), binding))
         try:
@@ -1894,6 +1992,13 @@ async def install_v021_bubble_footer_hook(
     installed = already = 0
     slash_installed = slash_already = 0
     errors = []
+    try:
+        from gateway.run_turn_runner import TurnRunner
+        final_producer_ready = bool(getattr(TurnRunner, '_hermes_wechat_final_origin_v2', False))
+    except ImportError:
+        final_producer_ready = False
+    if adapters and not final_producer_ready:
+        errors.append('final-result producer provenance boundary unavailable')
     for adapter in adapters:
         try:
             if patch_adapter(adapter):
@@ -1953,6 +2058,7 @@ async def install_v021_bubble_footer_hook(
             "stream_boundary_model_origin": True,
             "nonstream_interim_model_origin": True,
             "pre_delivery_final_model_origin": True,
+            "early_final_result_provenance": final_producer_ready,
             "consumer_owned_stream_model_origin": True,
             "fallback_model_before_stream_finalize": True,
             "sole_weixin_startup_ready_owner": True,
