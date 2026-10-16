@@ -121,6 +121,45 @@ def _prune_context_fill() -> None:
         _CONTEXT_FILL.pop(key, None)
 
 
+def _refresh_context_fill_from_cached_agent(runner: Any, source: Any) -> None:
+    """Seed the footer fill from the live cached agent BEFORE the turn runs.
+
+    ``_remember_context_fill`` only fires at turn end, so an abrupt shrink such
+    as ``/compress`` leaves the next turn's bubbles showing the pre-compress
+    value.  The cached agent's context compressor already holds the post-
+    compress reading (the same one ``/status`` renders), so sample it at turn
+    start.  These are in-memory attribute reads only; any missing core
+    attribute, a ``-1``/``0`` sentinel, or an absent cache simply leaves the
+    previous snapshot in place, so core drift degrades to the old one-turn-lag
+    behaviour instead of breaking delivery.
+    """
+    try:
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        session_key = str(getattr(source, "session_key", "") or "")
+        if not chat_id or not session_key:
+            return
+        cache = getattr(runner, "_agent_cache", None)
+        if not cache:
+            return
+        lock = getattr(runner, "_agent_cache_lock", None)
+        if lock is not None:
+            with lock:
+                entry = cache.get(session_key)
+        else:
+            entry = cache.get(session_key)
+        agent = entry[0] if isinstance(entry, tuple) and entry else entry
+        comp = getattr(agent, "context_compressor", None)
+        if comp is None:
+            return
+        _remember_context_fill(
+            chat_id,
+            getattr(comp, "last_prompt_tokens", 0),
+            getattr(comp, "context_length", 0),
+        )
+    except Exception:
+        return
+
+
 def context_bar(chat_id: str) -> str:
     """Return the constant-width context-fill progress bar, or "" when unknown."""
     env = os.environ.get(
@@ -1000,7 +1039,7 @@ def patch_gateway_runner(runner: Any) -> bool:
     if callable(original_run):
         @functools.wraps(original_run)
         async def wrapped_run(*args: Any, **kwargs: Any):
-            result = await original_run(*args, **kwargs)
+            runner_self = args[0] if args else None
             source = kwargs.get("source")
             if source is None:
                 source = next(
@@ -1009,6 +1048,9 @@ def patch_gateway_runner(runner: Any) -> bool:
                 )
             platform_obj = getattr(source, "platform", "")
             platform = str(getattr(platform_obj, "value", platform_obj) or "").lower()
+            if platform == "weixin":
+                _refresh_context_fill_from_cached_agent(runner_self, source)
+            result = await original_run(*args, **kwargs)
             if platform == "weixin" and isinstance(result, dict):
                 chat_id = str(getattr(source, "chat_id", "") or "")
                 pending = _peek_turn_model(chat_id)

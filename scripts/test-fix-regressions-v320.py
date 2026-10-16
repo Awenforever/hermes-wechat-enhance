@@ -181,5 +181,91 @@ check("backoff capped at DRAIN_BACKOFF_CEILING_SECONDS", "DRAIN_BACKOFF_CEILING_
 check("a sooner retry preempts a longer-sleeping worker", "current.cancel()" in src)
 check("worker tracks a wake deadline for preemption", "retry_deadlines[key]" in src)
 
+print("== 8. v3.3.4 turn-start live context-fill read (kills /compress lag) ==")
+
+
+class _Comp:
+    def __init__(self, used, limit):
+        self.last_prompt_tokens = used
+        self.context_length = limit
+
+
+class _Agent:
+    def __init__(self, used, limit):
+        self.context_compressor = _Comp(used, limit)
+
+
+class _Src:
+    def __init__(self, chat, skey, plat="weixin"):
+        self.chat_id = chat
+        self.session_key = skey
+        self.platform = plat
+
+
+class _Runner:
+    def __init__(self, cache, lock=True):
+        self._agent_cache = cache
+        self._agent_cache_lock = threading.Lock() if lock else None
+
+
+CHAT = "compress-chat"
+SKEY = "weixin:compress-chat"
+
+# Stale pre-compress snapshot (the bug): footer would render ~full.
+set_fill(CHAT, 900_000, 1_000_000)
+runner = _Runner({SKEY: (_Agent(77_809, 1_000_000), "sig")})
+M._refresh_context_fill_from_cached_agent(runner, _Src(CHAT, SKEY))
+check("turn-start read overrides stale pre-compress snapshot",
+      M._CONTEXT_FILL[CHAT][0] == 77_809 and M._CONTEXT_FILL[CHAT][1] == 1_000_000)
+check("post-compress ratio is low, not full",
+      M._CONTEXT_FILL[CHAT][0] / M._CONTEXT_FILL[CHAT][1] < 0.1)
+
+# -1 sentinel right after /compress (awaiting real usage) must NOT be written.
+set_fill(CHAT, 55_000, 1_000_000)
+prev = M._CONTEXT_FILL[CHAT][0]
+runner_neg = _Runner({SKEY: (_Agent(-1, 1_000_000), "sig")})
+M._refresh_context_fill_from_cached_agent(runner_neg, _Src(CHAT, SKEY))
+check("-1 sentinel ignored, snapshot unchanged", M._CONTEXT_FILL[CHAT][0] == prev)
+
+# Zero / missing compressor / missing cache / missing session_key: no crash, no change.
+runner_zero = _Runner({SKEY: (_Agent(0, 1_000_000), "sig")})
+M._refresh_context_fill_from_cached_agent(runner_zero, _Src(CHAT, SKEY))
+check("0 usage ignored", M._CONTEXT_FILL[CHAT][0] == prev)
+
+
+class _NoComp:
+    pass
+
+
+runner_nocomp = _Runner({SKEY: (_NoComp(), "sig")})
+M._refresh_context_fill_from_cached_agent(runner_nocomp, _Src(CHAT, SKEY))
+check("agent without compressor ignored", M._CONTEXT_FILL[CHAT][0] == prev)
+
+
+class _BareRunner:
+    pass
+
+
+M._refresh_context_fill_from_cached_agent(_BareRunner(), _Src(CHAT, SKEY))
+check("runner without _agent_cache degrades silently", M._CONTEXT_FILL[CHAT][0] == prev)
+
+M._refresh_context_fill_from_cached_agent(runner, _Src(CHAT, ""))
+check("source without session_key ignored", M._CONTEXT_FILL[CHAT][0] == prev)
+
+# Non-tuple cache entry (layout drift) must not raise and must not corrupt.
+runner_flat = _Runner({SKEY: _Agent(12_345, 1_000_000)})
+M._refresh_context_fill_from_cached_agent(runner_flat, _Src(CHAT, SKEY))
+check("non-tuple cache entry handled (uses entry itself)", M._CONTEXT_FILL[CHAT][0] == 12_345)
+
+src_pg = " ".join(inspect.getsource(M.patch_gateway_runner).split())
+check("turn-start refresh invoked in wrapped_run",
+      "_refresh_context_fill_from_cached_agent(runner_self, source)" in src_pg)
+check("turn-start refresh precedes original_run",
+      src_pg.index("_refresh_context_fill_from_cached_agent(runner_self, source)")
+      < src_pg.index("result = await original_run(*args, **kwargs)"))
+check("end-of-turn authoritative remember retained",
+      src_pg.count("_remember_context_fill(") == 1
+      and "result.get(\"last_prompt_tokens\")" in src_pg)
+
 print(f"\nRESULT pass={PASS} fail={FAIL}")
 sys.exit(1 if FAIL else 0)
