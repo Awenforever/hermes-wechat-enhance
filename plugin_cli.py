@@ -208,10 +208,6 @@ def _install_hook() -> int:
     source = _source_root() / "hooks" / "hermes-wechat-enhance"
     target = _hook_target()
     target.parent.mkdir(parents=True, exist_ok=True)
-    stage = target.with_name(f".{target.name}.stage")
-    if stage.exists():
-        shutil.rmtree(stage)
-    shutil.copytree(source, stage)
     previous = _read_manifest()
     current_hash = _tree_hash(target)
     source_hash = _tree_hash(source)
@@ -221,29 +217,73 @@ def _install_hook() -> int:
         and current_hash == previous.get("installed_hash")
     )
     backup = str(previous.get("original_backup") or "") or None
-    if target.exists() and not previous_owned and current_hash != source_hash:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        backup_path = _hook_backup_root() / stamp
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-        target.replace(backup_path)
-        backup = str(backup_path)
-    elif target.exists():
-        shutil.rmtree(target)
-    stage.replace(target)
-    installed_hash = _tree_hash(target)
-    busy_input_mode = _ensure_queue_mode(previous)
-    _write_manifest({
-        "schema_version": 1,
-        "owner": "hermes-wechat-enhance",
-        "installed": True,
-        "hook": str(target),
-        "installed_hash": installed_hash,
-        "original_backup": backup,
-        "busy_input_mode": busy_input_mode,
-        "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    })
+    legacy_stage = target.with_name(f'.{target.name}.stage')
+    if legacy_stage.exists():
+        if legacy_stage.is_symlink() or _tree_hash(legacy_stage) not in {source_hash, current_hash}:
+            raise RuntimeError('Unrecognized legacy staging hook; preserve it and reconcile before restart')
+        backup_root = _hook_backup_root()
+        backup_root.mkdir(parents=True, exist_ok=True)
+        quarantine = Path(tempfile.mkdtemp(prefix='legacy-stage-', dir=backup_root))
+        legacy_stage.replace(quarantine / 'previous')
+    retired = transaction = None
+    activated = False
+    config_path = _config_path()
+    config_before = config_path.read_bytes() if config_path.is_file() else None
+    config_after = None
+    try:
+        if current_hash != source_hash:
+            # Never stage beneath hooks/: Core can discover dot directories.
+            # Never recursively delete an active hook: foreign-owned caches can
+            # fail midway and leave a broken install. Rename the whole tree.
+            backup_root = _hook_backup_root()
+            backup_root.mkdir(parents=True, exist_ok=True)
+            transaction = Path(tempfile.mkdtemp(prefix='install-', dir=backup_root))
+            stage = transaction / 'candidate'
+            shutil.copytree(source, stage,
+                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '*.pyo'))
+            if target.exists():
+                retired = transaction / 'previous'
+                target.replace(retired)
+                if not previous_owned:
+                    backup = str(retired)
+            stage.replace(target)
+            activated = True
+        # Identical source really is a no-op on the active tree, including caches.
+        installed_hash = _tree_hash(target)
+        busy_input_mode = _ensure_queue_mode(previous)
+        config_after = config_path.read_bytes() if config_path.is_file() else None
+        _write_manifest({
+            "schema_version": 1,
+            "owner": "hermes-wechat-enhance",
+            "installed": True,
+            "hook": str(target),
+            "installed_hash": installed_hash,
+            "original_backup": backup,
+            "busy_input_mode": busy_input_mode,
+            "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+    except BaseException:
+        if activated and target.exists():
+            target.replace(transaction / 'failed-candidate')
+        if retired is not None and retired.exists() and not target.exists():
+            retired.replace(target)
+        _restore_config_snapshot(config_path, config_before, config_after)
+        raise
     print(json.dumps({"ok": True, "hook": str(target), "backup": str(backup) if backup else None}))
     return 0
+
+
+def _restore_config_snapshot(path: Path, before: bytes | None, after: bytes | None) -> None:
+    """Undo this transaction only if no later writer changed its result."""
+    if after is None or before == after or not path.is_file() or path.read_bytes() != after:
+        return
+    if before is None:
+        path.unlink()
+        return
+    with tempfile.NamedTemporaryFile('wb', dir=path.parent, delete=False) as handle:
+        handle.write(before)
+        temporary = Path(handle.name)
+    os.replace(temporary, path)
 
 
 def _uninstall_hook() -> int:
@@ -262,22 +302,39 @@ def _uninstall_hook() -> int:
     if backup is not None and not backup.is_dir():
         print(json.dumps({"ok": False, "reason": "original_hook_backup_missing"}))
         return 4
-    if target.exists():
-        shutil.rmtree(target)
-    if backup_text:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        assert backup is not None
-        backup.replace(target)
-        restored = True
-    config_restore = _restore_queue_mode(manifest.get("busy_input_mode"))
-    manifest.update({
-        "installed": False,
-        "installed_hash": None,
-        "original_backup": None,
-        "last_uninstalled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "busy_input_mode_restore": config_restore,
-    })
-    _write_manifest(manifest)
+    retired = None
+    config_path = _config_path()
+    config_before = config_path.read_bytes() if config_path.is_file() else None
+    config_after = None
+    try:
+        if target.exists():
+            backup_root = _hook_backup_root()
+            backup_root.mkdir(parents=True, exist_ok=True)
+            transaction = Path(tempfile.mkdtemp(prefix='uninstall-', dir=backup_root))
+            retired = transaction / 'previous'
+            target.replace(retired)
+        if backup_text:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            assert backup is not None
+            backup.replace(target)
+            restored = True
+        config_restore = _restore_queue_mode(manifest.get("busy_input_mode"))
+        config_after = config_path.read_bytes() if config_path.is_file() else None
+        manifest.update({
+            "installed": False,
+            "installed_hash": None,
+            "original_backup": None,
+            "last_uninstalled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "busy_input_mode_restore": config_restore,
+        })
+        _write_manifest(manifest)
+    except BaseException:
+        if restored and target.exists():
+            target.replace(backup)
+        if retired is not None and retired.exists() and not target.exists():
+            retired.replace(target)
+        _restore_config_snapshot(config_path, config_before, config_after)
+        raise
     print(json.dumps({"ok": True, "hook_removed": not target.exists() or restored, "restored_previous": restored, "config_restore": config_restore}))
     return 0
 
