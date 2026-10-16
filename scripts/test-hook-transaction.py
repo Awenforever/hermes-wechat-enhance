@@ -47,6 +47,19 @@ with tempfile.TemporaryDirectory(prefix='hook-transaction-') as raw:
         assert M._install_hook() == 0
     assert cache_file.stat().st_mtime_ns == cache_stat.st_mtime_ns
     assert cache_file.read_bytes() == b'synthetic foreign-owned cache'
+    legacy = target.with_name('.hermes-wechat-enhance.stage')
+    shutil.copytree(source, legacy)
+    assert M._install_hook() == 0 and not legacy.exists()
+    legacy.mkdir()
+    (legacy/'unrecognized.txt').write_text('must not delete unknown data', encoding='utf-8')
+    try:
+        M._install_hook()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('unknown staging hook was silently accepted')
+    assert (legacy/'unrecognized.txt').exists()
+    legacy.replace(root/'unrecognized-stage-preserved')
     # A changed package must stage outside Core's hook discovery tree.
     with (source/'handler.py').open('a', encoding='utf-8') as handle:
         handle.write('\n# synthetic changed source\n')

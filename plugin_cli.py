@@ -217,6 +217,14 @@ def _install_hook() -> int:
         and current_hash == previous.get("installed_hash")
     )
     backup = str(previous.get("original_backup") or "") or None
+    legacy_stage = target.with_name(f'.{target.name}.stage')
+    if legacy_stage.exists():
+        if legacy_stage.is_symlink() or _tree_hash(legacy_stage) not in {source_hash, current_hash}:
+            raise RuntimeError('Unrecognized legacy staging hook; preserve it and reconcile before restart')
+        backup_root = _hook_backup_root()
+        backup_root.mkdir(parents=True, exist_ok=True)
+        quarantine = Path(tempfile.mkdtemp(prefix='legacy-stage-', dir=backup_root))
+        legacy_stage.replace(quarantine / 'previous')
     retired = transaction = None
     activated = False
     config_path = _config_path()
