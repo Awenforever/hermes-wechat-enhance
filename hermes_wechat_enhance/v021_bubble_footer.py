@@ -139,21 +139,20 @@ def _prune_context_fill() -> None:
         _CONTEXT_FILL.pop(key, None)
 
 
-def _refresh_context_fill_from_cached_agent(runner: Any, source: Any) -> None:
+def _refresh_context_fill_from_cached_agent(runner: Any, source: Any, session_key: Optional[str] = None) -> None:
     """Seed the footer fill from the live cached agent BEFORE the turn runs.
 
     ``_remember_context_fill`` only fires at turn end, so an abrupt shrink such
     as ``/compress`` leaves the next turn's bubbles showing the pre-compress
     value.  The cached agent's context compressor already holds the post-
     compress reading (the same one ``/status`` renders), so sample it at turn
-    start.  These are in-memory attribute reads only; any missing core
-    attribute, a ``-1``/``0`` sentinel, or an absent cache simply leaves the
-    previous snapshot in place, so core drift degrades to the old one-turn-lag
-    behaviour instead of breaking delivery.
+    start. SessionSource does not own a session_key: the runner call does.
+    A negative usage sentinel invalidates the old snapshot: compression made
+    that reading obsolete and no new provider usage is available yet.
     """
     try:
         chat_id = str(getattr(source, "chat_id", "") or "")
-        session_key = str(getattr(source, "session_key", "") or "")
+        session_key = str(session_key or getattr(source, "session_key", "") or "")
         if not chat_id or not session_key:
             return
         cache = getattr(runner, "_agent_cache", None)
@@ -169,9 +168,16 @@ def _refresh_context_fill_from_cached_agent(runner: Any, source: Any) -> None:
         comp = getattr(agent, "context_compressor", None)
         if comp is None:
             return
+        used = getattr(comp, "last_prompt_tokens", 0)
+        if int(used or 0) < 0:
+            _load_context_fill()
+            with _CONTEXT_FILL_LOCK:
+                _CONTEXT_FILL.pop(chat_id, None)
+            _save_context_fill()
+            return
         _remember_context_fill(
             chat_id,
-            getattr(comp, "last_prompt_tokens", 0),
+            used,
             getattr(comp, "context_length", 0),
         )
     except Exception:
@@ -494,8 +500,8 @@ class PendingBubbleStore:
 
     Queueing at this boundary prevents a partially delivered multi-bubble reply
     from being replayed as one large duplicate.  Raw account and peer IDs are
-    never persisted; the queued message text is retained because it must later
-    be delivered verbatim.
+    hashed in queue rows. A separate private route table retains destination IDs
+    for autonomous restart recovery; it contains no credentials or tokens.
     """
 
     def __init__(self, path: Path) -> None:
@@ -555,6 +561,12 @@ class PendingBubbleStore:
                     requested_at REAL NOT NULL,
                     PRIMARY KEY(account_key,chat_key,binding)
                 );
+                CREATE TABLE IF NOT EXISTS pending_routes_v1 (
+                    account_key TEXT NOT NULL,
+                    chat_key TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    PRIMARY KEY(account_key,chat_key)
+                );
                 """
             )
             connection.execute('INSERT OR IGNORE INTO transport_receipt_meta_v1(name,value) VALUES(?,?)',('epoch',secrets.token_hex(32)))
@@ -581,6 +593,8 @@ class PendingBubbleStore:
                 "INSERT OR IGNORE INTO pending_bubbles(account_key,chat_key,client_id,chunk,model,enqueued_at,last_error,transport_binding) VALUES(?,?,?,?,?,?,?,?)",
                 (account_key, chat_key, str(client_id), str(chunk), _safe_model(model), time.time(), str(error)[:500], binding),
             )
+            connection.execute('INSERT OR REPLACE INTO pending_routes_v1 VALUES(?,?,?)',
+                               (account_key, chat_key, str(chat_id)))
             owned = connection.execute('SELECT account_key,chat_key,transport_binding FROM pending_bubbles WHERE client_id=?', (str(client_id),)).fetchone()
             if owned and tuple(owned) == (account_key, chat_key, binding):
                 self._record_receipt(connection, account_id, chat_id, client_id, binding, 'queued')
@@ -610,6 +624,32 @@ class PendingBubbleStore:
             # A metadata failure must never retry or replace physical delivery.
             self.receipts_available = False
 
+    def recover_routes(self, account_id, trusted_candidates=()):
+        """Recover exact owned routes only; never infer a peer from text/hash.
+
+        Legacy DM candidates come from Core's restored token keys, not tokens.
+        Missing legacy group destinations remain visible as unresolved counts.
+        """
+        account_key = self._keys(account_id, '')[0]
+        with self._lock, self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            for chat_id in trusted_candidates:
+                keys = self._keys(account_id, chat_id)
+                exists = connection.execute('SELECT 1 FROM pending_bubbles WHERE account_key=? AND chat_key=? LIMIT 1', keys).fetchone()
+                if exists:
+                    connection.execute('INSERT OR IGNORE INTO pending_routes_v1 VALUES(?,?,?)', (*keys, str(chat_id)))
+            # Route retention follows pending ownership, not an eternal roster.
+            connection.execute('DELETE FROM pending_routes_v1 WHERE NOT EXISTS (SELECT 1 FROM pending_bubbles p WHERE p.account_key=pending_routes_v1.account_key AND p.chat_key=pending_routes_v1.chat_key)')
+            rows = connection.execute('SELECT DISTINCT p.chat_key, r.chat_id FROM pending_bubbles p LEFT JOIN pending_routes_v1 r ON p.account_key=r.account_key AND p.chat_key=r.chat_key WHERE p.account_key=?', (account_key,)).fetchall()
+            routes, unresolved = [], 0
+            for row in rows:
+                chat = row['chat_id']
+                if isinstance(chat, str) and chat and self._keys(account_id, chat)[1] == row['chat_key']:
+                    routes.append(chat)
+                else:
+                    unresolved += 1
+            return routes, unresolved
+
     def request_withdrawal(self, account_id, chat_id, binding):
         """Trusted host request, not a grant. Preserve the deny across restart."""
         if not isinstance(binding,str) or not re.fullmatch(r'[0-9a-f]{64}',binding):
@@ -628,6 +668,10 @@ class PendingBubbleStore:
             return False
         with self._lock,self._connect() as connection:
             return connection.execute('SELECT 1 FROM transport_withdrawals_v1 WHERE account_key=? AND chat_key=? AND binding=?',(*self._keys(account_id,chat_id),binding)).fetchone() is not None
+
+    def record_suppressed(self, account_id, chat_id, client_id, binding):
+        with self._lock, self._connect() as connection:
+            self._record_receipt(connection, account_id, chat_id, client_id, binding, 'withdrawn')
 
     def withdraw_pending(self, account_id, chat_id, binding):
         keys = self._keys(account_id,chat_id)
@@ -1179,7 +1223,12 @@ def patch_gateway_runner(runner: Any) -> bool:
     if callable(original_run):
         @functools.wraps(original_run)
         async def wrapped_run(*args: Any, **kwargs: Any):
-            runner_self = args[0] if args else None
+            # original_run is already bound to runner. args[0] is the message,
+            # never self. Bind its actual signature for keyword/positional calls.
+            try:
+                call = inspect.signature(original_run).bind_partial(*args, **kwargs).arguments
+            except (TypeError, ValueError):
+                call = kwargs
             source = kwargs.get("source")
             if source is None:
                 source = next(
@@ -1189,7 +1238,7 @@ def patch_gateway_runner(runner: Any) -> bool:
             platform_obj = getattr(source, "platform", "")
             platform = str(getattr(platform_obj, "value", platform_obj) or "").lower()
             if platform == "weixin":
-                _refresh_context_fill_from_cached_agent(runner_self, source)
+                _refresh_context_fill_from_cached_agent(runner, source, call.get("session_key"))
             result = await original_run(*args, **kwargs)
             if platform == "weixin" and isinstance(result, dict):
                 chat_id = str(getattr(source, "chat_id", "") or "")
@@ -1429,7 +1478,7 @@ def patch_adapter(adapter: Any) -> bool:
                     retry_deadlines[key] = loop.time() + delay
                     await asyncio.sleep(delay)
                     account_id = str(getattr(_self, "_account_id", ""))
-                    if not queue.count(account_id, key):
+                    if not await asyncio.to_thread(queue.count, account_id, key):
                         return
                     result = await drain_pending(_self, key)
                     if bool(result.get("ok")) or not int(result.get("pending", 0)):
@@ -1505,9 +1554,8 @@ def patch_adapter(adapter: Any) -> bool:
         async with lock:
             account_id = str(getattr(_self, "_account_id", ""))
             binding = _owned_transport_binding(_self,chat_id)
-            if queue.withdrawal_requested(account_id,str(chat_id),binding):
-                with queue._connect() as connection:
-                    queue._record_receipt(connection,account_id,str(chat_id),client_id,binding,'withdrawn')
+            if await asyncio.to_thread(queue.withdrawal_requested, account_id, str(chat_id), binding):
+                await asyncio.to_thread(queue.record_suppressed, account_id, str(chat_id), client_id, binding)
                 return
             model = _safe_model(_ACTIVE_MODEL.get())
             # The sqlite queue and counter stores do blocking disk I/O; keep it
@@ -1650,8 +1698,8 @@ def patch_adapter(adapter: Any) -> bool:
                 item = await asyncio.to_thread(queue.peek, account_id, str(chat_id))
                 if not item:
                     break
-                if queue.withdrawal_requested(account_id,str(chat_id),item.get('transport_binding')):
-                    queue.withdraw_pending(account_id,str(chat_id),item['transport_binding'])
+                if await asyncio.to_thread(queue.withdrawal_requested, account_id, str(chat_id), item.get('transport_binding')):
+                    await asyncio.to_thread(queue.withdraw_pending, account_id, str(chat_id), item['transport_binding'])
                     continue
                 context_token = _self._token_store.get(account_id, str(chat_id))
                 count, generation = await asyncio.to_thread(
@@ -1689,6 +1737,19 @@ def patch_adapter(adapter: Any) -> bool:
                 sent += 1
         return {"ok": True, "sent": sent, "pending": 0}
 
+    async def recover_pending(_self: Any):
+        account_id = str(getattr(_self, '_account_id', ''))
+        prefix = account_id + ':'
+        cache = getattr(_self._token_store, '_cache', {})
+        candidates = tuple(key[len(prefix):] for key in cache
+                           if isinstance(key, str) and key.startswith(prefix)) if isinstance(cache, dict) else ()
+        routes, unresolved = await asyncio.to_thread(queue.recover_routes, account_id, candidates)
+        for chat in routes:
+            schedule_retry(_self, chat, 'startup recovery')
+        if unresolved:
+            logger.error('Hermes WeChat Enhance: %d legacy pending route(s) unresolved; preserving rows, explicit route reconciliation required', unresolved)
+        return {'scheduled_routes': len(routes), 'unresolved_routes': unresolved}
+
     async def withdraw_binding(_self: Any, chat_id: str, binding: str):
         """Host-controlled withdrawal; caller must authorize it independently.
 
@@ -1696,10 +1757,10 @@ def patch_adapter(adapter: Any) -> bool:
         the deny. An already in-flight physical send is never cancelled/recalled.
         """
         account_id = str(getattr(_self,'_account_id',''))
-        queue.request_withdrawal(account_id,str(chat_id),binding)
+        await asyncio.to_thread(queue.request_withdrawal, account_id, str(chat_id), binding)
         lock = locks.setdefault(str(chat_id),asyncio.Lock())
         async with lock:
-            removed = queue.withdraw_pending(account_id,str(chat_id),binding)
+            removed = await asyncio.to_thread(queue.withdraw_pending, account_id, str(chat_id), binding)
         return {'removed_count':removed,'observation_available':queue.receipts_available,
                 'already_sent_possible':True,'external_recall_proven':False}
 
@@ -1779,6 +1840,7 @@ def patch_adapter(adapter: Any) -> bool:
         adapter._send_file = MethodType(send_file, adapter)
     adapter.send = MethodType(send, adapter)
     adapter._drain_pending = MethodType(drain_pending, adapter)
+    adapter._hermes_wechat_recover_pending = MethodType(recover_pending, adapter)
     adapter._process_message = MethodType(process_message, adapter)
     adapter._hermes_wechat_v021_pending_queue = queue
     adapter._hermes_transport_receipts_v1 = queue
@@ -1838,6 +1900,9 @@ async def install_v021_bubble_footer_hook(
                 installed += 1
             else:
                 already += 1
+            recovery = await adapter._hermes_wechat_recover_pending()
+            if recovery['unresolved_routes']:
+                errors.append('legacy pending routes require explicit reconciliation')
             # The exemption is part of the live v0.21 startup contract, not a
             # standalone test utility.  Install it after the footer wrapper so
             # its task-local content-key scope reaches the official core

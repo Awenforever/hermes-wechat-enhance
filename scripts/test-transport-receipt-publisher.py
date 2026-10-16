@@ -77,6 +77,13 @@ async def main(root, adapter_type=fixtures.FakeAdapter):
     assert ledger.count(adapter._account_id, 'peer') == 0
     await adapter._drain_pending('peer')
     assert len(adapter.sent) == physical + 1
+    # v3.3.3 schedules an autonomous probe even for the synthetic permanent
+    # failure. Manual drain empties the queue but its sleeping probe may remain
+    # until the deadline. Own and close these test tasks, not the runtime loop.
+    tasks = list(adapter._hermes_wechat_v021_retry_tasks.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
     assert not adapter._hermes_wechat_v021_retry_tasks
     assert PendingBubbleStore(root/'fresh-ledger.sqlite3').publisher_epoch != ledger.publisher_epoch
 

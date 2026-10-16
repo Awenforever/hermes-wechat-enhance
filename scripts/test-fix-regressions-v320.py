@@ -225,7 +225,9 @@ set_fill(CHAT, 55_000, 1_000_000)
 prev = M._CONTEXT_FILL[CHAT][0]
 runner_neg = _Runner({SKEY: (_Agent(-1, 1_000_000), "sig")})
 M._refresh_context_fill_from_cached_agent(runner_neg, _Src(CHAT, SKEY))
-check("-1 sentinel ignored, snapshot unchanged", M._CONTEXT_FILL[CHAT][0] == prev)
+check("-1 sentinel invalidates obsolete snapshot", CHAT not in M._CONTEXT_FILL)
+check("invalidated snapshot not resurrected from persistence", M.context_bar(CHAT) == "")
+set_fill(CHAT, prev, 1_000_000)
 
 # Zero / missing compressor / missing cache / missing session_key: no crash, no change.
 runner_zero = _Runner({SKEY: (_Agent(0, 1_000_000), "sig")})
@@ -259,9 +261,9 @@ check("non-tuple cache entry handled (uses entry itself)", M._CONTEXT_FILL[CHAT]
 
 src_pg = " ".join(inspect.getsource(M.patch_gateway_runner).split())
 check("turn-start refresh invoked in wrapped_run",
-      "_refresh_context_fill_from_cached_agent(runner_self, source)" in src_pg)
+      "_refresh_context_fill_from_cached_agent(runner, source, call.get(\"session_key\"))" in src_pg)
 check("turn-start refresh precedes original_run",
-      src_pg.index("_refresh_context_fill_from_cached_agent(runner_self, source)")
+      src_pg.index("_refresh_context_fill_from_cached_agent(runner, source, call.get(\"session_key\"))")
       < src_pg.index("result = await original_run(*args, **kwargs)"))
 check("end-of-turn authoritative remember retained",
       src_pg.count("_remember_context_fill(") == 1

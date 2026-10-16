@@ -66,7 +66,9 @@ integrity proof and no Alive result ingestion. Do not promote these records into
 canonical delivery or learning outcomes, or remove Alive's direct-observer guard.
 Next add qualified publisher/source identity, bounded consumer reconciliation and
 explicit ambiguous/finality coverage, then end-to-end autonomous feedback and
-longitudinal verification. Enhance final release/acceptance remains after Alive.
+longitudinal verification. The user's 2026-10-16 direction advances Enhance
+integration/closure separately from Alive. This supersedes the previous
+scheduling constraint, not unproven end-to-end Alive acceptance requirements.
 
 Evidence: Windows fake transport tests cover migration/reopen, two distinct
 bindings sharing one FIFO, cross-task drain, route isolation, pagination, replay,

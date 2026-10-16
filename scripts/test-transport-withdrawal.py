@@ -53,7 +53,15 @@ async def test(root,inflight=False,core=None):
         draining = asyncio.create_task(adapter._drain_pending('peer'))
         await entered.wait()
         cancelling = asyncio.create_task(adapter._hermes_transport_withdraw_binding_v1('peer',a))
-        await asyncio.sleep(0)
+        # Durable storage is offloaded; a scheduler yield is not proof that its
+        # transaction committed. Wait for the explicit durable observation.
+        deadline = asyncio.get_running_loop().time() + 3
+        while not queue.withdrawal_requested(adapter._account_id,'peer',a):
+            if cancelling.done():
+                await cancelling
+                raise AssertionError('withdrawal finished without durable deny')
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.001)
         assert queue.withdrawal_requested(adapter._account_id,'peer',a)
         release.set()
         await draining
@@ -74,6 +82,10 @@ async def test(root,inflight=False,core=None):
     assert result['already_sent_possible'] and not result['external_recall_proven']
     assert (await adapter._hermes_transport_withdraw_binding_v1('peer',a))['removed_count']==0
     assert queue.count(adapter._account_id,'peer')==0
+    tasks = list(adapter._hermes_wechat_v021_retry_tasks.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
     assert not adapter._hermes_wechat_v021_retry_tasks
 
 
