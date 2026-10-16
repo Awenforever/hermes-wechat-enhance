@@ -24,8 +24,9 @@ Hermes WeChat Enhance 是 Hermes 的微信通道增强插件。它为每个真�
 | 能力 | 能得到什么 |
 |---|---|
 | **真实模型尾注** | 模型正文显示实际路由或 fallback 模型；Hermes 控制消息显示 `hermes`。 |
-| **确认后才计数** | 文本、图片和文件等每个实际送达的气泡都占一个序号；媒体本身不加尾注，后续文本会体现正确计数，失败发送不占号。 |
+| **确认后才计数** | 文本、图片和文件等每个传输确认成功的气泡都占一个序号；媒体本身不加尾注，后续文本会体现正确计数，失败发送不占号。 |
 | **多气泡一致归因** | 长回复拆成多个气泡后，每个气泡都保留正确模型名称并独立计数。 |
+| **上下文用量条** | 尾注用 8 格展示最近有效的上下文用量；压缩后尚无新读数时不冒用旧值。 |
 | **持久 FIFO 恢复** | 发送失败的气泡跨重启保存，恢复时永远排在新回复之前。 |
 | **自动刷新 Context Token** | 每一条微信入站消息都会在去重前刷新回复窗口。 |
 | **静默 `/continue`** | 手动刷新 Token 并恢复积压，但不会进入 Hermes 对话上下文。 |
@@ -59,8 +60,8 @@ FIFO，再把原生引用和行首 `@` 命令交给已安装的消费者；未�
 
 - Hermes `>=0.21.3,<0.22`
 - Hermes 中已有可用的 Weixin 通道
-- Python 3.11+
-- Linux、WSL2 或基于 Linux 的 Docker / NAS 环境
+- 使用当前 Hermes 要求的 Python 运行时，不单独降级解释器
+- Windows 原生、Linux、WSL2 或基于 Linux 的 Docker / NAS 环境
 
 ## 快速安装
 
@@ -133,7 +134,9 @@ HERMES_HOME/
 ```
 
 计数状态只保存不可逆摘要，不保存原始 Context Token 或会话 ID。审计记录可能包含
-聊天正文，应像聊天备份一样保护。Docker 环境必须把 `HERMES_HOME` 放在持久卷中。
+聊天正文，FIFO 包含待发送正文和用于重启恢复的目标标识，引用缓存包含已发消息映射，
+应像聊天备份一样保护。传输确认不代表对方已读。Docker 环境必须把 `HERMES_HOME`
+放在持久卷中。
 
 ## 故障排查
 
@@ -153,6 +156,9 @@ Gateway。模型正文应显示实际模型；控制消息显示 `hermes` 是正
 
 发送任意一条新微信消息，或者发送 `/continue` 静默恢复。如果仍失败，应先检查
 微信通道和网络，不要直接清空队列。
+
+队列平时会自动退避重试，不需要靠 `/continue` 才能运行。升级前的旧队列若缺失
+可验证的目标映射，会保留并报告需要恢复路由；不要把它们改发到最近一个会话。
 </details>
 
 <details><summary><strong>容器重建后丢失配对或状态</strong></summary>
@@ -174,7 +180,7 @@ hermes plugins remove hermes-wechat-enhance
 
 - [`SKILL.md`](SKILL.md)：自动安装与交互契约
 - [`docs/PERSISTENCE_CONTRACT.md`](docs/PERSISTENCE_CONTRACT.md)：数据归属和重建规则
-- [`docs/MAINTAINER_REFERENCE.md`](docs/MAINTAINER_REFERENCE.md)：遗留版本与维护者参考
+- [`docs/DEVELOPMENT_MEMORANDUM.md`](docs/DEVELOPMENT_MEMORANDUM.md)：维护者内部备忘
 
 历史故障、实现细节和不可回归约束刻意不写进面向用户的 README。
 

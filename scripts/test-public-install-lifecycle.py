@@ -13,7 +13,18 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--core', type=Path, required=True)
 parser.add_argument('--public-clone', type=Path, required=True)
 parser.add_argument('--revision', required=True)
+parser.add_argument('--workspace', type=Path, help=argparse.SUPPRESS)
 args = parser.parse_args()
+
+if args.workspace is None:
+    # Core's PM holds process-lifetime generation leases. On Windows, cleanup
+    # must happen after that owning process exits and its atexit releases run.
+    # Do not delete leases, suppress cleanup errors or mutate Core to pass.
+    with tempfile.TemporaryDirectory(prefix='enhance-public-lifecycle-') as raw:
+        subprocess.run([sys.executable, '-B', str(Path(__file__).resolve()),
+                        *sys.argv[1:], '--workspace', raw], check=True, timeout=900)
+    print('PUBLIC_GIT_INSTALL_UPGRADE_UNINSTALL_REINSTALL_OK')
+    raise SystemExit(0)
 
 
 def invoke_hook(installed, action, env):
@@ -22,8 +33,8 @@ def invoke_hook(installed, action, env):
                    env=env, check=True, timeout=60)
 
 
-with tempfile.TemporaryDirectory(prefix='enhance-public-lifecycle-') as raw:
-    root = Path(raw)
+if args.workspace is not None:
+    root = args.workspace.resolve(strict=True)
     home = root/'profile'
     home.mkdir()
     os.environ.update(HOME=str(root), HERMES_HOME=str(home), PYTHONDONTWRITEBYTECODE='1')
@@ -73,4 +84,4 @@ with tempfile.TemporaryDirectory(prefix='enhance-public-lifecycle-') as raw:
     with closing(sqlite3.connect(database)) as db:
         assert db.execute('SELECT client_id,chunk,model FROM pending_bubbles').fetchone() == row
     # The installer/upgrade did not send, drain or drop the legacy obligation.
-    print('PUBLIC_GIT_INSTALL_UPGRADE_UNINSTALL_REINSTALL_OK')
+    print('PUBLIC_GIT_LIFECYCLE_WORKER_OK')
