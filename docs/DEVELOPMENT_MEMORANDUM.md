@@ -1,5 +1,30 @@
 # Hermes WeChat Enhance — Development Memorandum
 
+## 2026-10-16 — mixed-ownership hook lifecycle failure
+
+The approved NAS update was rolled back before activation after the old
+installer recursively removed the active hook and hit a foreign-owned cache.
+The previous source/hook were restored; no old business-state backup replaced
+new traffic. The restart authorization was consumed by recovery; another
+restart needs new consent. A temporary `.stage` under hooks was discoverable
+as another hook: quarantine it outside discovery, do not silently count
+`already=1` as proof that no duplicate handler loaded.
+
+3.4.1 fixes the lifecycle, not the NAS alone. Identical source leaves the
+active tree/caches untouched. Changed source stages under private hook-backups,
+renames the entire prior tree, activates a complete candidate, and restores
+prior code/config on failure. Uninstall also retires whole trees rather than
+recursively deleting active code. Old trees remain recoverable outside hook
+discovery; no recursive chown, privilege escalation or ignoring permission
+errors is required. Fixture tests prove cache preservation, no active rmtree,
+activation failure, metadata/config failure, rollback and external-hook restore.
+
+The earlier Windows CI failure at 45a7ede was a different test-lifetime issue:
+Core PM's process lease was still open while TempDirectory cleaned up. The
+test now lets its owning child exit before parent cleanup. Both Windows and
+Ubuntu public-install lifecycle jobs and main CI passed before the NAS attempt;
+this does not cover every possible pre-existing production ownership layout.
+
 ## 2026-10-16 — Qoder integration candidate (not production acceptance)
 
 The release integration branch descends from Qoder's v3.3.4 `f736dda`,

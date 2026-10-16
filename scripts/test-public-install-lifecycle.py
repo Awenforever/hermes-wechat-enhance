@@ -15,6 +15,9 @@ parser.add_argument('--public-clone', type=Path, required=True)
 parser.add_argument('--revision', required=True)
 parser.add_argument('--workspace', type=Path, help=argparse.SUPPRESS)
 args = parser.parse_args()
+expected_version = next(line.split(':', 1)[1].strip() for line in
+    (args.public_clone/'plugin.yaml').read_text(encoding='utf-8').splitlines()
+    if line.startswith('version:'))
 
 if args.workspace is None:
     # Core's PM holds process-lifetime generation leases. On Windows, cleanup
@@ -64,7 +67,7 @@ if args.workspace is not None:
     subprocess.run([sys.executable, '-B', '-c', code], env=env, check=True)
     installed, manifest, name = _install_plugin_core(origin, force=True,
         ref=args.revision, scan_decision_cb=lambda result: True)
-    assert manifest['version'] == '3.4.0'
+    assert manifest['version'] == expected_version
     invoke_hook(installed, '_install_hook', env)
     invoke_hook(installed, '_install_hook', env)
     database = data/'send-queue.sqlite3'
