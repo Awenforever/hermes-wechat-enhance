@@ -46,18 +46,59 @@ DRAIN_PROBE_DELAY_SECONDS = 45.0
 
 # Per-chat context-window fill captured from the turn result at the runner
 # boundary (``last_prompt_tokens`` / ``context_length``), rendered as a compact
-# horizontal progress bar in the bubble footer.  The bar uses only Block
-# Elements (U+2588 full, U+2591 empty, U+258F..U+2589 eighth partials): one
-# Unicode range so every cell is monospace-width-uniform in WeChat inline code
-# (the earlier 5-glyph pie mixed Geometric Shapes of differing widths and had
-# only 5 granularity steps).  8 cells x 8 eighths = 64 fill levels at a constant
-# 8-char width.  Set HERMES_WECHAT_FOOTER_CONTEXT_BAR=0 to disable.
+# horizontal progress bar in the bubble footer.  The bar uses Block Elements
+# for the filled part (U+2588 full, U+258F..U+2589 eighth partials) and plain
+# spaces for the unused part, with a single thinnest ``▏`` pinned at the 100%
+# end so the track's full extent is always visible; one Unicode range for the
+# fill keeps monospace glyph metrics uniform in WeChat inline code.  The fill
+# is persisted to ``context-fill.json`` so a gateway restart does not blank the
+# indicator until a turn re-warms it.  8 fill cells x 8 eighths = 64 levels at
+# a constant 9-char width (8 fill + 1 cap).  HERMES_WECHAT_FOOTER_CONTEXT_BAR=0
+# disables.
 _CONTEXT_FILL: Dict[str, tuple[int, int, float]] = {}
 _CONTEXT_FILL_LOCK = threading.RLock()
+_CONTEXT_FILL_LOADED = False
 CONTEXT_BAR_CELLS = 8
 CONTEXT_BAR_FULL = "█"
-CONTEXT_BAR_EMPTY = "░"
+CONTEXT_BAR_BLANK = " "
+CONTEXT_BAR_CAP = "▏"
 CONTEXT_BAR_PARTIALS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
+
+
+def _context_fill_path() -> Path:
+    root = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    return root / "plugin-data" / "hermes-wechat-enhance" / "context-fill.json"
+
+
+def _load_context_fill() -> None:
+    """Restore the last-known per-chat fill so restarts keep the bar visible."""
+    global _CONTEXT_FILL_LOADED
+    with _CONTEXT_FILL_LOCK:
+        if _CONTEXT_FILL_LOADED:
+            return
+        _CONTEXT_FILL_LOADED = True
+        try:
+            raw = json.loads(_context_fill_path().read_text(encoding="utf-8"))
+            cutoff = time.time() - TURN_MODEL_TTL_SECONDS
+            for chat, entry in (raw or {}).items():
+                used, limit, ts = (list(entry) + [0, 0, 0.0])[:3]
+                used, limit = int(used or 0), int(limit or 0)
+                if used > 0 and limit > 0 and float(ts or 0) >= cutoff:
+                    _CONTEXT_FILL[str(chat)] = (used, limit, float(ts))
+        except Exception:
+            pass
+
+
+def _save_context_fill() -> None:
+    try:
+        path = _context_fill_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _CONTEXT_FILL_LOCK:
+            snapshot = {k: list(v) for k, v in _CONTEXT_FILL.items()}
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
 
 
 def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> None:
@@ -71,6 +112,7 @@ def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> None:
     with _CONTEXT_FILL_LOCK:
         _CONTEXT_FILL[str(chat_id)] = (used_i, limit_i, time.time())
         _prune_context_fill()
+    _save_context_fill()
 
 
 def _prune_context_fill() -> None:
@@ -87,6 +129,7 @@ def context_bar(chat_id: str) -> str:
     )
     if env.strip().lower() in {"0", "false", "no", "off"}:
         return ""
+    _load_context_fill()
     with _CONTEXT_FILL_LOCK:
         entry = _CONTEXT_FILL.get(str(chat_id))
     if not entry:
@@ -100,8 +143,8 @@ def context_bar(chat_id: str) -> str:
         full += 1
         sub = 0
     partial = CONTEXT_BAR_PARTIALS[sub]
-    empty = CONTEXT_BAR_CELLS - full - (1 if sub else 0)
-    return CONTEXT_BAR_FULL * full + partial + CONTEXT_BAR_EMPTY * empty
+    blanks = CONTEXT_BAR_CELLS - full - (1 if partial else 0)
+    return CONTEXT_BAR_FULL * full + partial + CONTEXT_BAR_BLANK * blanks + CONTEXT_BAR_CAP
 
 
 def _decorate_footer(chunk: str, count: int, model: str, chat_id: str) -> str:

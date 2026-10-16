@@ -41,28 +41,37 @@ def check(label: str, condition: bool) -> None:
         print(f"  FAIL {label}")
 
 
+# Sandbox HERMES_HOME so persistence writes never touch the real profile.
+_SANDBOX = os.path.join(os.environ.get("TMPDIR", "/tmp"), "hwe-context-fill-test")
+os.makedirs(_SANDBOX, exist_ok=True)
+os.environ["HERMES_HOME"] = _SANDBOX
+
+
 def set_fill(chat: str, used: int, limit: int) -> None:
     M._CONTEXT_FILL.clear()
     M._remember_context_fill(chat, used, limit)
 
 
-print("== 1. context bar mapping (constant 8-char width) ==")
+print("== 1. context bar mapping (constant 9-char width: 8 fill + cap) ==")
 cases = [
-    (5, 100, "▍░░░░░░░"),
-    (6, 100, "▌░░░░░░░"),
-    (25, 100, "██░░░░░░"),
-    (50, 100, "████░░░░"),
-    (75, 100, "██████░░"),
-    (100, 100, "████████"),
+    (5, 100, "▍       ▏"),
+    (6, 100, "▌       ▏"),
+    (25, 100, "██      ▏"),
+    (50, 100, "████    ▏"),
+    (75, 100, "██████  ▏"),
+    (100, 100, "████████▏"),
 ]
 for used, limit, want in cases:
     set_fill("chatA", used, limit)
     got = M.context_bar("chatA")
-    check(f"ratio {used}/{limit} -> {want}", got == want)
-    check(f"ratio {used}/{limit} width==8", len(got) == M.CONTEXT_BAR_CELLS)
+    check(f"ratio {used}/{limit} -> {want!r}", got == want)
+    check(f"ratio {used}/{limit} width==9", len(got) == M.CONTEXT_BAR_CELLS + 1)
+    check(f"ratio {used}/{limit} unused is blank not ░", "░" not in got)
+    check(f"ratio {used}/{limit} ends with cap ▏", got.endswith(M.CONTEXT_BAR_CAP))
 set_fill("chatA", 0, 100)
 check("zero used = no API reading -> unknown", M.context_bar("chatA") == "")
 M._CONTEXT_FILL.clear()
+M._CONTEXT_FILL_LOADED = True
 check("unknown chat -> empty", M.context_bar("chatUnknown") == "")
 os.environ["HERMES_WECHAT_FOOTER_CONTEXT_BAR"] = "0"
 set_fill("chatA", 100, 100)
@@ -71,13 +80,21 @@ os.environ.pop("HERMES_WECHAT_FOOTER_CONTEXT_BAR", None)
 M._remember_context_fill("chatBad", 0, 0)
 check("zero/zero ignored", M.context_bar("chatBad") == "")
 
+print("== 1b. fill persists across a simulated restart ==")
+set_fill("chatP", 50, 100)
+check("persist file written", os.path.exists(M._context_fill_path()))
+M._CONTEXT_FILL.clear()
+M._CONTEXT_FILL_LOADED = False  # simulate fresh process / gateway restart
+check("after restart bar restored from disk", M.context_bar("chatP") == "████    ▏")
+
 print("== 2. footer decoration wraps bar in inline code ==")
 set_fill("chatB", 100, 100)
 decorated = M._decorate_footer("hello", 3, "deepseek-flash", "chatB")
 check("footer keeps count+model spans", "`3` `deepseek-flash`" in decorated)
-check("footer appends bar span", decorated.endswith("`████████`"))
+check("footer appends bar span", decorated.endswith("`████████▏`"))
 check("footer separator preserved", "\n\n---\n\n" in decorated)
 M._CONTEXT_FILL.clear()
+M._CONTEXT_FILL_LOADED = True
 decorated_none = M._decorate_footer("hello", 3, "deepseek-flash", "chatB")
 check("no bar when unknown -> unchanged footer", decorated_none.endswith("`deepseek-flash`"))
 
