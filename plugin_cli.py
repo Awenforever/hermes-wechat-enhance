@@ -245,14 +245,14 @@ def _install_hook() -> int:
         busy_input_mode = _ensure_queue_mode(previous)
         config_after = config_path.read_bytes() if config_path.is_file() else None
         _write_manifest({
-        "schema_version": 1,
-        "owner": "hermes-wechat-enhance",
-        "installed": True,
-        "hook": str(target),
-        "installed_hash": installed_hash,
-        "original_backup": backup,
-        "busy_input_mode": busy_input_mode,
-        "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "schema_version": 1,
+            "owner": "hermes-wechat-enhance",
+            "installed": True,
+            "hook": str(target),
+            "installed_hash": installed_hash,
+            "original_backup": backup,
+            "busy_input_mode": busy_input_mode,
+            "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
     except BaseException:
         if activated and target.exists():
@@ -313,11 +313,11 @@ def _uninstall_hook() -> int:
         config_restore = _restore_queue_mode(manifest.get("busy_input_mode"))
         config_after = config_path.read_bytes() if config_path.is_file() else None
         manifest.update({
-        "installed": False,
-        "installed_hash": None,
-        "original_backup": None,
-        "last_uninstalled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "busy_input_mode_restore": config_restore,
+            "installed": False,
+            "installed_hash": None,
+            "original_backup": None,
+            "last_uninstalled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "busy_input_mode_restore": config_restore,
         })
         _write_manifest(manifest)
     except BaseException:
