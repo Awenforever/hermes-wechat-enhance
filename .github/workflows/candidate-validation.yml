@@ -330,7 +330,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           repository: NousResearch/hermes-agent
-          ref: 345cd2b057a452236de401d3534b8502a7465e8d
+          ref: 1badde9053f80643d97834a9114ad4a7971e2996
           path: upstream-hermes
           persist-credentials: false
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
@@ -346,3 +346,28 @@ jobs:
         run: |
           mkdir -p "$HOME" "$HERMES_HOME"
           python -B scripts/run-regressions.py --hermes-root "$GITHUB_WORKSPACE/upstream-hermes"
+
+  public-install-lifecycle:
+    name: Public Git install and retained-state lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 1badde9053f80643d97834a9114ad4a7971e2996
+          path: upstream-hermes
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -e ./upstream-hermes
+      - name: Actual installer, upgrade, uninstall and reinstall (no Gateway)
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python -B scripts/test-public-install-lifecycle.py --core "$GITHUB_WORKSPACE/upstream-hermes" --public-clone "$GITHUB_WORKSPACE" --revision "$(git rev-parse HEAD)"
