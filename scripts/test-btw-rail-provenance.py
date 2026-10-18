@@ -80,6 +80,20 @@ async def main():
     await asyncio.sleep(0.05)
     assert sent2 == ["hermes"], f"failed side question must fail closed to hermes, got {sent2}"
 
+    # Instance-shadow case: patch_gateway_runner sets the resolver on the runner
+    # INSTANCE, which shadows the class wrapper.  The /btw scope must still win.
+    sent3 = []
+    answer3 = SimpleNamespace(answer_side_question=lambda q, h: "shadowed answer")
+    runner3 = FakeSlash(sent3, answer3)
+    base_resolve = runner3._resolve_session_agent_runtime
+    runner3._resolve_session_agent_runtime = lambda **kw: base_resolve(**kw)
+    assert v.patch_side_question_provenance(
+        slash_cls=FakeSlash, turn_cls=FakeTurn, answer_module=answer3, runner=runner3
+    ) is True
+    assert await runner3._handle_btw_command(None) == "started"
+    await asyncio.sleep(0.05)
+    assert sent3 == ["deepseek-flash"], f"instance shadow lost provenance: {sent3}"
+
     print("BTW_RAIL_PROVENANCE_OK")
 
 

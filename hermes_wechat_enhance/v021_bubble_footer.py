@@ -81,8 +81,14 @@ def patch_side_question_provenance(
     slash_cls: Any = None,
     turn_cls: Any = None,
     answer_module: Any = None,
+    runner: Any = None,
 ) -> bool:
-    """Bind the /btw side-question model to its background send rail."""
+    """Bind the /btw side-question model to its background send rail.
+
+    patch_gateway_runner installs _resolve_session_agent_runtime as an INSTANCE
+    attribute, which shadows a class-level wrapper.  Wrap that instance
+    attribute too, or the /btw scope never records a model.
+    """
     if slash_cls is None or turn_cls is None:
         try:
             from gateway.slash_commands import GatewaySlashCommandsMixin as slash_cls
@@ -141,6 +147,19 @@ def patch_side_question_provenance(
 
             answer_module._hermes_wechat_btw_answer_original = original_answer
             answer_module.answer_side_question = _answer_side_question
+
+    if runner is not None and callable(runner.__dict__.get("_resolve_session_agent_runtime")):
+        instance_resolve = runner.__dict__["_resolve_session_agent_runtime"]
+
+        @functools.wraps(instance_resolve)
+        def _instance_resolve(*args, **kwargs):
+            model, runtime = instance_resolve(*args, **kwargs)
+            token = _BTW_RAIL_TOKEN.get()
+            if token:
+                _btw_model_set(token, str(model or ""))
+            return model, runtime
+
+        runner._resolve_session_agent_runtime = _instance_resolve
     return True
 
 
@@ -2143,7 +2162,7 @@ async def install_v021_bubble_footer_hook(
     from hermes_wechat_enhance.lifecycle import patch_core_weixin_startup_notifications
 
     startup_owner_installed = patch_core_weixin_startup_notifications(runner)
-    side_question_provenance_installed = patch_side_question_provenance()
+    side_question_provenance_installed = patch_side_question_provenance(runner=runner)
     background_task_provenance_installed = patch_background_task_provenance()
 
     from hermes_wechat_enhance.slash_command_dedup import patch_weixin_adapter
