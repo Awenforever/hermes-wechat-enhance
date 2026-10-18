@@ -1,5 +1,16 @@
 # Hermes WeChat Enhance — Development Memorandum
 
+## 2026-10-18 — /bg background-task model provenance (I1.T1.3)
+
+The /bg delivery rail sends the background agent's final text with reply-only
+metadata, so its footer also fell closed to hermes. patch_background_task_provenance
+scopes the background task and binds the model only after a completed run that
+produced a final response and did not fail; failed or empty runs stay hermes.
+
+The model is the agent's resolved model; a provider fallback inside the run is
+not observable here either. Regression: scripts/test-bg-rail-provenance.py
+(success, failed, empty) is red on 3.4.2 and green now.
+
 ## 2026-10-18 — /btw side-question model provenance (I1.T1.2)
 
 Core sends the model-authored /btw answer with reply-only metadata

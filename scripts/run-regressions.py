@@ -21,6 +21,7 @@ PURE = (
     'test-restart-drain.py',
     'test-hook-transaction.py',
     'test-btw-rail-provenance.py',
+    'test-bg-rail-provenance.py',
 )
 NATIVE = ('test-v021-native-contract.py', 'test-v021-real-adapter.py',
           'test-fix-regressions-q1q2q5.py', 'test-fix-regressions-v320.py',

@@ -48,6 +48,9 @@ _BTW_RAIL_TOKEN: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 _BTW_MODEL_BY_TOKEN: Dict[str, str] = {}
 _BTW_MODEL_LOCK = threading.Lock()
 _BTW_MODEL_MAX_ENTRIES = 32
+_BG_RAIL_TOKEN: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "hermes_wechat_bg_rail_token", default=None
+)
 
 
 def _btw_model_set(token: str, model: str) -> None:
@@ -138,6 +141,52 @@ def patch_side_question_provenance(
 
             answer_module._hermes_wechat_btw_answer_original = original_answer
             answer_module.answer_side_question = _answer_side_question
+    return True
+
+
+def patch_background_task_provenance(*, turn_cls: Any = None, agent_cls: Any = None) -> bool:
+    """Bind the completed /bg run's model to its delivery rail."""
+    if turn_cls is None:
+        try:
+            from gateway.run_turn import GatewayTurnMixin as turn_cls
+        except Exception as exc:
+            logger.error("Hermes WeChat Enhance: /bg turn patch unavailable: %s", exc)
+            return False
+    if agent_cls is None:
+        try:
+            from run_agent import AIAgent as agent_cls
+        except Exception as exc:
+            logger.error("Hermes WeChat Enhance: /bg agent class unavailable: %s", exc)
+            return False
+    if getattr(turn_cls, "_hermes_wechat_bg_originals", None) is not None:
+        return True
+    original_task = getattr(turn_cls, "_run_background_task_inner", None)
+    original_run = getattr(agent_cls, "run_conversation", None)
+    if not callable(original_task) or not callable(original_run):
+        return False
+
+    @functools.wraps(original_task)
+    async def _run_background_task_inner(self, *args, **kwargs):
+        token = secrets.token_hex(8)
+        scope_token = _BG_RAIL_TOKEN.set(token)
+        try:
+            return await original_task(self, *args, **kwargs)
+        finally:
+            _BG_RAIL_TOKEN.reset(scope_token)
+
+    @functools.wraps(original_run)
+    def _run_conversation(self, *args, **kwargs):
+        result = original_run(self, *args, **kwargs)
+        token = _BG_RAIL_TOKEN.get()
+        if token and isinstance(result, dict):
+            final = str(result.get("final_response") or "")
+            if final and not result.get("failed"):
+                _btw_model_set(token, str(getattr(self, "model", "") or ""))
+        return result
+
+    turn_cls._run_background_task_inner = _run_background_task_inner
+    agent_cls.run_conversation = _run_conversation
+    turn_cls._hermes_wechat_bg_originals = {"task": original_task, "run": original_run}
     return True
 
 
@@ -1193,11 +1242,11 @@ def _resolve_model(
     )
     if explicit:
         return _safe_model(explicit), False
-    btw_token = _BTW_RAIL_TOKEN.get()
-    if btw_token:
-        btw_model = _btw_model_get(btw_token)
-        if btw_model:
-            return _safe_model(btw_model), False
+    rail_token = _BTW_RAIL_TOKEN.get() or _BG_RAIL_TOKEN.get()
+    if rail_token:
+        rail_model = _btw_model_get(rail_token)
+        if rail_model:
+            return _safe_model(rail_model), False
     # Hermes' stream consumer has one exceptional fallback rail for text that
     # precedes an approval/clarification prompt.  That rail calls adapter.send
     # without forwarding the consumer metadata.  patch_stream_consumer scopes
@@ -2095,6 +2144,7 @@ async def install_v021_bubble_footer_hook(
 
     startup_owner_installed = patch_core_weixin_startup_notifications(runner)
     side_question_provenance_installed = patch_side_question_provenance()
+    background_task_provenance_installed = patch_background_task_provenance()
 
     from hermes_wechat_enhance.slash_command_dedup import patch_weixin_adapter
 
