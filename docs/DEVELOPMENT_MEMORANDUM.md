@@ -1,5 +1,14 @@
 # Hermes WeChat Enhance — Development Memorandum
 
+## 2026-10-18 — /btw provenance shadowed by the instance resolver (I1.E3)
+
+3.4.3 shipped the /btw scope but the production footer still said hermes.
+patch_gateway_runner replaces runner._resolve_session_agent_runtime with an
+INSTANCE attribute; a class-level wrapper never runs for that runner, so the
+side-question scope never learned the model. The scope now also wraps the
+instance attribute when a runner is supplied. Regression extends
+test-btw-rail-provenance.py with an instance-shadow case.
+
 ## 2026-10-18 — /bg background-task model provenance (I1.T1.3)
 
 The /bg delivery rail sends the background agent's final text with reply-only
