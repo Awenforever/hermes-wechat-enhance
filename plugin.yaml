@@ -7,7 +7,7 @@ author: Awenforever
 license: MIT
 homepage: https://github.com/Awenforever/hermes-wechat-enhance
 tags: [gateway, weixin, operations, audit]
-requires_hermes: ">=0.21.3,<0.22"
+requires_hermes: ">=0.22,<0.23"
 config_schema:
   capture_messages:
     type: bool
