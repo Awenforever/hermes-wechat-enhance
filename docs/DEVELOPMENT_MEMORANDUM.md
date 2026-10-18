@@ -1,5 +1,38 @@
 # Hermes WeChat Enhance — Development Memorandum
 
+## 2026-10-18 — /bg background-task model provenance (I1.T1.3)
+
+The /bg delivery rail sends the background agent's final text with reply-only
+metadata, so its footer also fell closed to hermes. patch_background_task_provenance
+scopes the background task and binds the model only after a completed run that
+produced a final response and did not fail; failed or empty runs stay hermes.
+
+The model is the agent's resolved model; a provider fallback inside the run is
+not observable here either. Regression: scripts/test-bg-rail-provenance.py
+(success, failed, empty) is red on 3.4.2 and green now.
+
+## 2026-10-18 — /btw side-question model provenance (I1.T1.2)
+
+Core sends the model-authored /btw answer with reply-only metadata
+(gateway/slash_commands.py:_handle_btw_command), so the footer failed closed to
+hermes. 3.4.2 covered the TurnRunner/stream rails only; this rail is outside
+that provenance boundary.
+
+Fix: patch_side_question_provenance scopes the resolved session model to the
+exact side-question task (context-token keyed), records it from
+_resolve_session_agent_runtime, and drops it when answer generation raises so
+failure/control text never borrows a model label. No text classification and no
+chat-wide inference.
+
+Residual: the scoped value is the session-resolved (requested) model. A provider
+fallback inside the fork/one-shot call is not observable from the plugin today,
+so this rail can still name the requested model after a fallback. True
+post-fallback attribution needs Core provenance (proposal I1.T1-P1).
+
+Regression: scripts/test-btw-rail-provenance.py is red on 3.4.2 (hermes) and
+green with the patch; it also asserts failed generation fails closed. Suite is
+now 16 contracts.
+
 ## 2026-10-16 — final result precedes agent:end when follow-ups are queued
 
 Production3.4.1 physically sent a genuine model final with a `hermes` footer.
