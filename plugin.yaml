@@ -1,5 +1,5 @@
 name: hermes-wechat-enhance
-version: 3.4.5
+version: 3.4.4
 manifest_version: 1
 api_version: 1
 description: Reliable Weixin delivery, durable FIFO resume, acknowledged text/media bubble counters, model tags, context-fill bar, audit, and migration support.
@@ -7,7 +7,7 @@ author: Awenforever
 license: MIT
 homepage: https://github.com/Awenforever/hermes-wechat-enhance
 tags: [gateway, weixin, operations, audit]
-requires_hermes: ">=0.22,<0.23"
+requires_hermes: ">=0.21.3,<0.22"
 config_schema:
   capture_messages:
     type: bool
