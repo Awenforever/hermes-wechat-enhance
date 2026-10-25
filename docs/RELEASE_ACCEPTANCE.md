@@ -11,8 +11,9 @@ Gateway restart are done, and T4 passes through Gateway boot on Windows 11
 native. The queue-driven FIFO redesign (`afe4dd7`, docs `ce418de`) was deployed
 to production on 2026-10-25 18:12 +08 and the Gateway restarted under it
 (pid 2648379); boot checks pass and the queue is empty. A real user-triggered
-Weixin round trip completed on 2026-10-25 18:29 +08 after an authorized Gateway
-restart recovered a wedged send session; details in §12.7.
+Weixin round trip completed on 2026-10-25: an authorized restart recovered a
+wedged send session at 18:29 +08, and a fresh round trip at 18:33 +08 completed
+without intervention; details in §12.7.
 
 This record follows `PLUGIN_TEST_CONTRACT.md` and the release gate in
 `SKILL.md`. It supplements, but never replaces, `scripts/verify-self-install.py`
@@ -418,6 +419,10 @@ removes a row; no separate retry task may be the sole owner of that wakeup.
   the shutdown notice, and the new startup-ready notice; the user received the
   replies. Poll traffic (`getupdates`) kept working through the same interval,
   isolating the fault to the send session rather than DNS or host egress.
+- Post-recovery confirmation: a further user message at 18:32:50 +08 was
+  answered at 18:33:58 with no FIFO row and no send failure (`pending=0`,
+  `errors=[]`); the user confirmed receipt. A user-triggered round trip now
+  completes end to end without operator intervention.
 - Residual risk (Core-level): after a connection blip,
   `WeixinAdapter._send_session` can stay unusable until the process restarts;
   Core only recycles `_poll_session` on its failure streak. The plugin FIFO
