@@ -322,3 +322,14 @@ Findings:
 - Still open: real Weixin delivery run, production deployment of `31309e2` with
   backlog drain, and the branch push/PR. 3.4.4 stays at "partial acceptance"
   until the first two run.
+
+### 12.6 Drained by an inbound message — 2026-10-25 15:49 +08
+
+A user-sent `/continue` in the affected chat refreshed the context token
+(`/opt/data/weixin/accounts/…context-tokens.json` mtime 15:49:18) and the
+plugin drained locally: `sent=4 pending=0 ok=True`. The FIFO queue is empty.
+This confirms the drain path revives on inbound (`process_message` →
+`drain_pending`) and that the outage was a dead worker plus no inbound, not a
+permanently invalid token. The `31309e2` overflow fix was **not** deployed for
+this recovery; it remains preventive work, and no session-side production write
+was made.
