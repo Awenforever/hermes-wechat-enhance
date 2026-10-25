@@ -114,6 +114,7 @@ check("0.01s cooldown >= its own remaining", d_short is not None and d_short >= 
 d_long = M._transient_retry_delay(None, rate_err, 1)
 check("30s cooldown resumes at ~30s, not backoff", d_long is not None and 30.0 <= d_long <= 30.5)
 check("no-cooldown transient keeps exponential floor", M._transient_retry_delay(None, connect_err, 1) == 2.0)
+check("huge attempt count does not overflow backoff", M._transient_retry_delay(None, connect_err, 1_000_000) == 120.0)
 
 print("== 4. drain guarantee probes even for unclassified errors ==")
 check("probe delay for permanent at attempt 1", M._drain_delay(None, permanent, 1) == M.DRAIN_PROBE_DELAY_SECONDS)

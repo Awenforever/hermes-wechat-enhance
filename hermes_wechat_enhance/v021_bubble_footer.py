@@ -634,7 +634,10 @@ def _transient_retry_delay(adapter: Any, error: Any, attempt: int) -> Optional[f
         # when it expires.  Stacking the exponential floor on top made a
         # 0.01s cooldown wait ~2s, so a silent /continue looked dead.
         return remaining + COOLDOWN_RESUME_JITTER_SECONDS
-    backoff = min(120.0, 2.0 * (2 ** max(0, int(attempt) - 1)))
+    # Cap the exponent before the float conversion: 2 ** 1273 raises
+    # OverflowError and killed the retry worker, stranding the whole backlog.
+    exponent = min(max(0, int(attempt) - 1), 10)
+    backoff = min(120.0, 2.0 * (2 ** exponent))
     return max(0.05, backoff)
 
 
