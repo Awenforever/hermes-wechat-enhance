@@ -19,6 +19,7 @@ PURE = (
     'test-v021-bubble-footer.py', 'test-transport-receipt-publisher.py',
     'test-transport-withdrawal.py',
     'test-restart-drain.py',
+    'test-fifo-backlog-invariant.py',
     'test-hook-transaction.py',
     'test-btw-rail-provenance.py',
     'test-bg-rail-provenance.py',

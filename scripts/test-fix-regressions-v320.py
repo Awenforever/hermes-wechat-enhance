@@ -114,12 +114,24 @@ check("0.01s cooldown >= its own remaining", d_short is not None and d_short >= 
 d_long = M._transient_retry_delay(None, rate_err, 1)
 check("30s cooldown resumes at ~30s, not backoff", d_long is not None and 30.0 <= d_long <= 30.5)
 check("no-cooldown transient keeps exponential floor", M._transient_retry_delay(None, connect_err, 1) == 2.0)
+check("huge attempt count does not overflow backoff",
+      M._transient_retry_delay(None, connect_err, 1_000_000) == M.DRAIN_BACKOFF_CEILING_SECONDS)
+check("backoff ceiling is 60s", M.DRAIN_BACKOFF_CEILING_SECONDS == 60.0)
 
-print("== 4. drain guarantee probes even for unclassified errors ==")
-check("probe delay for permanent at attempt 1", M._drain_delay(None, permanent, 1) == M.DRAIN_PROBE_DELAY_SECONDS)
-check("probe delay within cap", M._drain_delay(None, permanent, M.MAX_DRAIN_PROBES) == M.DRAIN_PROBE_DELAY_SECONDS)
-check("no probe beyond cap", M._drain_delay(None, permanent, M.MAX_DRAIN_PROBES + 1) is None)
+print("== 4. queue-driven drain: retry forever, pause only on session expiry ==")
+check("probe delay for unclassified error at attempt 1",
+      M._drain_delay(None, permanent, 1) == M.DRAIN_PROBE_DELAY_SECONDS)
+check("probe cadence never stops (retry forever)",
+      M._drain_delay(None, permanent, 1_000_000) == M.DRAIN_PROBE_DELAY_SECONDS)
+check("unclassified delay within ceiling",
+      M._drain_delay(None, permanent, 1) <= M.DRAIN_BACKOFF_CEILING_SECONDS)
 check("transient preferred over probe", M._drain_delay(None, rate_err, 1) != M.DRAIN_PROBE_DELAY_SECONDS)
+check("session-expired pauses the queue",
+      M._drain_delay(None, "iLink sendmessage error: ret=-14 errcode=-14 errmsg=session expired", 1) is None)
+check("errmsg-only session expiry also pauses",
+      M._drain_delay(None, "send failed: session expired", 1) is None)
+check("missing token is NOT a pause reason (core sends tokenless)",
+      M._drain_delay(None, "no context token cached for peer", 1) == M.DRAIN_PROBE_DELAY_SECONDS)
 
 print("== 5. send-path I/O is offloaded off the event loop ==")
 src = " ".join(inspect.getsource(M.patch_adapter).split())
@@ -174,12 +186,19 @@ check("failures bump attempts in place", int(_after["attempts"]) == 5)
 Q.remove(int(_after["seq"]))
 check("success (remove) -> depth 0", Q.count("acct", "peer") == 0)
 
-print("== 7. drain worker is drain-until-empty and cooldown-preemptive ==")
+print("== 7. drain worker is queue-driven: revival, no give-up, 60s cap ==")
 check("worker loops until the queue is empty", "while True:" in src)
-check("no bounded 'awaiting fresh inbound token' give-up", "awaiting fresh inbound token" not in src)
+check("ensure_drainer exists for every trigger", "def ensure_drainer" in src)
+check("enqueue behind backlog revives a dead worker", 'reason="enqueue-behind-backlog"' in src)
+check("startup recovery arms every routed backlog", 'reason="startup recovery"' in src)
+check("worker rearms after an unforeseen exit", 'reason="worker re-arm"' in src)
+check("drain crash is caught, not fatal", "deferred FIFO drain crashed" in src)
 check("backoff capped at DRAIN_BACKOFF_CEILING_SECONDS", "DRAIN_BACKOFF_CEILING_SECONDS" in src)
+check("ceiling is 60s", M.DRAIN_BACKOFF_CEILING_SECONDS == 60.0)
 check("a sooner retry preempts a longer-sleeping worker", "current.cancel()" in src)
 check("worker tracks a wake deadline for preemption", "retry_deadlines[key]" in src)
+check("only session expiry pauses the queue", "paused until fresh inbound token" in src)
+check("probe-cap give-up removed", not hasattr(M, "MAX_DRAIN_PROBES"))
 
 print("== 8. v3.3.4 turn-start live context-fill read (kills /compress lag) ==")
 

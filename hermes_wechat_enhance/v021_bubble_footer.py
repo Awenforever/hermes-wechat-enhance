@@ -288,10 +288,10 @@ def _record_final_delivery_shapes(adapter: Any, chat_id: str, model: Any, respon
         except (ImportError, AttributeError):
             return
         _record_final_origin(adapter, chat_id, model, visible)
-MAX_TRANSIENT_DRAIN_RETRIES = 4
-MAX_DRAIN_PROBES = 3
-DRAIN_PROBE_DELAY_SECONDS = 45.0
-DRAIN_BACKOFF_CEILING_SECONDS = 120.0
+MAX_TRANSIENT_DRAIN_RETRIES = 4  # first sustained-failure alert, not a stop
+DRAIN_PROBE_DELAY_SECONDS = 45.0  # cadence for errors outside the transient set
+DRAIN_REVIVE_DELAY_SECONDS = 2.0  # revive a dead worker soon after enqueue/inbound
+DRAIN_BACKOFF_CEILING_SECONDS = 60.0  # hard cap for every retry cadence
 COOLDOWN_RESUME_JITTER_SECONDS = 0.05
 
 # Per-chat context-window fill captured from the turn result at the runner
@@ -594,14 +594,32 @@ def _token_fingerprint(context_token: Optional[str]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+_SESSION_EXPIRED_RE = re.compile(
+    r"(?:ret|errcode)\s*=\s*-14\b|session[ _-]?expired|context[ _-]?token[^.]{0,40}(?:expired|invalid)",
+    re.IGNORECASE,
+)
+
+
+def _token_blocked_error(error: Any) -> bool:
+    """True only for a proven dead context-token session (iLink errcode -14).
+
+    A missing cached token is NOT blocking: core deliberately retries without
+    ``context_token`` and iLink accepts tokenless sends (group replies have no
+    room-scoped token at all, because core stores tokens under the sender id).
+    Only an explicit session expiry pauses the FIFO until a fresh inbound token.
+    """
+    text = str(error or "")
+    return bool(_SESSION_EXPIRED_RE.search(text))
+
+
 def _transient_retry_delay(adapter: Any, error: Any, attempt: int) -> Optional[float]:
     """Return a bounded retry delay for transport failures that can self-heal.
 
     A fresh Weixin Context Token does not clear the adapter's process-wide
     cooldown.  Treating the first cooldown exception as a terminal drain made
     a silent ``/continue`` look ineffective until another inbound message
-    happened to arrive.  Permanent/budget failures deliberately return None:
-    they must wait for another fresh inbound token instead of retrying forever.
+    happened to arrive.  None only means "not recognised as transient"; the
+    caller turns that into a probe cadence instead of a terminal stop.
     """
     message = str(error or "")
     folded = message.casefold()
@@ -634,27 +652,28 @@ def _transient_retry_delay(adapter: Any, error: Any, attempt: int) -> Optional[f
         # when it expires.  Stacking the exponential floor on top made a
         # 0.01s cooldown wait ~2s, so a silent /continue looked dead.
         return remaining + COOLDOWN_RESUME_JITTER_SECONDS
-    backoff = min(120.0, 2.0 * (2 ** max(0, int(attempt) - 1)))
+    # Cap the exponent before the float conversion: 2 ** 1273 raises
+    # OverflowError and killed the retry worker, stranding the whole backlog.
+    exponent = min(max(0, int(attempt) - 1), 10)
+    backoff = min(DRAIN_BACKOFF_CEILING_SECONDS, 2.0 * (2 ** exponent))
     return max(0.05, backoff)
 
 
 def _drain_delay(adapter: Any, error: Any, attempt: int) -> Optional[float]:
     """Return the delay before the next deferred FIFO drain attempt.
 
-    Guarantees that ANY enqueued backlog gets a future drain attempt, not just
-    errors the transient classifier recognises.  Production stranded a backlog
-    for ~21 minutes when a connect failure fell outside the classifier and
-    ``schedule_retry`` no-opped, leaving the next inbound message as the only
-    drain trigger.  Unrecognised/permanent-classified errors therefore still
-    probe a bounded number of times; truly terminal failures stop after the
-    probe cap and still drain on the next fresh inbound token as before.
+    The queue owns one invariant: while it holds rows it keeps draining, so an
+    unrecognised or "permanent"-looking error only changes the cadence, never
+    stops the loop.  Production stranded a backlog because a connect failure
+    fell outside the classifier and ``schedule_retry`` no-opped.  None is
+    reserved for a proven dead session, where only a fresh inbound token helps.
     """
+    if _token_blocked_error(error):
+        return None
     delay = _transient_retry_delay(adapter, error, attempt)
-    if delay is not None:
-        return delay
-    if int(attempt) <= MAX_DRAIN_PROBES:
-        return DRAIN_PROBE_DELAY_SECONDS
-    return None
+    if delay is None:
+        delay = DRAIN_PROBE_DELAY_SECONDS
+    return min(delay, DRAIN_BACKOFF_CEILING_SECONDS)
 
 
 class BubbleCounterStore:
@@ -1710,32 +1729,47 @@ def patch_adapter(adapter: Any) -> bool:
     retry_tasks: Dict[str, asyncio.Task[Any]] = {}
     retry_deadlines: Dict[str, float] = {}
 
-    def schedule_retry(_self: Any, chat_id: str, error: Any) -> bool:
+    def ensure_drainer(
+        _self: Any,
+        chat_id: str,
+        *,
+        delay: float = 0.0,
+        reason: str = "backlog",
+        preempt: bool = False,
+    ) -> bool:
+        """Guarantee a live FIFO drain worker for this peer while rows exist.
+
+        Enqueue, inbound, startup recovery and the worker itself all call this,
+        so a dead worker is replaced without waiting for a lucky inbound.  The
+        queue row is the source of truth: a failed send never removes it, so
+        reviving a worker can never duplicate or drop a bubble.
+        """
         key = str(chat_id)
-        first_delay = _drain_delay(_self, error, 1)
-        if first_delay is None:
-            return False
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            loop = asyncio.get_event_loop()
-        wanted = loop.time() + first_delay
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                return False
+        wanted = loop.time() + max(0.0, float(delay))
         current = retry_tasks.get(key)
         if current is not None and not current.done():
-            # Keep the in-flight worker unless this error promises a strictly
-            # sooner wake.  A non-transient failure schedules a long drain probe;
-            # a later explicit cooldown must be able to preempt it, or a silent
-            # /continue stays stranded behind that probe for its full delay.  A
-            # worker that is actively draining has a deadline already in the
-            # past, so preemption never cancels a drain in progress.
             existing = retry_deadlines.get(key)
-            if existing is None or wanted >= existing - 1e-3:
+            # Preemption is reserved for an explicit cooldown that expires
+            # sooner than the sleeping worker.  A worker that is actively
+            # draining has a deadline already in the past, so this never
+            # cancels a physical send in progress.
+            if not preempt or existing is None or wanted >= existing - 1e-3:
                 return True
             current.cancel()
 
         async def retry_worker() -> None:
-            delay = first_delay
             attempt = 0
+            pending_left = 0
+            paused_for_token = False
+            cancelled = False
+            wait_for = max(0.0, float(delay))
             try:
                 # The queue owns one invariant: while it is non-empty it keeps
                 # trying to drain itself, with no dependence on any inbound
@@ -1749,38 +1783,69 @@ def patch_adapter(adapter: Any) -> bool:
                 # resumes fast instead of waiting for the ceiling.
                 while True:
                     attempt += 1
-                    retry_deadlines[key] = loop.time() + delay
-                    await asyncio.sleep(delay)
+                    retry_deadlines[key] = loop.time() + wait_for
+                    if wait_for > 0:
+                        await asyncio.sleep(wait_for)
                     account_id = str(getattr(_self, "_account_id", ""))
-                    if not await asyncio.to_thread(queue.count, account_id, key):
-                        return
-                    result = await drain_pending(_self, key)
-                    if bool(result.get("ok")) or not int(result.get("pending", 0)):
-                        logger.warning(
-                            "Hermes WeChat Enhance: deferred FIFO retry recovered peer=%s sent=%d pending=%d attempts=%d",
+                    try:
+                        pending_left = int(await asyncio.to_thread(queue.count, account_id, key))
+                    except Exception:
+                        logger.exception(
+                            "Hermes WeChat Enhance: deferred FIFO queue.count failed peer=%s; assuming backlog",
                             hashlib.sha256(key.encode()).hexdigest()[:12],
-                            int(result.get("sent", 0)),
-                            int(result.get("pending", 0)),
-                            attempt,
+                        )
+                        pending_left = 1
+                    if pending_left <= 0:
+                        return
+                    try:
+                        result = await drain_pending(_self, key)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # A crash inside drain must not kill the wakeup: the row
+                        # is still queued, so keep probing at the capped cadence.
+                        logger.exception(
+                            "Hermes WeChat Enhance: deferred FIFO drain crashed peer=%s",
+                            hashlib.sha256(key.encode()).hexdigest()[:12],
+                        )
+                        result = {
+                            "ok": False,
+                            "pending": pending_left,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    pending_left = int(result.get("pending", pending_left) or 0)
+                    if bool(result.get("ok")) or pending_left <= 0:
+                        if int(result.get("sent", 0)):
+                            logger.warning(
+                                "Hermes WeChat Enhance: deferred FIFO retry recovered peer=%s sent=%d attempts=%d",
+                                hashlib.sha256(key.encode()).hexdigest()[:12],
+                                int(result.get("sent", 0)),
+                                attempt,
+                            )
+                        return
+                    wait_for = _drain_delay(_self, result.get("error"), attempt + 1)
+                    if wait_for is None:
+                        # Session expired: the stored token is dead and only a
+                        # fresh inbound refreshes it.  The row stays queued.
+                        paused_for_token = True
+                        logger.warning(
+                            "Hermes WeChat Enhance: deferred FIFO paused until fresh inbound token peer=%s pending=%d error=%s",
+                            hashlib.sha256(key.encode()).hexdigest()[:12],
+                            pending_left,
+                            str(result.get("error"))[:200],
                         )
                         return
-                    # Transient/cooldown errors carry their own bounded delay;
-                    # anything the classifier treats as permanent falls back to
-                    # the probe interval so nothing is ever stranded waiting for
-                    # the next inbound token.
-                    delay = _transient_retry_delay(_self, result.get("error"), attempt + 1)
-                    if delay is None:
-                        delay = DRAIN_PROBE_DELAY_SECONDS
-                    delay = min(delay, DRAIN_BACKOFF_CEILING_SECONDS)
-                    if attempt == MAX_TRANSIENT_DRAIN_RETRIES:
+                    if attempt == MAX_TRANSIENT_DRAIN_RETRIES or attempt % 20 == 0:
                         logger.warning(
-                            "Hermes WeChat Enhance: deferred FIFO still pending after %d attempts peer=%s pending=%d; continuing with capped backoff (ceiling=%.0fs)",
+                            "Hermes WeChat Enhance: deferred FIFO still pending after %d attempts peer=%s pending=%d; continuing with capped backoff (ceiling=%.0fs, reason=%s)",
                             attempt,
                             hashlib.sha256(key.encode()).hexdigest()[:12],
-                            int(result.get("pending", 0)),
+                            pending_left,
                             DRAIN_BACKOFF_CEILING_SECONDS,
+                            reason,
                         )
             except asyncio.CancelledError:
+                cancelled = True
                 raise
             except Exception:
                 logger.exception("Hermes WeChat Enhance: deferred FIFO retry crashed")
@@ -1788,12 +1853,39 @@ def patch_adapter(adapter: Any) -> bool:
                 if retry_tasks.get(key) is asyncio.current_task():
                     retry_tasks.pop(key, None)
                     retry_deadlines.pop(key, None)
+                    if not cancelled and not paused_for_token and pending_left > 0:
+                        # Unforeseen exit while rows remain: replace the worker
+                        # instead of leaving the queue without a wakeup.
+                        with suppress(Exception):
+                            ensure_drainer(
+                                _self,
+                                key,
+                                delay=DRAIN_PROBE_DELAY_SECONDS,
+                                reason="worker re-arm",
+                            )
 
         retry_deadlines[key] = wanted
         retry_tasks[key] = asyncio.create_task(
             retry_worker(), name=f"hermes-wechat-fifo-retry-{hashlib.sha256(key.encode()).hexdigest()[:8]}"
         )
         return True
+
+    def schedule_retry(_self: Any, chat_id: str, error: Any) -> bool:
+        first_delay = _drain_delay(_self, error, 1)
+        if first_delay is None:
+            logger.warning(
+                "Hermes WeChat Enhance: deferred FIFO waits for fresh inbound token peer=%s error=%s",
+                hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
+                str(error)[:200],
+            )
+            return False
+        return ensure_drainer(
+            _self,
+            chat_id,
+            delay=first_delay,
+            reason=f"error: {str(error)[:120]}",
+            preempt=True,
+        )
 
     def format_message(_self: Any, content: Optional[str]) -> str:
         return _normalize_transport_markdown(content)
@@ -1845,6 +1937,15 @@ def patch_adapter(adapter: Any) -> bool:
                     hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
                     pending,
                 )
+                # A backlog means a physical send already failed.  If its worker
+                # died, this enqueue must revive one instead of waiting for the
+                # next inbound message.
+                ensure_drainer(
+                    _self,
+                    str(chat_id),
+                    delay=DRAIN_REVIVE_DELAY_SECONDS,
+                    reason="enqueue-behind-backlog",
+                )
                 return
             count, generation = await asyncio.to_thread(
                 store.preview, account_id, str(chat_id), context_token
@@ -1868,10 +1969,9 @@ def patch_adapter(adapter: Any) -> bool:
                     pending,
                     exc,
                 )
-                # A transient transport failure must not strand the backlog until
-                # the next inbound happens to arrive.  schedule_retry is a no-op
-                # for permanent/budget failures (_transient_retry_delay returns
-                # None), so only self-healing errors spawn a deferred drain.
+                # Keep a worker pointed at the queue for every error except a
+                # dead session, which pauses until a fresh inbound token.  The
+                # bubble itself stays queued either way.
                 schedule_retry(_self, str(chat_id), exc)
                 return
             await asyncio.to_thread(
@@ -1998,6 +2098,7 @@ def patch_adapter(adapter: Any) -> bool:
                         "pending": await asyncio.to_thread(queue.count, account_id, str(chat_id)),
                         "error": str(exc),
                         "retry_scheduled": scheduled,
+                        "token_blocked": not scheduled,
                     }
                 if not await asyncio.to_thread(
                     store.commit, account_id, str(chat_id), generation, count
@@ -2019,7 +2120,11 @@ def patch_adapter(adapter: Any) -> bool:
                            if isinstance(key, str) and key.startswith(prefix)) if isinstance(cache, dict) else ()
         routes, unresolved = await asyncio.to_thread(queue.recover_routes, account_id, candidates)
         for chat in routes:
-            schedule_retry(_self, chat, 'startup recovery')
+            # Queue rows are the source of truth, so arm a drain for every
+            # recovered route even without a cached token: core sends tokenless
+            # as a documented fallback (group replies always are), and a dead
+            # session pauses the worker without losing the row.
+            ensure_drainer(_self, chat, delay=0.0, reason="startup recovery")
         if unresolved:
             logger.error('Hermes WeChat Enhance: %d legacy pending route(s) unresolved; preserving rows, explicit route reconciliation required', unresolved)
         return {'scheduled_routes': len(routes), 'unresolved_routes': unresolved}
@@ -2068,6 +2173,18 @@ def patch_adapter(adapter: Any) -> bool:
         # (re-queues + bounded backoff) when none is valid, so a tokenless inbound
         # can still recover a backlog that an earlier transient failure stranded.
         drain_result = await drain_pending(_self, drain_key)
+        if (
+            int(drain_result.get("pending", 0)) > 0
+            and not drain_result.get("retry_scheduled")
+            and not drain_result.get("token_blocked")
+        ):
+            # Defensive: the row survived but no worker owns the next attempt.
+            ensure_drainer(
+                _self,
+                drain_key,
+                delay=DRAIN_REVIVE_DELAY_SECONDS,
+                reason="inbound",
+            )
         refresh_runtime_status({"adapters": {"weixin": _self}})
 
         normalized = normalize_weixin_inbound_reference(
@@ -2114,6 +2231,7 @@ def patch_adapter(adapter: Any) -> bool:
         adapter._send_file = MethodType(send_file, adapter)
     adapter.send = MethodType(send, adapter)
     adapter._drain_pending = MethodType(drain_pending, adapter)
+    adapter._hermes_wechat_v021_ensure_drainer = MethodType(ensure_drainer, adapter)
     adapter._hermes_wechat_recover_pending = MethodType(recover_pending, adapter)
     adapter._process_message = MethodType(process_message, adapter)
     adapter._hermes_wechat_v021_pending_queue = queue

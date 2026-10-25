@@ -35,7 +35,6 @@ with tempfile.TemporaryDirectory(prefix='hook-transaction-') as raw:
     cache_file.write_bytes(b'synthetic foreign-owned cache')
     cache_file.chmod(0o444)
     previous_hash = M._tree_hash(target)
-    previous_manifest = M._install_manifest_path().read_bytes()
     cache_stat = cache_file.stat()
     rmtree = shutil.rmtree
 
@@ -71,6 +70,9 @@ with tempfile.TemporaryDirectory(prefix='hook-transaction-') as raw:
             raise PermissionError('synthetic activation failure')
         return original_replace(path, destination)
 
+    # Capture immediately before the failing activation; earlier no-op installs
+    # legitimately refresh installed_at (second resolution) in the manifest.
+    previous_manifest = M._install_manifest_path().read_bytes()
     with patch.object(Path, 'replace', fail_activation):
         try:
             M._install_hook()

@@ -48,6 +48,15 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f" :: {detail}" if detail else ""))
 
 
+def check_posix_mode(name: str, path: Path, expected: int) -> None:
+    # Windows has no POSIX mode bits: os.chmod(0o600) cannot be observed via st_mode.
+    if os.name == "nt":
+        print(f"  [SKIP] {name} :: POSIX modes N/A on Windows (NTFS ACLs)")
+        return
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    check(name, mode == expected, f"mode={oct(mode)}")
+
+
 def footer_of(chunk: str) -> str:
     return chunk.split("\n\n---\n\n", 1)[-1]
 
@@ -404,18 +413,15 @@ def t_q5_permissions(home: str):
     with tempfile.TemporaryDirectory(prefix="q5perm-") as d:
         store = st.MessageStore(base_dir=d)
         store.append({"platform": "weixin", "user_id": PEER, "direction": "in", "content": "hi"})
-        mode = stat.S_IMODE(os.stat(store.messages_path).st_mode)
-        check("Q5 new messages.jsonl is 0600", mode == 0o600, f"mode={oct(mode)}")
+        check_posix_mode("Q5 new messages.jsonl is 0600", store.messages_path, 0o600)
 
         # Pre-existing world-readable file (the production defect) is tightened on next append.
         os.chmod(store.messages_path, 0o644)
         store.append({"platform": "weixin", "user_id": PEER, "direction": "in", "content": "again"})
-        mode2 = stat.S_IMODE(os.stat(store.messages_path).st_mode)
-        check("Q5 pre-existing 0644 tightened to 0600", mode2 == 0o600, f"mode={oct(mode2)}")
+        check_posix_mode("Q5 pre-existing 0644 tightened to 0600", store.messages_path, 0o600)
 
         store.append_pending(PEER, "pending content")
-        pmode = stat.S_IMODE(os.stat(store.pending_path).st_mode)
-        check("Q5 pending.jsonl is 0600", pmode == 0o600, f"mode={oct(pmode)}")
+        check_posix_mode("Q5 pending.jsonl is 0600", store.pending_path, 0o600)
     print()
 
 
@@ -454,8 +460,7 @@ def t_q5_rotation(home: str):
                   os.stat(live).st_size <= st.AUDIT_MAX_BYTES + 4096,
                   f"size={os.stat(live).st_size}")
             # Backups are owner-only too.
-            bmode = stat.S_IMODE(os.stat(Path(f"{live}.1")).st_mode)
-            check("Q5 rotated backup is 0600", bmode == 0o600, f"mode={oct(bmode)}")
+            check_posix_mode("Q5 rotated backup is 0600", Path(f"{live}.1"), 0o600)
 
             # Pending must NEVER rotate (losing it would drop undelivered bubbles).
             for i in range(40):
