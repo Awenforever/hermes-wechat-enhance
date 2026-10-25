@@ -434,7 +434,7 @@ removes a row; no separate retry task may be the sole owner of that wakeup.
 
 - PR #9 (`fix: queue-driven Weixin FIFO drain with 60s cap`) merged into `main`
   as merge commit `d4b22dd4282b620297eda7aae70351e482b57520` at
-  2026-10-25 18:50 +08, after 8/8 checks passed on head
+  2026-10-25 18:53:11 +08, after 8/8 checks passed on head
   `7f0f14f0347dd2d5a1a7c39480a052d09f1cb4bb`. The merge commit then passed
   7/7 checks on `main`.
 - The release commit `7f0f14f` sets `plugin.yaml` to `3.5.0` (minor: the
