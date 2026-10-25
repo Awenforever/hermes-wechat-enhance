@@ -11,7 +11,8 @@ Gateway restart are done, and T4 passes through Gateway boot on Windows 11
 native. The queue-driven FIFO redesign (`afe4dd7`, docs `ce418de`) was deployed
 to production on 2026-10-25 18:12 +08 and the Gateway restarted under it
 (pid 2648379); boot checks pass and the queue is empty. A real user-triggered
-Weixin round trip remains the final acceptance item. Details in §12.7.
+Weixin round trip completed on 2026-10-25 18:29 +08 after an authorized Gateway
+restart recovered a wedged send session; details in §12.7.
 
 This record follows `PLUGIN_TEST_CONTRACT.md` and the release gate in
 `SKILL.md`. It supplements, but never replaces, `scripts/verify-self-install.py`
@@ -403,5 +404,23 @@ removes a row; no separate retry task may be the sole owner of that wakeup.
 - Production `.git` still reports `f82fbc7` because K4 delivery uses
   `git archive`; the deployed tree is identified by the commit and tree hash
   above, not by the production checkout's HEAD.
-- A real user-triggered Weixin round trip is still pending as of this write; it
-  is the final acceptance item.
+- Real user-triggered round trip (2026-10-25): inbound at 18:19:15 and
+  18:24:05; the first reply was ready at 18:20:58, but every send then failed
+  with `Cannot connect to host ilinkai.weixin.qq.com:443 ... [None]` during a
+  network blip. The queue retained both replies (plus the shutdown notification
+  enqueued at 18:27:57 and the next boot's startup-ready notice) in strict
+  order; attempts grew to 10 and nothing was dropped or reordered. A fresh
+  aiohttp connection from the same container reached the send endpoint (HTTP
+  200) while the gateway's long-lived `_send_session` stayed unusable, so an
+  authorized `s6-svc -r` restart was performed at 18:27:57. The new pid is
+  2651648; startup recovery drained the queue at 18:29:12
+  (`sent=4 attempts=1 pending=0`). The four bubbles were the two user replies,
+  the shutdown notice, and the new startup-ready notice; the user received the
+  replies. Poll traffic (`getupdates`) kept working through the same interval,
+  isolating the fault to the send session rather than DNS or host egress.
+- Residual risk (Core-level): after a connection blip,
+  `WeixinAdapter._send_session` can stay unusable until the process restarts;
+  Core only recycles `_poll_session` on its failure streak. The plugin FIFO
+  preserves every failed send, but automatic delivery recovery may require a
+  Gateway restart until Core recycles the send session too. Core was not
+  modified; this remains a follow-up.
