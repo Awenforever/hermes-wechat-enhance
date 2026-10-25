@@ -429,3 +429,30 @@ removes a row; no separate retry task may be the sole owner of that wakeup.
   preserves every failed send, but automatic delivery recovery may require a
   Gateway restart until Core recycles the send session too. Core was not
   modified; this remains a follow-up.
+
+### 12.8 Release 3.5.0 — 2026-10-25 (Asia/Shanghai)
+
+- PR #9 (`fix: queue-driven Weixin FIFO drain with 60s cap`) merged into `main`
+  as merge commit `d4b22dd4282b620297eda7aae70351e482b57520` at
+  2026-10-25 18:53:11 +08, after 8/8 checks passed on head
+  `7f0f14f0347dd2d5a1a7c39480a052d09f1cb4bb`. The merge commit then passed
+  7/7 checks on `main`.
+- The release commit `7f0f14f` sets `plugin.yaml` to `3.5.0` (minor: the
+  backlog-drain contract changed; no config or API change). README badges and
+  `scripts/check-consistency.sh` match.
+- Annotated tag `v3.5.0` (tag object
+  `62cb20d46aa41a7a83eea213ba0601a790246551`) points at the merge commit; the
+  release tree is `7244f1f4b8d35a55fd599793708437f9b25759d7`. The GitHub
+  release was published 2026-10-25 18:53 +08:
+  `https://github.com/Awenforever/hermes-wechat-enhance/releases/tag/v3.5.0`.
+- Production still runs the `ce418de` tree deployed at 18:12 +08. The release
+  commit differs from it only in version metadata (`plugin.yaml`, README
+  badges, consistency script). Re-deploying the exact tag tree and restarting
+  the Gateway is a separate production action and was not performed.
+- Core follow-up prepared on 2026-10-25: `_send_session` recycling after
+  transport failures for text retries and media sends. `_is_transport_failure`
+  keeps API-level errors on the same session, and a `stale` guard lets
+  concurrent callers recycle only the session that failed. Seven of the eight
+  new tests fail on the base tree, and all eight pass with the patch. The
+  branch is pushed to a fork; it is not upstreamed and not deployed, and
+  production Core is unchanged.
