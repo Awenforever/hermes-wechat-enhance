@@ -178,9 +178,22 @@ hermes plugins remove hermes-wechat-enhance
 
 ## 文档
 
+先读：
+
 - [`SKILL.md`](SKILL.md)：自动安装与交互契约
+- [`README.md`](README.md)：English README
+
+维护者与发布：
+
+- [`docs/OWNERSHIP.md`](docs/OWNERSHIP.md)：产物归属、授权边界与文档权威表
+- [`docs/DEVELOPMENT_MEMORANDUM.md`](docs/DEVELOPMENT_MEMORANDUM.md)：设计取舍与回归不变量
+- [`docs/RELEASE_ACCEPTANCE.md`](docs/RELEASE_ACCEPTANCE.md)：发布身份、平台矩阵与验收证据
+- [`IMPACT_MATRIX.md`](IMPACT_MATRIX.md)：各类改动需要联动更新的文件
+- [`docs/INSTALL_STATE_RUNBOOK.md`](docs/INSTALL_STATE_RUNBOOK.md)：安装事务状态（诊断或授权修复）
 - [`docs/PERSISTENCE_CONTRACT.md`](docs/PERSISTENCE_CONTRACT.md)：数据归属和重建规则
-- [`docs/DEVELOPMENT_MEMORANDUM.md`](docs/DEVELOPMENT_MEMORANDUM.md)：维护者内部备忘
+- [`docs/SLASH_COMMAND_DEDUP_HOOK.md`](docs/SLASH_COMMAND_DEDUP_HOOK.md)：重复 slash 命令处理
+- [`docs/transport-receipt-development.md`](docs/transport-receipt-development.md)：实验性传输回执契约（未部署）
+- [`references/`](references/)：带日期的研究记录（架构、隔离审计、并排测试）
 
 历史故障、实现细节和不可回归约束刻意不写进面向用户的 README。
 

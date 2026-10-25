@@ -187,9 +187,22 @@ explicitly removes them after backup.
 
 ## Documentation
 
+Start here:
+
 - [`SKILL.md`](SKILL.md) — installation and automation contract
+- [`README_CN.md`](README_CN.md) — 简体中文说明
+
+Maintainer and release:
+
+- [`docs/OWNERSHIP.md`](docs/OWNERSHIP.md) — artifact ownership, authorization boundaries and document map
+- [`docs/DEVELOPMENT_MEMORANDUM.md`](docs/DEVELOPMENT_MEMORANDUM.md) — design decisions and regression invariants
+- [`docs/RELEASE_ACCEPTANCE.md`](docs/RELEASE_ACCEPTANCE.md) — release identity, platform matrix and acceptance evidence
+- [`IMPACT_MATRIX.md`](IMPACT_MATRIX.md) — files to update for each class of change
+- [`docs/INSTALL_STATE_RUNBOOK.md`](docs/INSTALL_STATE_RUNBOOK.md) — install transaction state (diagnosis or authorized repair)
 - [`docs/PERSISTENCE_CONTRACT.md`](docs/PERSISTENCE_CONTRACT.md) — state ownership and rebuild rules
-- [`docs/DEVELOPMENT_MEMORANDUM.md`](docs/DEVELOPMENT_MEMORANDUM.md) — internal maintainer memorandum
+- [`docs/SLASH_COMMAND_DEDUP_HOOK.md`](docs/SLASH_COMMAND_DEDUP_HOOK.md) — repeated slash command handling
+- [`docs/transport-receipt-development.md`](docs/transport-receipt-development.md) — experimental receipt publisher contract (not deployed)
+- [`references/`](references/) — dated research notes (architecture, isolated audit, side-by-side testing)
 
 Development incident history and regression invariants are intentionally kept
 outside this user-facing README.
