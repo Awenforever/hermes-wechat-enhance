@@ -2,9 +2,10 @@
 
 **Status as of 2026-10-25 (Asia/Shanghai).** This document records artifact
 ownership, authorization boundaries and the document authority map. It does
-**not** appoint a product owner: product ownership is user-designated, and the
-current cross-agent execution registration lives in the shared handoff (see
-"Current execution tracks" below). This document grants no production
+**not** appoint a product owner: product ownership is user-designated;
+cross-agent execution registration lives in the shared handoff and, as of
+2026-10-26, in the private `hermes-collab-center` (see "Current execution
+tracks" below). This document grants no production
 authorization.
 
 ## Artifacts
@@ -51,10 +52,13 @@ authorization.
 
 ## Current execution tracks
 
-Do not copy volatile names or status into this file. Read the shared handoff
-`README.md` (executor registration) and the latest dated section of the
-relevant `*_STATUS.md`. A registration is neither a lock nor an authorization;
-the single-executor rule and per-window user authorization still apply.
+Do not copy volatile names or status into this file. Read the append-only
+development log in the private `hermes-collab-center` repository
+(`projects/plugins/wechat-enhance/LOG.md`) for current status, and the shared
+handoff `README.md` (executor registration) plus the frozen `*_STATUS.md`
+files for historical evidence. A registration is neither a lock nor an
+authorization; the single-executor rule and per-window user authorization
+still apply.
 
 ## Change control
 
