@@ -1,5 +1,10 @@
 # Install-state runbook
 
+**Revision 2026-10-25 (Asia/Shanghai):** reviewed against
+`scripts/manage-install-state.py` in the 3.5.0 tree. `--home` is the Hermes
+home (`/opt/data` in the NAS container), not `/opt/data/.hermes`; the state
+path is `<home>/.hermes/wechat-enhance/install-state`.
+
 This runbook covers the shell installer transaction state managed by
 `scripts/manage-install-state.py`. The state exists so that install and
 uninstall can be transactional. It is not runtime user data and it is not a

@@ -1,5 +1,36 @@
 # Hermes WeChat Enhance — Development Memorandum
 
+## 2026-10-25 — Queue-driven FIFO drain (3.5.0)
+
+The durable queue, not a retry task, now owns delivery. `ensure_drainer` is
+called by enqueue, inbound handling, startup recovery and the worker itself, so
+a dead worker is replaced without waiting for a lucky inbound message. While
+the peer has rows and a usable context token, the worker drains in strict
+`seq` order; a failed send only increments `attempts` and leaves the row in
+place, and only an acknowledged send or an explicit withdrawal dequeues it.
+`client_id` remains UNIQUE with `INSERT OR IGNORE`, so reviving a worker cannot
+duplicate or drop a bubble.
+
+There is no separate retry scheduler to wedge or race. Unrecognised and
+"permanent-looking" errors change only the cadence, never stop the loop:
+backoff is capped at `DRAIN_BACKOFF_CEILING_SECONDS = 60`, the transient-retry
+counter is an alert threshold rather than a stop, and other errors probe every
+45 seconds. A proven token-blocked state pauses the worker until a fresh
+inbound restores a token; `/continue` remains a silent token-refresh entry
+point and never bypasses queue order. No schema change: the queue,
+transport-receipt and withdrawal tables are unchanged.
+
+Residual Core risk (not a plugin defect): after a connection blip,
+`WeixinAdapter._send_session` can remain unusable until the process restarts,
+because Core only recycles `_poll_session`. A fork-only patch recycles the send
+session on transport failures and passes eight new tests; it is not upstreamed
+and not deployed. The FIFO still preserves every failed send, so delivery
+resumes once the session recovers.
+
+Release `3.5.0` was tagged as a minor version because the backlog-drain
+contract changed; there is no config or API change. Production metadata was
+aligned to the release on 2026-10-25 22:08 +08 without changing runtime code.
+
 ## 2026-10-18 — /btw provenance shadowed by the instance resolver (I1.E3)
 
 3.4.3 shipped the /btw scope but the production footer still said hermes.

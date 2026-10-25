@@ -1,5 +1,9 @@
 # Persistence and recovery contract
 
+**Revision 2026-10-25 (Asia/Shanghai):** reviewed against the 3.5.0 tree. The
+queue-driven FIFO redesign changed control flow only; the owned paths, tables
+and lifecycle below are unchanged.
+
 `HERMES_HOME` is the active Hermes profile, not a second home nested inside it.
 It must be durable on Docker/NAS and private to the operator on every platform.
 Native Windows/Linux/WSL installations do not need Docker volume configuration.
@@ -21,7 +25,9 @@ and native CLI.
 
 Counters, context-fill snapshots, durable `send-queue.sqlite3`, quote cache,
 audit and install metadata are user state. Queue rows contain pending text and
-model labels. A private routing table retains destination IDs for restart
+model labels. A row leaves the queue only after an acknowledged send or an
+explicit withdrawal; a failed send keeps the row and increments its attempt
+counter. A private routing table retains destination IDs for restart
 recovery, but no context tokens or credentials. Legacy hash-only routes recover
 only from exact trusted Core peers; unresolved rows are preserved and reported.
 Never infer a destination from a message body or latest conversation.

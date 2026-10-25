@@ -1,10 +1,16 @@
 # Release acceptance — Hermes WeChat Enhance
 
-**Current status as of 2026-10-24 (Asia/Shanghai): partial acceptance.**
-The 3.4.4 production tree is byte-identical to the public release and passes
-T1, T2 and the T3 WSL2 thin smoke. T4 (Windows native E2E), a real-Weixin
-delivery run and a Gateway restart were not executed in this cycle, so 3.4.4
-must not be described as fully accepted across every supported platform.
+**Current status as of 2026-10-25 22:10 +08 (Asia/Shanghai).**
+Production runs the `3.5.0` release metadata over the queue-driven FIFO runtime
+tree `ce418de`; the four metadata files now match release commit `7f0f14f`
+(§12.9). T1, T2 and the T3 WSL2 thin smoke pass on the 3.4.4 baseline; T4
+passes through Gateway boot on Windows 11 native; a real user-triggered Weixin
+round trip completed on 2026-10-25; the Gateway was restarted under the FIFO
+redesign and again for the 3.5.0 metadata alignment. Full 3.5.0 four-platform
+acceptance has **not** been re-executed: the 3.5.0 delta is the FIFO drain logic
+plus metadata, and §12.7–§12.9 record the evidence actually collected. Do not
+describe 3.5.0 as fully accepted on every platform until a fresh four-platform
+run is recorded.
 
 **Update 2026-10-25 (deployed):** PR #8 merged, production K5 cleanup and a
 Gateway restart are done, and T4 passes through Gateway boot on Windows 11
@@ -13,7 +19,12 @@ to production on 2026-10-25 18:12 +08 and the Gateway restarted under it
 (pid 2648379); boot checks pass and the queue is empty. A real user-triggered
 Weixin round trip completed on 2026-10-25: an authorized restart recovered a
 wedged send session at 18:29 +08, and a fresh round trip at 18:33 +08 completed
-without intervention; details in §12.7.
+without intervention; details in §12.7. Release `3.5.0` was tagged from
+`7f0f14f` at 18:53 +08; production metadata was aligned and the Gateway
+restarted at 22:06–22:08 +08 (§12.8–§12.9).
+
+**Reading order:** §12 is the current record. §1–§11 preserve the 3.4.4
+baseline; where they conflict with §12, §12 wins.
 
 This record follows `PLUGIN_TEST_CONTRACT.md` and the release gate in
 `SKILL.md`. It supplements, but never replaces, `scripts/verify-self-install.py`
@@ -34,6 +45,9 @@ and the regression suite.
 The acceptance branch `qoder/residual-closure-20261024` adds one test-only
 commit, `5c9d51147a1f12af9969b98b741ecba53f580500`. It is not part of the
 published tag and does not change runtime code.
+
+> **Not the current release:** this table records the 3.4.4 baseline. The 3.5.0
+> release identity and production alignment are in §12.8 and §12.9.
 
 ## 2. Platform matrix
 
@@ -194,6 +208,10 @@ Windows-hosted and NAS/Docker.
 Therefore: production consistency is proven, but the full four-platform release
 acceptance is **not** complete. The next release candidate must close T4, the
 real-Weixin run and the Gateway restart, and include the T3 test fix.
+
+> **Status change on 2026-10-25:** Gateway restart and real Weixin behavior now
+> pass (§12.7, §12.9); T4 is boot-level only (§12.1). The remaining gap for the
+> 3.5.0 line is a fresh full four-platform run of the FIFO delta.
 
 ## 9. Open findings carried with this record
 
@@ -456,3 +474,43 @@ removes a row; no separate retry task may be the sole owner of that wakeup.
   new tests fail on the base tree, and all eight pass with the patch. The
   branch is pushed to a fork; it is not upstreamed and not deployed, and
   production Core is unchanged.
+
+> **Superseded for the production deployment state by §12.9.** The metadata
+> alignment was performed at 22:06–22:08 +08 under a separate authorization.
+
+### 12.9 Production metadata alignment to 3.5.0 — 2026-10-25 22:06–22:08 +08
+
+- Authorized separately after the release. Scope was metadata only: no Python,
+  hook, `config.yaml`, database, queue or runtime-behaviour change.
+- Four files were copied from release commit `7f0f14f` into the production
+  plugin tree, preserving owner `1000:1000` and mode:
+  - `plugin.yaml` — sha256 `ae9ae50d5e8735d747d80fe9de657572469679084582c51768e84e10b72e31f4`
+  - `README.md` — sha256 `67a69b48f760595ca0fdf0bfa9d932a23052ea7cbb78ed21e6efcfaf4f8c1781`
+  - `README_CN.md` — sha256 `17d9037457573b504facd53e659b34b9f5dd9e148b1b915bf4860a1315b9a3f0`
+  - `scripts/check-consistency.sh` — sha256 `a80e6ecc4dfb191aedd1441b0e1c6ce5dae0b48e697d4e326d1550a4b606aac6`
+- Pre-change backup:
+  `~/Work/Hermes/2026-10-15-qoder-wechat-enhance-handoff/backups/2026-10-25-align-350/`
+  contains the four old files, the old install-state manifest, `SHA256SUMS`,
+  `PREFLIGHT.txt`, and `plugin-source-before-350.tar.gz` (131,166 B).
+- Install state was refreshed with
+  `scripts/manage-install-state.py record-installed --home /opt/data` (note:
+  `--home /opt/data`, not `/opt/data/.hermes`). `source_installed_hash` became
+  `cb8fc6edbfb55c29c5e473f545a7d8850f1bfecb92886176f4450ca45a725801`;
+  `hook_installed_hash` stayed
+  `5dd5ac8abb684486638fc9f197ca4a6597fa11a0e71955938372a30d21b67224`.
+- The Gateway was restarted through s6 (`/run/service/gateway-default`) in a
+  single-executor window. Verified afterward: s6 `up` (pid 2689830, pgid
+  2689830); gateway health 200 at `http://127.0.0.1:8642/health`;
+  `hermes plugins info hermes-wechat-enhance` reports `3.5.0`, enabled;
+  3 hooks loaded and the plugin hook initialized with `errors=0`; Weixin
+  connected and restored one context token; queue `pending_bubbles=0`,
+  `pending_routes_v1=1`, `transport_receipts_v1=0`,
+  `transport_withdrawals_v1=0`, `outbound_queue=0`.
+- No new tracebacks in the post-restart error log (5,186 new bytes; warnings
+  only). Real Weixin shutdown/startup notices were delivered at 22:06:51 and
+  22:07:10 +08; no additional test message was sent.
+- Runtime code is unchanged by this step: it remains the `ce418de` FIFO tree
+  deployed at 18:12 +08. The production directory is a git worktree whose
+  `HEAD` remains `f82fbc7`, so the four aligned metadata files appear as
+  intentional local modifications. Do not run `git checkout` or `git clean`
+  in that directory.
