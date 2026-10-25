@@ -15,9 +15,10 @@
 
 ---
 
-Hermes WeChat Enhance is a channel-layer extension for Hermes.
+Hermes WeChat Enhance is a channel-layer extension for Hermes. It makes every
 
-> **Cross-project coordination:** ownership, append-only development log and residual list live in the private [`hermes-collab-center`](https://github.com/Awenforever/hermes-collab-center/blob/main/projects/plugins/wechat-enhance/PROJECT.md) repository (access required). It makes every
+> **Cross-project coordination:** ownership, append-only development log and residual list live in the private [`hermes-collab-center`](https://github.com/Awenforever/hermes-collab-center/blob/main/projects/plugins/wechat-enhance/PROJECT.md) repository (access required).
+
 successfully delivered Weixin text bubble auditable at a glance, keeps failed
 delivery in strict FIFO order, and preserves the user's existing Hermes model,
 channel, pairing, and profile configuration.
