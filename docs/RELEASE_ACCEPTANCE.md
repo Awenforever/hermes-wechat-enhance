@@ -6,10 +6,12 @@ T1, T2 and the T3 WSL2 thin smoke. T4 (Windows native E2E), a real-Weixin
 delivery run and a Gateway restart were not executed in this cycle, so 3.4.4
 must not be described as fully accepted across every supported platform.
 
-**Update 2026-10-25:** PR #8 merged, production K5 cleanup and a Gateway
-restart are done, and T4 now passes through Gateway boot on Windows 11 native.
-A production FIFO defect found in 3.4.4 is redesigned on the branch but not yet
-deployed; real Weixin delivery remains unverified. Details in §12.
+**Update 2026-10-25 (deployed):** PR #8 merged, production K5 cleanup and a
+Gateway restart are done, and T4 passes through Gateway boot on Windows 11
+native. The queue-driven FIFO redesign (`afe4dd7`, docs `ce418de`) was deployed
+to production on 2026-10-25 18:12 +08 and the Gateway restarted under it
+(pid 2648379); boot checks pass and the queue is empty. A real user-triggered
+Weixin round trip remains the final acceptance item. Details in §12.7.
 
 This record follows `PLUGIN_TEST_CONTRACT.md` and the release gate in
 `SKILL.md`. It supplements, but never replaces, `scripts/verify-self-install.py`
@@ -337,7 +339,7 @@ permanently invalid token. The `31309e2` overflow fix was **not** deployed for
 this recovery; it remains preventive work, and no session-side production write
 was made. The structural gap is addressed by §12.7.
 
-### 12.7 Queue-driven FIFO redesign — 2026-10-25 (not deployed)
+### 12.7 Queue-driven FIFO redesign — 2026-10-25 (deployed)
 
 Required invariant: while `pending_bubbles` holds rows and a usable reply window
 exists, the plugin keeps draining in strict `seq` order; a failed send never
@@ -380,5 +382,26 @@ removes a row; no separate retry task may be the sole owner of that wakeup.
     plugin-data touched).
   - NAS host: `test-v021-bubble-footer.py` OK, `test-restart-drain.py` OK,
     `test-fifo-backlog-invariant.py` 18/18.
-- Not deployed. Production still runs the pre-redesign plugin. Deploying the fix
-  and draining any real WeChat backlog remain gated on explicit authorization.
+- Deployed 2026-10-25 18:12:14 +08 from `ce418de` (code tree `afe4dd7`) with
+  `git archive` per K4; the transactional `scripts/install.sh` returned
+  `SELF_INSTALL_VERIFY_OK` and `INSTALL_OK`. The hook tree is unchanged
+  (`5dd5ac8a…`), so the installer skipped the hook copy. Delivery checks: the
+  normalized production tree hash equals the commit archive
+  (`2766eb79b0782a91b49fc9045a4e081867fec711bc81463d5c0450cb347097fd`), 38
+  Python files compile, ownership is `1000:1000`, and no `__pycache__` remains.
+- Gateway restarted 2026-10-25 18:12:53 +08 (`s6-svc -r`, single executor, queue
+  empty). New pid **2648379**; the `gateway:startup` hook loaded at 18:13:33;
+  `runtime-status.json` at 18:13:36 reports `installed=1`, `model_route=true`,
+  `pending_bubbles=0`, `errors=[]`; `/health` returns 200; the startup-ready
+  notification was delivered (`target=configured`). Queue depth after boot:
+  `pending_bubbles=0`, `pending_routes_v1=0`.
+- Pre-deployment backup:
+  `/home/vive/hermes-production-backups/wechat-enhance-20261025-181044`
+  (source, hook, install-state, plugin-data; consistent SQLite copies with
+  `PRAGMA integrity_check=ok` and a clean `foreign_key_check`; 724 SHA-256
+  entries).
+- Production `.git` still reports `f82fbc7` because K4 delivery uses
+  `git archive`; the deployed tree is identified by the commit and tree hash
+  above, not by the production checkout's HEAD.
+- A real user-triggered Weixin round trip is still pending as of this write; it
+  is the final acceptance item.
