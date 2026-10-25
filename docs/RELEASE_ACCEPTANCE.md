@@ -6,6 +6,11 @@ T1, T2 and the T3 WSL2 thin smoke. T4 (Windows native E2E), a real-Weixin
 delivery run and a Gateway restart were not executed in this cycle, so 3.4.4
 must not be described as fully accepted across every supported platform.
 
+**Update 2026-10-25:** PR #8 merged, production K5 cleanup and a Gateway
+restart are done, and T4 now passes through Gateway boot on Windows 11 native.
+A production FIFO defect found in 3.4.4 is fixed on the branch but not yet
+deployed; real Weixin delivery remains unverified. Details in §12.
+
 This record follows `PLUGIN_TEST_CONTRACT.md` and the release gate in
 `SKILL.md`. It supplements, but never replaces, `scripts/verify-self-install.py`
 and the regression suite.
@@ -243,3 +248,77 @@ the 3.4.4 tree from `wsl/repo-v344.tar.gz` and build their own sandboxes.
 
 When a later candidate is evaluated, append a new section with its commit and
 tree; do not rewrite the historical results above.
+
+## 12. Residual closure — 2026-10-25 (Asia/Shanghai)
+
+Branch head for everything below: `31309e2` (`qoder/residual-closure-20261024`),
+which adds `09487e5` (Windows-only test skip) and `31309e2` (FIFO backoff fix)
+on top of the 3.4.4 tree. Runtime behavior is unchanged except for the backoff
+guard; no release was cut.
+
+### 12.1 T4 — Windows 11 native (PASS for transport-free boot)
+
+Environment: `win11-test` (Windows 11 10.0.26300), Hermes 0.21.6 at
+`818c13be1dc4fd28987e1e881a9408224afd4535`, Python 3.14.7, isolated
+`HERMES_HOME`.
+
+| Item | Result |
+|---|---|
+| Core PM install from `file://`, pinned `eceaf0bd` | PASS (`--force --yes-deps --enable`) |
+| Hook install (`plugin_cli._install_hook()`) | PASS — `gateway:startup`, `agent:start`, `agent:end` |
+| `verify-self-install` | `SELF_INSTALL_VERIFY_OK` |
+| Lifecycle (install → upgrade → uninstall → reinstall) | `PUBLIC_GIT_INSTALL_UPGRADE_UNINSTALL_REINSTALL_OK` at `09487e52` |
+| Regressions | `ENHANCE_REGRESSION_PASS count=17 native=True`; Q5 32/32 after `09487e5` |
+| Gateway boot | hook loaded; webhook bound `127.0.0.1:18080`; `GET /health` → 200 |
+| runtime-status | `errors: []`, `model_route=true`, `installed=0` (isolated profile has no Weixin adapter) |
+
+Findings:
+
+- Enabling the plugin makes Core prepend the per-install PM runtime venv to
+  `sys.path`, so Core optional dependencies (here `aiohttp`) must exist *in that
+  venv*. The earlier `Webhook: aiohttp not installed` was this redirection, not
+  a missing wheel in the Core venv.
+- The test gateway was stopped after capture. No real Weixin send/receive ran on
+  T4; that still needs a production send.
+
+### 12.2 PR #8 and production state
+
+- PR #8 (workflow-only) merged; GitHub `main` =
+  `1469a2ed8173d3ad3b3a567813ef6c555045ca5f`.
+- K5 cleanup done: `/opt/data/plugins/hermes-wechat-enhance` and `.../hooks` are
+  `1000:1000`; no `__pycache__` remains.
+- Gateway restarted 2026-10-24 20:31:07 +08 (pid 2418157); hooks reloaded;
+  runtime-status `errors: []`.
+
+### 12.3 Production FIFO stall — root cause and fix (not deployed)
+
+- From 2026-10-25 07:43:40 +08 the deferred FIFO stopped draining after
+  transient iLink connect failures. The queue held 4 bubbles (seq 582–585);
+  seq 582 had 1274 attempts; new bubbles only enqueued behind the backlog.
+- Cause: `_transient_retry_delay` computed `2 ** (attempt - 1)` in float space.
+  At `attempt >= 1024` this raises `OverflowError`, which killed the retry
+  worker; the enqueue path alone never restarts a worker.
+- Fix (`31309e2`): cap the exponent before float conversion, plus a regression
+  check (`huge attempt count does not overflow backoff`) in
+  `scripts/test-fix-regressions-v320.py`. The full native suite passes with the
+  fix.
+- iLink connectivity is back (TLS 1.3 handshake from the container,
+  2026-10-25 11:2x). The fix is **not** deployed to production and the backlog
+  is not yet drained.
+
+### 12.4 Core I1 provenance patch (not upstreamed)
+
+- Local Core commit `883d03f9` on 0.21.6: 8 files, +383/−32; 32 focused + 40
+  auxiliary-client tests pass.
+- Artifact: `I1.T1-core-provenance-patch/i1-provenance.patch`, SHA256
+  `f338742e54a162d1b264b7681b47f60bcc876e031ffdfd91efcbf569244da89a`.
+- No Core push; production Core untouched.
+
+### 12.5 Evidence and status
+
+- T4/FIFO evidence archive:
+  `/home/vive/Work/.scratch/2026-10-25-wechat-t4-fifo-evidence.tar.gz`,
+  SHA256 `c0790c0fe3fead5d794caa2cfa0eae48151feced3c0ca202c408e99ea93a53de`.
+- Still open: real Weixin delivery run, production deployment of `31309e2` with
+  backlog drain, and the branch push/PR. 3.4.4 stays at "partial acceptance"
+  until the first two run.
