@@ -46,9 +46,9 @@ authorization.
 | Data ownership and rebuild rules | `docs/PERSISTENCE_CONTRACT.md` |
 | Install-state diagnosis and repair | `docs/INSTALL_STATE_RUNBOOK.md` |
 | Change-impact checklist | `IMPACT_MATRIX.md` |
-| Current cross-agent task/status registration | NAS handoff `README.md` and each agent's `*_STATUS.md` |
+| Current cross-agent task/status registration | Private [hermes-collab-center](https://github.com/Awenforever/hermes-collab-center) `projects/plugins/wechat-enhance/` (`PROJECT.md` §6 + `LOG.md` tail); NAS handoff `README.md` keeps executor registration only |
 | Machine identities, network and production map | NAS `~/Work/AGENTS.md` (machine table is the SSOT) |
-| Documentation rules (SSOT, banned terms, as-of) | NAS `~/Work/DOC_GOVERNANCE.md` |
+| Documentation rules (SSOT, banned terms, as-of) | [hermes-collab-center GOVERNANCE.md](https://github.com/Awenforever/hermes-collab-center/blob/main/GOVERNANCE.md) (canonical); NAS `~/Work/DOC_GOVERNANCE.md` is a redirect stub |
 
 ## Current execution tracks
 
