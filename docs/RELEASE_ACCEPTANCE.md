@@ -8,7 +8,7 @@ must not be described as fully accepted across every supported platform.
 
 **Update 2026-10-25:** PR #8 merged, production K5 cleanup and a Gateway
 restart are done, and T4 now passes through Gateway boot on Windows 11 native.
-A production FIFO defect found in 3.4.4 is fixed on the branch but not yet
+A production FIFO defect found in 3.4.4 is redesigned on the branch but not yet
 deployed; real Weixin delivery remains unverified. Details in §12.
 
 This record follows `PLUGIN_TEST_CONTRACT.md` and the release gate in
@@ -290,7 +290,7 @@ Findings:
 - Gateway restarted 2026-10-24 20:31:07 +08 (pid 2418157); hooks reloaded;
   runtime-status `errors: []`.
 
-### 12.3 Production FIFO stall — root cause and fix (not deployed)
+### 12.3 Production FIFO stall — root cause and first fix (superseded by §12.7)
 
 - From 2026-10-25 07:43:40 +08 the deferred FIFO stopped draining after
   transient iLink connect failures. The queue held 4 bubbles (seq 582–585);
@@ -305,6 +305,9 @@ Findings:
 - iLink connectivity is back (TLS 1.3 handshake from the container,
   2026-10-25 11:2x). The fix is **not** deployed to production and the backlog
   is not yet drained.
+- `31309e2` only removed the overflow; it did not close the structural gap (a
+  dead worker or an enqueue-only path could still strand rows). §12.7 replaces
+  the retry model with a queue-driven drain.
 
 ### 12.4 Core I1 provenance patch (not upstreamed)
 
@@ -319,7 +322,7 @@ Findings:
 - T4/FIFO evidence archive:
   `/home/vive/Work/.scratch/2026-10-25-wechat-t4-fifo-evidence.tar.gz`,
   SHA256 `c0790c0fe3fead5d794caa2cfa0eae48151feced3c0ca202c408e99ea93a53de`.
-- Still open: real Weixin delivery run, production deployment of `31309e2` with
+- Still open: real Weixin delivery run, production deployment of `afe4dd7` with
   backlog drain, and the branch push/PR. 3.4.4 stays at "partial acceptance"
   until the first two run.
 
@@ -332,4 +335,50 @@ This confirms the drain path revives on inbound (`process_message` →
 `drain_pending`) and that the outage was a dead worker plus no inbound, not a
 permanently invalid token. The `31309e2` overflow fix was **not** deployed for
 this recovery; it remains preventive work, and no session-side production write
-was made.
+was made. The structural gap is addressed by §12.7.
+
+### 12.7 Queue-driven FIFO redesign — 2026-10-25 (not deployed)
+
+Required invariant: while `pending_bubbles` holds rows and a usable reply window
+exists, the plugin keeps draining in strict `seq` order; a failed send never
+leaves the queue; only a successful acknowledgement or an explicit withdrawal
+removes a row; no separate retry task may be the sole owner of that wakeup.
+
+- Commit `afe4dd7` on `qoder/residual-closure-20261024`:
+  - `DRAIN_BACKOFF_CEILING_SECONDS` 120 → **60**; every cadence is capped,
+    including explicit iLink cooldowns. The exponent is capped before the float
+    conversion, so a huge `attempts` value cannot raise `OverflowError`.
+  - Removed the `MAX_DRAIN_PROBES` give-up. Unclassified/permanent-looking
+    errors keep a 45s probe forever; only iLink `-14` (session expired) pauses
+    the queue until a fresh inbound refreshes the token.
+  - A missing cached token does **not** pause: Core deliberately sends tokenless
+    as a degraded fallback. This matters for groups, where `_process_message`
+    stores the token under `sender_id` but `_guess_chat_type` sends to the room
+    id, so a room-scoped token never exists.
+  - `ensure_drainer()` revives a dead worker from every producer/consumer edge:
+    enqueue behind a backlog, every inbound, startup recovery, and the worker's
+    own exit. Failed rows are never re-enqueued (`client_id` UNIQUE +
+    `INSERT OR IGNORE`), so revival cannot duplicate a bubble.
+  - The worker catches any exception from `drain_pending` and continues at the
+    capped cadence; `CancelledError` (shutdown/preemption) is the only exit
+    besides an empty queue or a session-expiry pause.
+  - Startup recovery arms every persisted `pending_routes_v1` route, not only
+    routes derivable from the in-memory token cache.
+  - Attempts only drive warning logs (`MAX_TRANSIENT_DRAIN_RETRIES`, then every
+    20 attempts); nothing is dropped or skipped.
+- Tests:
+  - New `scripts/test-fifo-backlog-invariant.py` (18 checks, stdlib fixtures):
+    60s ceiling/no overflow, five unclassified failures still drain, enqueue-only
+    revival without inbound, strict older-before-newer order, `-14` pause then
+    inbound resume, tokenless startup drain, and survival of a crash inside
+    `drain_pending`.
+  - `scripts/test-fix-regressions-v320.py`: 88/88 with the 60s expectations and
+    the new pause/revival assertions.
+  - Full `scripts/run-regressions.py --hermes-root /opt/hermes`: 18/18 test
+    files pass in a disposable `nousresearch/hermes-agent:v0.21.6` container
+    (`--network none`, repo mounted read-only; no production container or
+    plugin-data touched).
+  - NAS host: `test-v021-bubble-footer.py` OK, `test-restart-drain.py` OK,
+    `test-fifo-backlog-invariant.py` 18/18.
+- Not deployed. Production still runs the pre-redesign plugin. Deploying the fix
+  and draining any real WeChat backlog remain gated on explicit authorization.
