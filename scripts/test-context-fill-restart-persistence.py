@@ -203,6 +203,18 @@ def case_corrupt_file_does_not_raise():
     M._CONTEXT_FILL_LOADED = False
     assert M.context_bar(CHAT) == ""
 
+
+def case_near_zero_fill_is_not_an_empty_code_span():
+    reset()
+    assert M._remember_context_fill(CHAT, 10, 1_000_000)
+    bar = M.context_bar(CHAT)
+    assert bar and not bar.strip(), "a near-zero fill renders as blank cells"
+    decorate = getattr(M, "_decorate_footer", None)
+    if decorate is not None:
+        footer = decorate("x", 3, "m", CHAT)
+        bt = chr(96)
+        assert (bt + bar + bt) not in footer, "an all-blank bar must not become a code span"
+
 for case in (
     case_persisted_reading_survives_age,
     case_one_chat_cannot_evict_another,
@@ -215,7 +227,8 @@ for case in (
     case_state_file_is_written_atomically,
     case_one_corrupt_entry_keeps_the_others,
     case_corrupt_file_does_not_raise,
+    case_near_zero_fill_is_not_an_empty_code_span,
 ):
     case()
 
-print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=11')
+print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=12')

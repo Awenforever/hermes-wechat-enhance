@@ -564,7 +564,10 @@ def _decorate_footer(chunk: str, count: int, model: str, chat_id: str) -> str:
     """
     footer = f"`{count}` `{model}`"
     bar = context_bar(chat_id)
-    if bar:
+    # A very low fill renders as blanks. Appending it would emit an empty
+    # inline-code span, which reads as a rendering glitch rather than as
+    # "nearly empty", so the bar is omitted until there is something to show.
+    if bar.strip():
         footer = f"{footer} `{bar}`"
     return f"{chunk}\n\n---\n\n{footer}"
 
