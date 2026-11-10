@@ -30,6 +30,22 @@ This record follows `PLUGIN_TEST_CONTRACT.md` and the release gate in
 `SKILL.md`. It supplements, but never replaces, `scripts/verify-self-install.py`
 and the regression suite.
 
+## 3.5.1 - context bar capture and persistence (2026-11-11, Asia/Shanghai)
+
+Delta over 3.5.0, confined to the bubble footer:
+
+* a persisted per-chat reading is no longer discarded on load because of age, so the
+  bar survives a restart of a chat idle for longer than the six-hour turn-metadata
+  TTL; that discard is why the bar vanished in production;
+* the post-turn capture re-reads the warmed agent cache when the turn result carries
+  no usage, so the first turn after a gateway restart is captured instead of lost
+  while the cache is still cold;
+* a capture with no usable reading logs once per chat, and an install that cannot
+  wrap _run_agent_inner says so, instead of both failing silently.
+
+Regression: scripts/test-context-fill-restart-persistence.py pins both capture paths
+and fails on the 3.5.0 tree. Four-platform acceptance has not been re-executed for
+3.5.1; the delta only touches the footer indicator and cannot affect delivery.
 ## 1. Release identity
 
 | Item | Value |

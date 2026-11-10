@@ -327,11 +327,14 @@ def _load_context_fill() -> None:
         _CONTEXT_FILL_LOADED = True
         try:
             raw = json.loads(_context_fill_path().read_text(encoding="utf-8"))
-            cutoff = time.time() - TURN_MODEL_TTL_SECONDS
             for chat, entry in (raw or {}).items():
                 used, limit, ts = (list(entry) + [0, 0, 0.0])[:3]
                 used, limit = int(used or 0), int(limit or 0)
-                if used > 0 and limit > 0 and float(ts or 0) >= cutoff:
+                # Age is not staleness of the reading: context fill does not decay
+                # while a chat is idle. Pruning by TTL here blanked the bar for any
+                # chat untouched for six hours before the restart, which is the
+                # opposite of what persisting the value is for.
+                if used > 0 and limit > 0:
                     _CONTEXT_FILL[str(chat)] = (used, limit, float(ts))
         except Exception:
             pass
@@ -349,13 +352,37 @@ def _save_context_fill() -> None:
         pass
 
 
+_CONTEXT_FILL_WARNED: set = set()
+
+
+def _warn_context_fill_once(chat_id: str, reason: str) -> None:
+    """Report each chat's capture failure once per process.
+
+    Silence here is why "the bar disappeared" took three rounds to diagnose: the
+    capture returned early and nothing anywhere said so.
+    """
+    key = (chat_id, reason.split(":", 1)[0])
+    if key in _CONTEXT_FILL_WARNED:
+        return
+    _CONTEXT_FILL_WARNED.add(key)
+    logger.warning(
+        "Hermes WeChat Enhance: context bar has no reading for %s (%s); the footer "
+        "omits the bar until a turn reports usage",
+        chat_id, reason,
+    )
+
+
 def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> None:
     try:
         used_i = int(used or 0)
         limit_i = int(limit or 0)
     except (TypeError, ValueError):
+        _warn_context_fill_once(str(chat_id), "unparsable usage: used=%r limit=%r" % (used, limit))
         return
     if used_i <= 0 or limit_i <= 0:
+        _warn_context_fill_once(
+            str(chat_id), "no usable reading: used=%r limit=%r" % (used_i, limit_i)
+        )
         return
     with _CONTEXT_FILL_LOCK:
         _CONTEXT_FILL[str(chat_id)] = (used_i, limit_i, time.time())
@@ -1457,7 +1484,19 @@ def patch_gateway_runner(runner: Any) -> bool:
     original_resolve = getattr(runner, "_resolve_session_agent_runtime", None)
     original_run = getattr(runner, "_run_agent_inner", None)
     if not callable(original_resolve):
+        logger.warning(
+            "Hermes WeChat Enhance: gateway runner has no _resolve_session_agent_runtime; "
+            "model provenance and the context bar stay off for this runner"
+        )
         return False
+    if not callable(original_run):
+        # The model tag survives through _resolve_session_agent_runtime, so this
+        # only kills the per-turn boundaries (context fill). Failing silently here
+        # is what made the missing bar look like a rendering bug.
+        logger.warning(
+            "Hermes WeChat Enhance: gateway runner has no _run_agent_inner; "
+            "the context bar cannot capture usage on this runner (model tags still work)"
+        )
 
     @functools.wraps(original_resolve)
     def wrapped(*args: Any, **kwargs: Any):
@@ -1520,6 +1559,13 @@ def patch_gateway_runner(runner: Any) -> bool:
                     chat_id,
                     result.get("last_prompt_tokens"),
                     result.get("context_length"),
+                )
+                # The turn result does not always carry usage (proxy runs, and any
+                # gateway build that reports it only on the session entry). The
+                # cached agent is warm by now, so re-read it as the authoritative
+                # fallback instead of leaving the bar blank for that turn.
+                _refresh_context_fill_from_cached_agent(
+                    runner, source, call.get("session_key")
                 )
             return result
 
