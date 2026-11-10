@@ -30,22 +30,6 @@ This record follows `PLUGIN_TEST_CONTRACT.md` and the release gate in
 `SKILL.md`. It supplements, but never replaces, `scripts/verify-self-install.py`
 and the regression suite.
 
-## 3.5.1 - context bar capture and persistence (2026-11-11, Asia/Shanghai)
-
-Delta over 3.5.0, confined to the bubble footer:
-
-* a persisted per-chat reading is no longer discarded on load because of age, so the
-  bar survives a restart of a chat idle for longer than the six-hour turn-metadata
-  TTL; that discard is why the bar vanished in production;
-* the post-turn capture re-reads the warmed agent cache when the turn result carries
-  no usage, so the first turn after a gateway restart is captured instead of lost
-  while the cache is still cold;
-* a capture with no usable reading logs once per chat, and an install that cannot
-  wrap _run_agent_inner says so, instead of both failing silently.
-
-Regression: scripts/test-context-fill-restart-persistence.py pins both capture paths
-and fails on the 3.5.0 tree. Four-platform acceptance has not been re-executed for
-3.5.1; the delta only touches the footer indicator and cannot affect delivery.
 ## 1. Release identity
 
 | Item | Value |
@@ -530,3 +514,25 @@ removes a row; no separate retry task may be the sole owner of that wakeup.
   `HEAD` remains `f82fbc7`, so the four aligned metadata files appear as
   intentional local modifications. Do not run `git checkout` or `git clean`
   in that directory.
+
+## Addendum 3.5.1 - context bar capture and persistence (2026-11-11, Asia/Shanghai)
+
+- 读者：维护者 / QA。用途：记录 3.5.1 的增量证据，不替代上面按平台记录的历史验收。
+- 位置：本附录追加在文件末尾；Current status 与 §12 正文不动，避免打乱既有阅读顺序。
+
+Delta over 3.5.0, confined to the bubble footer:
+
+* a persisted per-chat reading is no longer discarded because of age, and the
+  write path no longer prunes by age either, so one chat completing a turn can
+  no longer erase another chat reading;
+* the end-of-turn capture resolves the reading from the turn result and the
+  context engine together, so the first turn after a gateway restart is
+  captured instead of lost while the agent cache is still cold;
+* a capture with no reading logs once per chat with a peer digest, and an
+  install that cannot wrap _run_agent_inner says so.
+
+Regression: `scripts/test-context-fill-restart-persistence.py` (7 cases) fails
+on the 3.5.0 tree and passes here; it is registered in the CI required list.
+Four-platform acceptance has not been re-executed for 3.5.1. The delta does not
+touch delivery, FIFO or dedup code, but it adds a call inside the turn boundary,
+so "cannot affect delivery" is a code-scope claim, not a measured one.

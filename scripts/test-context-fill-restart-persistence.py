@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""The context bar must survive a restart and a cold agent cache.
+"""Context bar capture: persistence, precedence, isolation, observability.
 
-Two real failures are pinned here:
+Pinned failures:
 
-* a persisted reading was discarded on load once it was older than the TTL, so
-  the bar vanished for any chat that had been idle before the restart — the
-  opposite of what persisting the value is for;
-* the first turn after every gateway restart captured nothing: the pre-turn
-  snapshot needs a warm agent cache, and the turn result carried no usage.
+* a persisted reading was discarded on load once older than the six-hour
+  turn-metadata TTL, so the bar vanished after any idle period spanning a
+  restart;
+* pruning by that same TTL on every capture erased *other* chats' readings as
+  soon as one chat finished a turn;
+* the first turn after a restart captured nothing, because the turn result
+  carries no context length and the pre-turn snapshot needs a warm cache;
+* rejections were silent, and the warning leaked the raw peer id.
 """
 import asyncio
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -24,31 +28,79 @@ sys.path.insert(0, str(ROOT))
 
 HOME = tempfile.mkdtemp(prefix='enhance-ctx-persist-')
 os.environ['HERMES_HOME'] = HOME
+os.environ.pop('HERMES_WECHAT_FOOTER_CONTEXT_BAR', None)
+os.environ.pop('HERMES_WECHAT_FOOTER_CONTEXT_PIE', None)
 from hermes_wechat_enhance import v021_bubble_footer as M  # noqa: E402
 
 CHAT = 'synthetic-peer'
+OTHER = 'synthetic-peer-two'
 STATE = Path(HOME) / 'plugin-data' / 'hermes-wechat-enhance' / 'context-fill.json'
+
+
+class Captured(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
 
 
 def reset():
     M._CONTEXT_FILL.clear()
     M._CONTEXT_FILL_LOADED = False
+    if hasattr(M, "_CONTEXT_FILL_WARNED"):
+        M._CONTEXT_FILL_WARNED.clear()
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+
+
+def bar_shape_ok(bar):
+    return len(bar) == M.CONTEXT_BAR_CELLS
 
 
 def case_persisted_reading_survives_age():
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    ancient = time.time() - 30 * 24 * 3600
-    STATE.write_text(json.dumps({CHAT: [250_000, 1_000_000, ancient]}), encoding='utf-8')
     reset()
+    STATE.write_text(json.dumps({CHAT: [250_000, 1_000_000, time.time() - 30 * 24 * 3600]}),
+                     encoding='utf-8')
+    M._CONTEXT_FILL.clear()
+    M._CONTEXT_FILL_LOADED = False
     bar = M.context_bar(CHAT)
     assert bar.strip(), 'a persisted reading must still render after a long idle'
-    assert M._CONTEXT_FILL[CHAT][0] == 250_000
+    assert bar_shape_ok(bar), 'the bar keeps a constant width'
+    assert bar.startswith('██ ') and not bar.startswith('███'), '25%% renders as two cells'
+
+
+def case_one_chat_cannot_evict_another():
+    reset()
+    STATE.write_text(json.dumps({OTHER: [250_000, 1_000_000, time.time() - 30 * 24 * 3600]}),
+                     encoding='utf-8')
+    M._CONTEXT_FILL.clear()
+    M._CONTEXT_FILL_LOADED = False
+    assert M.context_bar(OTHER).strip()
+    assert M._remember_context_fill(CHAT, 900_000, 1_000_000)
+    assert M.context_bar(OTHER).strip(), 'capturing one chat must not drop another'
+    persisted = json.loads(STATE.read_text(encoding='utf-8'))
+    assert OTHER in persisted and CHAT in persisted, 'both readings survive on disk'
+
+
+def case_result_reading_wins_over_the_engine():
+    reset()
+    comp = SimpleNamespace(last_prompt_tokens=222_222, last_real_prompt_tokens=222_222,
+                           context_length=1_000_000)
+    reading = M._resolve_context_reading({'last_prompt_tokens': 111_111}, comp)
+    assert reading == (111_111, 1_000_000), 'the turn result is authoritative for the fill'
+    reading = M._resolve_context_reading({}, comp)
+    assert reading == (222_222, 1_000_000), 'the engine covers a result without usage'
+    assert M._resolve_context_reading({}, SimpleNamespace(context_length=0)) is None
 
 
 def case_first_turn_after_restart_captures():
-    STATE.write_text('{}', encoding='utf-8')
     reset()
-    comp = SimpleNamespace(last_prompt_tokens=123_456, context_length=1_000_000)
+    STATE.write_text('{}', encoding='utf-8')
+    M._CONTEXT_FILL.clear()
+    M._CONTEXT_FILL_LOADED = False
+    comp = SimpleNamespace(last_prompt_tokens=123_456, last_real_prompt_tokens=123_456,
+                           context_length=1_000_000)
     agent = SimpleNamespace(context_compressor=comp)
 
     class Runner:
@@ -73,6 +125,52 @@ def case_first_turn_after_restart_captures():
     assert M.context_bar(CHAT).strip()
 
 
-case_persisted_reading_survives_age()
-case_first_turn_after_restart_captures()
-print('CONTEXT_FILL_RESTART_PERSISTENCE_OK')
+def case_rejection_is_reported_without_the_peer_id():
+    reset()
+    handler = Captured()
+    M.logger.addHandler(handler)
+    try:
+        assert not M._remember_context_fill(CHAT, 0, 0), 'a zero reading is not a reading'
+        M._warn_context_fill_once(CHAT, 'no usable reading')
+        M._warn_context_fill_once(CHAT, 'no usable reading')
+    finally:
+        M.logger.removeHandler(handler)
+    assert handler.messages, 'a rejected capture must be observable'
+    assert len(handler.messages) == 1, 'each chat is reported once per process'
+    message = handler.messages[0]
+    assert 'peer=' in message and CHAT not in message, 'the peer id must not be logged raw'
+
+
+def case_save_then_reload_round_trips():
+    reset()
+    assert M._remember_context_fill(CHAT, 640_000, 1_000_000)
+    M._CONTEXT_FILL.clear()
+    M._CONTEXT_FILL_LOADED = False
+    bar = M.context_bar(CHAT)
+    assert bar.strip() and bar_shape_ok(bar), 'a saved reading must come back'
+    assert M._CONTEXT_FILL[CHAT][0] == 640_000
+
+
+def case_no_capture_when_the_sentinel_says_unknown():
+    reset()
+    assert M._remember_context_fill(CHAT, 500_000, 1_000_000)
+    comp = SimpleNamespace(last_prompt_tokens=-1, context_length=1_000_000)
+    agent = SimpleNamespace(context_compressor=comp)
+    runner = SimpleNamespace(_agent_cache={'k': (agent, 'sig')}, _agent_cache_lock=threading.Lock())
+    source = SimpleNamespace(chat_id=CHAT, platform=SimpleNamespace(value='weixin'))
+    M._refresh_context_fill_from_cached_agent(runner, source, 'k')
+    assert not M.context_bar(CHAT).strip(), 'compression withdraws the reading (kept contract)'
+
+
+for case in (
+    case_persisted_reading_survives_age,
+    case_one_chat_cannot_evict_another,
+    case_result_reading_wins_over_the_engine,
+    case_first_turn_after_restart_captures,
+    case_rejection_is_reported_without_the_peer_id,
+    case_save_then_reload_round_trips,
+    case_no_capture_when_the_sentinel_says_unknown,
+):
+    case()
+
+print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=7')

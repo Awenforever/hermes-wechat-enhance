@@ -307,6 +307,7 @@ COOLDOWN_RESUME_JITTER_SECONDS = 0.05
 _CONTEXT_FILL: Dict[str, tuple[int, int, float]] = {}
 _CONTEXT_FILL_LOCK = threading.RLock()
 _CONTEXT_FILL_LOADED = False
+CONTEXT_FILL_MAX_CHATS = 200
 CONTEXT_BAR_CELLS = 8
 CONTEXT_BAR_FULL = "█"
 CONTEXT_BAR_BLANK = " "
@@ -365,36 +366,101 @@ def _warn_context_fill_once(chat_id: str, reason: str) -> None:
     if key in _CONTEXT_FILL_WARNED:
         return
     _CONTEXT_FILL_WARNED.add(key)
+    # Peer ids are personal identifiers; every other log line in this module
+    # writes a digest, so this one must not be the exception.
+    peer = hashlib.sha256(chat_id.encode("utf-8", "surrogatepass")).hexdigest()[:16]
     logger.warning(
-        "Hermes WeChat Enhance: context bar has no reading for %s (%s); the footer "
-        "omits the bar until a turn reports usage",
-        chat_id, reason,
+        "Hermes WeChat Enhance: context bar has no reading for peer=%s (%s); the "
+        "footer omits the bar until a turn reports usage",
+        peer, reason,
     )
 
 
-def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> None:
+def _resolve_context_reading(result: Any, comp: Any):
+    "Return (used, limit) from the turn result and the context engine."
+    limit = 0
+    for source in (result, comp):
+        try:
+            limit = int(getattr(source, "context_length", 0) or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit > 0:
+            break
+    if limit <= 0:
+        return None
+    candidates = []
+    if isinstance(result, dict):
+        candidates.append(result.get("last_prompt_tokens"))
+    candidates.append(getattr(comp, "last_real_prompt_tokens", 0))
+    candidates.append(getattr(comp, "last_prompt_tokens", 0))
+    for candidate in candidates:
+        try:
+            used = int(candidate or 0)
+        except (TypeError, ValueError):
+            continue
+        if used > 0:
+            return used, limit
+    return None
+
+def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> bool:
+    "Store one reading; True when a value was written."
     try:
         used_i = int(used or 0)
         limit_i = int(limit or 0)
     except (TypeError, ValueError):
-        _warn_context_fill_once(str(chat_id), "unparsable usage: used=%r limit=%r" % (used, limit))
-        return
+        return False
     if used_i <= 0 or limit_i <= 0:
-        _warn_context_fill_once(
-            str(chat_id), "no usable reading: used=%r limit=%r" % (used_i, limit_i)
-        )
-        return
+        return False
     with _CONTEXT_FILL_LOCK:
         _CONTEXT_FILL[str(chat_id)] = (used_i, limit_i, time.time())
         _prune_context_fill()
     _save_context_fill()
+    return True
 
+
+def _forget_context_fill(chat_id: str) -> None:
+    "Withdraw one chat reading, in memory and on disk."
+    _load_context_fill()
+    with _CONTEXT_FILL_LOCK:
+        _CONTEXT_FILL.pop(str(chat_id), None)
+    _save_context_fill()
 
 def _prune_context_fill() -> None:
-    cutoff = time.time() - TURN_MODEL_TTL_SECONDS
-    for key in [k for k, v in _CONTEXT_FILL.items() if v[2] < cutoff]:
+    "Bound the map by chat count. Age is never a reason to drop a reading."
+    overflow = len(_CONTEXT_FILL) - CONTEXT_FILL_MAX_CHATS
+    if overflow <= 0:
+        return
+    oldest = sorted(_CONTEXT_FILL.items(), key=lambda item: item[1][2])[:overflow]
+    for key, _entry in oldest:
         _CONTEXT_FILL.pop(key, None)
 
+
+def _capture_turn_context_fill(runner: Any, source: Any, session_key: Any, result: Any, chat_id: str) -> None:
+    "Record the fill for this turn, and say so once when no reading exists."
+    comp = _cached_context_engine(runner, session_key)
+    reading = _resolve_context_reading(result, comp)
+    if reading is not None and _remember_context_fill(chat_id, reading[0], reading[1]):
+        return
+    _warn_context_fill_once(str(chat_id), "no usable reading after the turn result and the cached engine")
+
+
+def _cached_context_engine(runner: Any, session_key: Any) -> Any:
+    "Return the cached agent context engine, or None when it is not reachable."
+    try:
+        key = str(session_key or "")
+        cache = getattr(runner, "_agent_cache", None)
+        if not key or not cache:
+            return None
+        lock = getattr(runner, "_agent_cache_lock", None)
+        if lock is not None:
+            with lock:
+                entry = cache.get(key)
+        else:
+            entry = cache.get(key)
+        agent = entry[0] if isinstance(entry, (tuple, list)) and entry else entry
+        return getattr(agent, "context_compressor", None)
+    except Exception:
+        return None
 
 def _refresh_context_fill_from_cached_agent(runner: Any, source: Any, session_key: Optional[str] = None) -> None:
     """Seed the footer fill from the live cached agent BEFORE the turn runs.
@@ -425,18 +491,22 @@ def _refresh_context_fill_from_cached_agent(runner: Any, source: Any, session_ke
         comp = getattr(agent, "context_compressor", None)
         if comp is None:
             return
-        used = getattr(comp, "last_prompt_tokens", 0)
-        if int(used or 0) < 0:
-            _load_context_fill()
-            with _CONTEXT_FILL_LOCK:
-                _CONTEXT_FILL.pop(chat_id, None)
-            _save_context_fill()
+        sentinel = 0
+        try:
+            sentinel = int(getattr(comp, "last_prompt_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            sentinel = 0
+        if sentinel < 0:
+            # Kept contract: a negative reading means the API usage is unknown
+            # (compression), and the indicator is withdrawn rather than showing
+            # a value the engine just invalidated. tests/test-context-fill-*
+            # pin this, so widening it is a product decision, not a bug fix.
+            _forget_context_fill(chat_id)
             return
-        _remember_context_fill(
-            chat_id,
-            used,
-            getattr(comp, "context_length", 0),
-        )
+        reading = _resolve_context_reading(None, comp)
+        if reading is None:
+            return
+        _remember_context_fill(chat_id, reading[0], reading[1])
     except Exception:
         return
 
@@ -1553,19 +1623,8 @@ def patch_gateway_runner(runner: Any) -> bool:
                 response = result.get("final_response") or result.get("response") or ""
                 response = _delivery_shaped_response(platform_obj, response)
                 _remember_model(chat_id, model, completed=True, response=response)
-                # The turn result carries the API-reported context fill and the
-                # resolved context-window limit; capture both for the footer bar.
-                _remember_context_fill(
-                    chat_id,
-                    result.get("last_prompt_tokens"),
-                    result.get("context_length"),
-                )
-                # The turn result does not always carry usage (proxy runs, and any
-                # gateway build that reports it only on the session entry). The
-                # cached agent is warm by now, so re-read it as the authoritative
-                # fallback instead of leaving the bar blank for that turn.
-                _refresh_context_fill_from_cached_agent(
-                    runner, source, call.get("session_key")
+                _capture_turn_context_fill(
+                    runner, source, call.get("session_key"), result, chat_id
                 )
             return result
 

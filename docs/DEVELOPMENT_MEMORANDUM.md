@@ -1,5 +1,16 @@
 # Hermes WeChat Enhance — Development Memorandum
 
+## 2026-11-11 - Context bar capture (3.5.1)
+
+The footer progress bar is fed by one captured reading per chat. Three defects
+made it vanish: the reader dropped a persisted reading once it was six hours
+old; the writer pruned by the same TTL, so any chat finishing a turn erased the
+others; and the end-of-turn capture trusted a context_length field the turn
+result never carries, leaving only a warm-cache read that the first turn after
+a restart cannot satisfy. Capture now resolves the fill from the turn result and
+the context engine together, and the engine supplies the limit. A negative fill
+remains the compression sentinel that withdraws the indicator, which is the
+pre-existing contract and stays pinned by tests.
 ## 2026-10-25 — Queue-driven FIFO drain (3.5.0)
 
 The durable queue, not a retry task, now owns delivery. `ensure_drainer` is
