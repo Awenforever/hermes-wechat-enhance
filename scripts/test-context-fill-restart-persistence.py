@@ -162,6 +162,47 @@ def case_no_capture_when_the_sentinel_says_unknown():
     assert not M.context_bar(CHAT).strip(), 'compression withdraws the reading (kept contract)'
 
 
+
+def case_dict_result_supplies_the_limit_without_a_cache():
+    """A provider fallback evicts the agent cache; the result is all we have."""
+    reset()
+    reading = M._resolve_context_reading(
+        {"last_prompt_tokens": 111_111, "context_length": 1_000_000}, None)
+    assert reading == (111_111, 1_000_000), "a dict result must be read with .get"
+    assert M._remember_context_fill(CHAT, reading[0], reading[1])
+    assert M.context_bar(CHAT).strip()
+
+
+def case_state_file_is_written_atomically():
+    reset()
+    assert M._remember_context_fill(CHAT, 300_000, 1_000_000)
+    leftovers = sorted(x.name for x in STATE.parent.iterdir() if x.name.endswith(".tmp"))
+    assert not leftovers, "a successful save leaves no temporary file behind"
+    parsed = json.loads(STATE.read_text(encoding="utf-8"))
+    assert str(CHAT) in parsed, "the file is valid JSON after the replace"
+    mode = oct(STATE.stat().st_mode & 0o777)
+    assert mode == "0o600", "the state file is private, mode=%s" % mode
+
+
+def case_one_corrupt_entry_keeps_the_others():
+    reset()
+    STATE.write_text(json.dumps({
+        CHAT: [250_000, 1_000_000, time.time()],
+        "broken-peer": "not-a-triple",
+    }), encoding="utf-8")
+    M._CONTEXT_FILL.clear()
+    M._CONTEXT_FILL_LOADED = False
+    assert M.context_bar(CHAT).strip(), "a corrupt sibling must not discard the good entry"
+    assert M.context_bar("broken-peer") == ""
+
+
+def case_corrupt_file_does_not_raise():
+    reset()
+    STATE.write_text("{not json", encoding="utf-8")
+    M._CONTEXT_FILL.clear()
+    M._CONTEXT_FILL_LOADED = False
+    assert M.context_bar(CHAT) == ""
+
 for case in (
     case_persisted_reading_survives_age,
     case_one_chat_cannot_evict_another,
@@ -170,7 +211,11 @@ for case in (
     case_rejection_is_reported_without_the_peer_id,
     case_save_then_reload_round_trips,
     case_no_capture_when_the_sentinel_says_unknown,
+    case_dict_result_supplies_the_limit_without_a_cache,
+    case_state_file_is_written_atomically,
+    case_one_corrupt_entry_keeps_the_others,
+    case_corrupt_file_does_not_raise,
 ):
     case()
 
-print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=7')
+print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=11')

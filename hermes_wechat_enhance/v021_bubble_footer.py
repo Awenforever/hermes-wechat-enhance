@@ -328,29 +328,42 @@ def _load_context_fill() -> None:
         _CONTEXT_FILL_LOADED = True
         try:
             raw = json.loads(_context_fill_path().read_text(encoding="utf-8"))
+        except Exception:
+            raw = {}
+        if raw:
             for chat, entry in (raw or {}).items():
-                used, limit, ts = (list(entry) + [0, 0, 0.0])[:3]
-                used, limit = int(used or 0), int(limit or 0)
+                try:
+                    used, limit, ts = (list(entry) + [0, 0, 0.0])[:3]
+                    used, limit = int(used or 0), int(limit or 0)
+                except (TypeError, ValueError):
+                    continue
                 # Age is not staleness of the reading: context fill does not decay
                 # while a chat is idle. Pruning by TTL here blanked the bar for any
                 # chat untouched for six hours before the restart, which is the
                 # opposite of what persisting the value is for.
                 if used > 0 and limit > 0:
                     _CONTEXT_FILL[str(chat)] = (used, limit, float(ts))
-        except Exception:
-            pass
 
 
 def _save_context_fill() -> None:
+    "Persist atomically: a torn file loses every chat reading at once."
     try:
         path = _context_fill_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with _CONTEXT_FILL_LOCK:
             snapshot = {k: list(v) for k, v in _CONTEXT_FILL.items()}
-        path.write_text(json.dumps(snapshot), encoding="utf-8")
-        os.chmod(path, 0o600)
-    except Exception:
-        pass
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(snapshot), encoding="utf-8")
+            try:
+                os.chmod(tmp, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp, path)
+    except Exception as exc:
+        logger.warning(
+            "Hermes WeChat Enhance: could not persist the context bar state (%r); "
+            "the footer keeps the in-memory reading", exc,
+        )
 
 
 _CONTEXT_FILL_WARNED: set = set()
@@ -379,13 +392,19 @@ def _warn_context_fill_once(chat_id: str, reason: str) -> None:
 def _resolve_context_reading(result: Any, comp: Any):
     "Return (used, limit) from the turn result and the context engine."
     limit = 0
-    for source in (result, comp):
+    if isinstance(result, dict):
+        # A dict has no attributes: getattr() here would silently never see
+        # result['context_length'], which is exactly the turn where the cache
+        # was evicted by a provider fallback and the result is the only source.
         try:
-            limit = int(getattr(source, "context_length", 0) or 0)
+            limit = int(result.get("context_length") or 0)
         except (TypeError, ValueError):
             limit = 0
-        if limit > 0:
-            break
+    if limit <= 0:
+        try:
+            limit = int(getattr(comp, "context_length", 0) or 0)
+        except (TypeError, ValueError):
+            limit = 0
     if limit <= 0:
         return None
     candidates = []
