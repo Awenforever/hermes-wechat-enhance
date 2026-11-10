@@ -215,6 +215,34 @@ def case_near_zero_fill_is_not_an_empty_code_span():
         bt = chr(96)
         assert (bt + bar + bt) not in footer, "an all-blank bar must not become a code span"
 
+
+def case_first_capture_merges_with_the_persisted_file():
+    """A process that captures before it ever renders must not clobber the file."""
+    reset()
+    STATE.write_text(json.dumps({OTHER: [111_000, 1_000_000, time.time()]}), encoding="utf-8")
+    M._CONTEXT_FILL.clear()
+    M._CONTEXT_FILL_LOADED = False          # deliberately not loaded
+    assert M._remember_context_fill(CHAT, 222_000, 1_000_000)
+    persisted = json.loads(STATE.read_text(encoding="utf-8"))
+    assert OTHER in persisted, "the unloaded chat must survive the first save"
+    assert M.context_bar(OTHER).strip()
+
+
+def case_compression_turn_withdraws_the_bar():
+    """The bubble that announces a compression must not repaint the old fill."""
+    reset()
+    assert M._remember_context_fill(CHAT, 900_000, 1_000_000)
+    comp = SimpleNamespace(last_prompt_tokens=-1, last_real_prompt_tokens=900_000,
+                           context_length=1_000_000)
+    agent = SimpleNamespace(context_compressor=comp)
+    runner = SimpleNamespace(_agent_cache={"k": (agent, "sig")},
+                             _agent_cache_lock=threading.Lock())
+    M._capture_turn_context_fill(
+        runner, None, "k", {"last_prompt_tokens": -1}, CHAT)
+    assert not M.context_bar(CHAT).strip(), "the pre-compression fill must be withdrawn"
+    persisted = json.loads(STATE.read_text(encoding="utf-8"))
+    assert str(CHAT) not in persisted
+
 for case in (
     case_persisted_reading_survives_age,
     case_one_chat_cannot_evict_another,
@@ -228,7 +256,9 @@ for case in (
     case_one_corrupt_entry_keeps_the_others,
     case_corrupt_file_does_not_raise,
     case_near_zero_fill_is_not_an_empty_code_span,
+    case_first_capture_merges_with_the_persisted_file,
+    case_compression_turn_withdraws_the_bar,
 ):
     case()
 
-print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=12')
+print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=14')

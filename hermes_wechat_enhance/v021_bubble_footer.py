@@ -423,6 +423,10 @@ def _resolve_context_reading(result: Any, comp: Any):
 
 def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> bool:
     "Store one reading; True when a value was written."
+    # The map is loaded lazily for rendering. A process that captures before it
+    # ever renders would otherwise save a one-entry snapshot and delete every
+    # other chat reading on disk.
+    _load_context_fill()
     try:
         used_i = int(used or 0)
         limit_i = int(limit or 0)
@@ -457,6 +461,18 @@ def _prune_context_fill() -> None:
 def _capture_turn_context_fill(runner: Any, source: Any, session_key: Any, result: Any, chat_id: str) -> None:
     "Record the fill for this turn, and say so once when no reading exists."
     comp = _cached_context_engine(runner, session_key)
+    sentinel = 0
+    try:
+        sentinel = int(getattr(comp, "last_prompt_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        sentinel = 0
+    if sentinel < 0:
+        # Compression invalidated the reading. last_real_prompt_tokens still
+        # holds the pre-compression fill, so resolving it here would repaint
+        # the old ~90% bar on the very bubble that announced the compression.
+        # The turn-start path withdraws for the same reason; keep them identical.
+        _forget_context_fill(chat_id)
+        return
     reading = _resolve_context_reading(result, comp)
     if reading is not None and _remember_context_fill(chat_id, reading[0], reading[1]):
         return

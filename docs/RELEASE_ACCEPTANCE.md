@@ -524,14 +524,18 @@ Delta over 3.5.0, confined to the bubble footer:
 
 * a persisted per-chat reading is no longer discarded because of age, and the
   write path no longer prunes by age either, so one chat completing a turn can
-  no longer erase another chat reading;
+  no longer erase another chat reading; a capture also merges into the file it
+  has not loaded yet instead of overwriting it;
 * the end-of-turn capture resolves the reading from the turn result and the
   context engine together, so the first turn after a gateway restart is
   captured instead of lost while the agent cache is still cold;
+* a compression turn withdraws the bar from both the turn-start and the
+  turn-end path, so the bubble announcing a compression never repaints the
+  pre-compression fill;
 * a capture with no reading logs once per chat with a peer digest, and an
   install that cannot wrap _run_agent_inner says so.
 
-Regression: `scripts/test-context-fill-restart-persistence.py` (7 cases) fails
+Regression: `scripts/test-context-fill-restart-persistence.py` (14 cases) fails
 on the 3.5.0 tree and passes here; it is registered in the CI required list.
 Four-platform acceptance has not been re-executed for 3.5.1. The delta does not
 touch delivery, FIFO or dedup code, but it adds a call inside the turn boundary,
