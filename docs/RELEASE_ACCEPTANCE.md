@@ -536,3 +536,40 @@ on the 3.5.0 tree and passes here; it is registered in the CI required list.
 Four-platform acceptance has not been re-executed for 3.5.1. The delta does not
 touch delivery, FIFO or dedup code, but it adds a call inside the turn boundary,
 so "cannot affect delivery" is a code-scope claim, not a measured one.
+
+### Core coupling this delta relies on
+
+These are Hermes internals, not a public API. Each was asserted to exist in the
+0.21.3 gateway; if one disappears the capture degrades to "no bar", and the
+install-time warning covers the first two.
+
+| Symbol | Assumption | Verified at |
+| --- | --- | --- |
+| runner._run_agent_inner | coroutine; returns a dict; takes session_key | gateway/run_turn.py:3943 |
+| runner._resolve_session_agent_runtime | all-kwargs; returns (model, runtime) | gateway/run_turn.py:72 |
+| runner._agent_cache / _agent_cache_lock | key = session_key; value starts with the agent; synchronous lock | gateway/run.py:3493 |
+| agent.context_compressor | exposes context_length, last_prompt_tokens, last_real_prompt_tokens | agent/context_compressor.py:1865,2402 |
+| turn result keys | has last_prompt_tokens; has never carried context_length | agent/turn_finalizer.py:538-560 |
+
+Note: last_prompt_tokens = -1 is the Core compression sentinel meaning "unknown
+until the next API call". The plugin keeps its pre-existing contract of
+withdrawing the indicator on that value rather than showing an invalidated one.
+
+### Deploy and roll back (3.5.1)
+
+The installer default target is `$HERMES_HOME/skills/hermes-wechat-enhance` while
+the hook loads `$HERMES_HOME/plugins/hermes-wechat-enhance`. On this production host
+those trees differ (plugins 3.5.0, skills 3.0.1), so a default install verifies
+OK and changes nothing that runs. Pin the target explicitly:
+
+1. record the current tree hash and the imported file path;
+2. install with the plugins tree as the source and target of record;
+3. restart the gateway (the hook imports the module at startup);
+4. after restart confirm the imported file path and version, not just install output;
+5. send one Weixin message and check the footer renders the bar;
+6. regenerate install-state (manage-install-state.py record-installed) so a later
+   restore validates the tree that is actually running.
+
+Roll back by restoring the previous plugin tree and restarting the gateway; the
+footer state file is additive and safe to keep or delete.
+
