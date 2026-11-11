@@ -29,7 +29,7 @@ from typing import Any, Dict, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
-MARKER = "HERMES_WECHAT_V021_BUBBLE_FOOTER_V4"
+MARKER = "HERMES_WECHAT_V021_BUBBLE_FOOTER_V5"
 DELIVERY_MARKER = "HERMES_WECHAT_V021_FIFO_CONTEXT_REFRESH_V3"
 FOOTER_RESERVE = 160
 
@@ -1959,6 +1959,25 @@ def _quote_cache_path() -> Path:
     return root / "plugin-data" / "hermes-wechat-enhance" / "quote-cache.sqlite3"
 
 
+def _package_identity() -> Dict[str, str]:
+    "What this process actually loaded: manifest version and file path."
+    # The marker alone cannot tell two releases apart, and a shell that installed a
+    # new tree says nothing about the module the running gateway imported.
+    version = ""
+    package_dir = Path(__file__).resolve().parent
+    for candidate in (package_dir.parent / "plugin.yaml", package_dir / "plugin.yaml"):
+        try:
+            for line in candidate.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("version:"):
+                    version = line.split(":", 1)[1].strip().strip(chr(34) + chr(39))
+                    break
+        except Exception:
+            continue
+        if version:
+            break
+    return {"version": version, "package_file": str(Path(__file__).resolve())}
+
+
 def refresh_runtime_status(context: Optional[Dict[str, Any]] = None) -> None:
     """Refresh live queue observability after startup or an inbound drain."""
     path = _queue_path().parent / "runtime-status.json"
@@ -1974,6 +1993,7 @@ def refresh_runtime_status(context: Optional[Dict[str, Any]] = None) -> None:
             with suppress(Exception):
                 total += int(queue.total())
     value["pending_bubbles"] = total
+    value.update(_package_identity())
     value["recorded_at"] = time.time()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

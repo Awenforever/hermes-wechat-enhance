@@ -554,3 +554,11 @@ that share a home serialise on a lock file in addition to the atomic replace, so
 last-writer-wins cannot drop the other rows. The stale mark is written with the
 reading and restored on load, so a restart never presents a leftover as current;
 files written before the mark existed still load, unmarked.
+
+## 2026-11-12 - Runtime identity (3.5.2)
+
+A deploy is only verifiable if the running process says what it loaded. The footer
+marker is a protocol version, not a release version, so 3.5.0 and 3.5.1 shared it.
+The runtime status now carries the manifest version and the resolved package file,
+which is what an operator should read after a restart; the marker moves to V5 to
+separate this payload shape from the earlier one.
