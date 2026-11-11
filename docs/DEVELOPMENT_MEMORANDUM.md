@@ -536,3 +536,11 @@ current number from a stale one. The marker is keyed on "a turn ran and produced
 reading", not on age: an idle conversation keeps the same context, so an old but
 unturned reading is still true and stays unmarked. The next successful capture, and
 any withdrawal, clear the mark.
+
+Hermes profiles are a ContextVar override of the home directory, never an
+os.environ mutation, because one process serves several profiles. Reading the
+environment therefore pointed every profile at the same state file. The bar state
+now resolves its home through hermes_constants.get_hermes_home(), remembers which
+profile it loaded for, and rebuilds the map when that changes. A profile with no
+override keeps the original path, so nothing migrates. The remaining assumption is
+one writer per home, which the gateway already guarantees by running one per home.

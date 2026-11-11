@@ -307,6 +307,7 @@ COOLDOWN_RESUME_JITTER_SECONDS = 0.05
 _CONTEXT_FILL: Dict[str, tuple[int, int, float]] = {}
 _CONTEXT_FILL_LOCK = threading.RLock()
 _CONTEXT_FILL_LOADED = False
+_CONTEXT_FILL_SCOPE: "Optional[str]" = None
 CONTEXT_FILL_MAX_CHATS = 200
 CONTEXT_BAR_CELLS = 8
 CONTEXT_BAR_FULL = "█"
@@ -314,18 +315,46 @@ CONTEXT_BAR_BLANK = " "
 CONTEXT_BAR_PARTIALS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
 
 
+def _hermes_home_root() -> Path:
+    "Effective Hermes home for THIS context, not for the whole process."
+    # Hermes multiplexes profiles through a ContextVar
+    # (hermes_constants.set_hermes_home_override) and deliberately does not touch
+    # os.environ, which is shared by every thread. Reading the environment alone
+    # made every profile read and write the same state file.
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()).expanduser()
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+
+
+def _hermes_home_scope() -> str:
+    "Stable identity of the current profile home, for cache invalidation."
+    try:
+        from hermes_constants import get_hermes_home, hermes_home_key
+        return str(hermes_home_key(get_hermes_home()) or "")
+    except Exception:
+        return str(_hermes_home_root())
+
+
 def _context_fill_path() -> Path:
-    root = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    root = _hermes_home_root()
     return root / "plugin-data" / "hermes-wechat-enhance" / "context-fill.json"
 
 
 def _load_context_fill() -> None:
     """Restore the last-known per-chat fill so restarts keep the bar visible."""
-    global _CONTEXT_FILL_LOADED
+    global _CONTEXT_FILL_LOADED, _CONTEXT_FILL_SCOPE
+    scope = _hermes_home_scope()
     with _CONTEXT_FILL_LOCK:
-        if _CONTEXT_FILL_LOADED:
+        if _CONTEXT_FILL_LOADED and _CONTEXT_FILL_SCOPE == scope:
             return
         _CONTEXT_FILL_LOADED = True
+        _CONTEXT_FILL_SCOPE = scope
+        # Each profile owns its own file, so the map must be rebuilt when the
+        # scope changes; otherwise one profile reads another conversation into
+        # its own file on the next save.
+        _CONTEXT_FILL.clear()
         try:
             raw = json.loads(_context_fill_path().read_text(encoding="utf-8"))
         except Exception:

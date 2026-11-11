@@ -53,6 +53,7 @@ def reset():
         M._CONTEXT_FILL_WARNED.clear()
     if hasattr(M, "_CONTEXT_FILL_STALE"):
         M._CONTEXT_FILL_STALE.clear()
+    M._CONTEXT_FILL_SCOPE = None
     STATE.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -353,6 +354,63 @@ def case_an_idle_chat_keeps_its_reading_unmarked():
     assert M.context_bar(CHAT).strip()
     assert not _is_stale(CHAT), "an old but unturned reading needs no marker"
 
+
+# Tolerant on older trees: missing resolvers fall back to the environment, which
+# is exactly the pre-fix behaviour this case is meant to catch.
+_ORIGINAL_HOME_ROOT = getattr(M, "_hermes_home_root", None)
+_ORIGINAL_HOME_SCOPE = getattr(M, "_hermes_home_scope", None)
+
+
+def _use_profile(root, scope):
+    M._hermes_home_root = lambda: Path(root)
+    M._hermes_home_scope = lambda: scope
+
+
+def _restore_profile():
+    if _ORIGINAL_HOME_ROOT is not None:
+        M._hermes_home_root = _ORIGINAL_HOME_ROOT
+    if _ORIGINAL_HOME_SCOPE is not None:
+        M._hermes_home_scope = _ORIGINAL_HOME_SCOPE
+    if hasattr(M, "_CONTEXT_FILL_SCOPE"):
+        M._CONTEXT_FILL_SCOPE = None
+
+
+def case_two_profiles_keep_separate_state_files():
+    """Hermes profiles are a ContextVar; each one owns its own reading."""
+    reset()
+    profile_a = Path(tempfile.mkdtemp(prefix="profile-a-"))
+    profile_b = Path(tempfile.mkdtemp(prefix="profile-b-"))
+    try:
+        _use_profile(profile_a, "scope-a")
+        assert M._remember_context_fill(CHAT, 111_000, 1_000_000)
+        path_a = M._context_fill_path()
+        assert path_a.exists(), "profile A writes its own file"
+
+        _use_profile(profile_b, "scope-b")
+        assert not M.context_bar(CHAT).strip(), "profile B must not see A reading"
+        assert M._remember_context_fill(CHAT, 222_000, 1_000_000)
+        path_b = M._context_fill_path()
+        assert path_a != path_b, "the two profiles must not share a file"
+
+        _use_profile(profile_a, "scope-a")
+        assert M.context_bar(CHAT).strip(), "switching back reloads A"
+        assert M._CONTEXT_FILL[CHAT][0] == 111_000
+        assert json.loads(path_a.read_text(encoding="utf-8"))[str(CHAT)][0] == 111_000
+        assert json.loads(path_b.read_text(encoding="utf-8"))[str(CHAT)][0] == 222_000
+    finally:
+        _restore_profile()
+
+
+def case_default_profile_keeps_the_original_path():
+    """No override configured: the file must stay where 3.5.0 wrote it."""
+    reset()
+    try:
+        M._hermes_home_root = lambda: Path(HOME)
+        M._hermes_home_scope = lambda: str(HOME)
+        assert M._context_fill_path() == STATE, "the default layout is unchanged"
+    finally:
+        _restore_profile()
+
 for case in (
     case_persisted_reading_survives_age,
     case_one_chat_cannot_evict_another,
@@ -375,7 +433,9 @@ for case in (
     case_a_successful_capture_clears_the_marker,
     case_withdrawing_the_reading_also_clears_the_marker,
     case_an_idle_chat_keeps_its_reading_unmarked,
+    case_two_profiles_keep_separate_state_files,
+    case_default_profile_keeps_the_original_path,
 ):
     case()
 
-print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=21')
+print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=23')
