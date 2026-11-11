@@ -284,9 +284,20 @@ check("turn-start refresh invoked in wrapped_run",
 check("turn-start refresh precedes original_run",
       src_pg.index("_refresh_context_fill_from_cached_agent(runner, source, call.get(\"session_key\"))")
       < src_pg.index("result = await original_run(*args, **kwargs)"))
+# The invariant is that the end-of-turn capture is driven by the turn result,
+# not that it calls _remember_context_fill inline: the capture now goes through
+# _capture_turn_context_fill so the turn result and the cached engine are
+# resolved together and the precedence rule lives in exactly one place.
+src_capture = " ".join(inspect.getsource(M._capture_turn_context_fill).split())
+src_resolve = " ".join(inspect.getsource(M._resolve_context_reading).split())
+src_resolve_flat = src_resolve.replace(" ", "")
+# Whitespace-insensitive: the call is wrapped over two lines in the source.
+src_pg_flat = src_pg.replace(" ", "")
+src_capture_flat = src_capture.replace(" ", "")
 check("end-of-turn authoritative remember retained",
-      src_pg.count("_remember_context_fill(") == 1
-      and "result.get(\"last_prompt_tokens\")" in src_pg)
+      "_capture_turn_context_fill(runner,source,call.get(\"session_key\"),result,chat_id)" in src_pg_flat
+      and "result.get(\"last_prompt_tokens\")" in src_resolve_flat
+      and "_remember_context_fill(chat_id,reading[0],reading[1])" in src_capture_flat)
 
 print(f"\nRESULT pass={PASS} fail={FAIL}")
 sys.exit(1 if FAIL else 0)

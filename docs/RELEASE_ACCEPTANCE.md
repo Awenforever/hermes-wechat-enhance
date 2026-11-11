@@ -514,3 +514,100 @@ removes a row; no separate retry task may be the sole owner of that wakeup.
   `HEAD` remains `f82fbc7`, so the four aligned metadata files appear as
   intentional local modifications. Do not run `git checkout` or `git clean`
   in that directory.
+
+## Addendum 3.5.1 - context bar capture and persistence (2026-11-11, Asia/Shanghai)
+
+- 读者：维护者 / QA。用途：记录 3.5.1 的增量证据，不替代上面按平台记录的历史验收。
+- 位置：本附录追加在文件末尾；Current status 与 §12 正文不动，避免打乱既有阅读顺序。
+
+Delta over 3.5.0, confined to the bubble footer:
+
+* a persisted per-chat reading is no longer discarded because of age, and the
+  write path no longer prunes by age either, so one chat completing a turn can
+  no longer erase another chat reading; a capture also merges into the file it
+  has not loaded yet instead of overwriting it;
+* the end-of-turn capture resolves the reading from the turn result and the
+  context engine together, so the first turn after a gateway restart is
+  captured instead of lost while the agent cache is still cold;
+* the persisted session entry is also a fill source, so a build that reports no
+  usage and a provider fallback that evicted the agent cache no longer lose the
+  reading; the last known context window supplies the denominator;
+* writers sharing one home serialise on a lock file (best effort, POSIX flock),
+  on top of the atomic replace, so last-writer-wins cannot drop the other rows;
+* the stale mark is persisted with the reading, so a restart cannot present a
+  leftover as current; older three-element state files still load unmarked;
+* each Hermes profile reads and writes its own state file: the home is resolved
+  through the context-local override instead of the process environment, and the
+  in-memory map is rebuilt when the profile changes, so one profile never writes
+  another conversation into its file; the default profile keeps the 3.5.0 path;
+* a turn that completes without a reading marks the bar stale: the footer keeps
+  the last known fill with a ~ prefix instead of presenting it as current, and the
+  next successful capture clears the mark. Age alone is not staleness, because an
+  idle conversation keeps the same context;
+* `/compress` and `/new` invalidate the stored reading through the persisted
+  session entry, so the bar no longer keeps the pre-reset fill; an entry that
+  cannot be read leaves the stored reading untouched instead of blanking it;
+* a compression turn withdraws the bar from both the turn-start and the
+  turn-end path, so the bubble announcing a compression never repaints the
+  pre-compression fill;
+* a capture with no reading logs once per chat with a peer digest, and an
+  install that cannot wrap _run_agent_inner says so.
+
+Regression: `scripts/test-context-fill-restart-persistence.py` (28 cases) fails
+on the 3.5.0 tree and passes here; it is registered in the CI required list.
+Four-platform acceptance for 3.5.1 was executed on 2026-11-12 (see below).
+The previous statement that it had not been re-executed is superseded. The delta does not
+touch delivery, FIFO or dedup code, but it adds a call inside the turn boundary,
+so "cannot affect delivery" is a code-scope claim, not a measured one.
+
+### Core coupling this delta relies on
+
+These are Hermes internals, not a public API. Each was asserted to exist in the
+0.21.3 gateway; if one disappears the capture degrades to "no bar", and the
+install-time warning covers the first two.
+
+| Symbol | Assumption | Verified at |
+| --- | --- | --- |
+| runner._run_agent_inner | coroutine; returns a dict; takes session_key | gateway/run_turn.py:3943 |
+| runner._resolve_session_agent_runtime | all-kwargs; returns (model, runtime) | gateway/run_turn.py:72 |
+| runner._agent_cache / _agent_cache_lock | key = session_key; value starts with the agent; synchronous lock | gateway/run.py:3493 |
+| agent.context_compressor | exposes context_length, last_prompt_tokens, last_real_prompt_tokens | agent/context_compressor.py:1865,2402 |
+| turn result keys | has last_prompt_tokens; has never carried context_length | agent/turn_finalizer.py:538-560 |
+| runner.session_store._entries[*] | persisted SessionEntry; last_prompt_tokens is the real reading after a turn and 0 after /compress | gateway/session.py:761,491; run_turn.py:1751; slash_commands_session.py:423,444,626 |
+| hermes_constants.get_hermes_home / hermes_home_key | the effective home is a ContextVar override, not os.environ; one home per profile | hermes_constants.py:25-39,101,119 |
+
+Note: last_prompt_tokens = -1 is the Core compression sentinel meaning "unknown
+until the next API call". The plugin keeps its pre-existing contract of
+withdrawing the indicator on that value rather than showing an invalidated one.
+
+### Deploy and roll back (3.5.1)
+
+The installer default target is `$HERMES_HOME/skills/hermes-wechat-enhance` while
+the hook loads `$HERMES_HOME/plugins/hermes-wechat-enhance`. On this production host
+those trees differ (plugins 3.5.0, skills 3.0.1), so a default install verifies
+OK and changes nothing that runs. Pin the target explicitly:
+
+1. record the current tree hash and the imported file path;
+2. install with the plugins tree as the source and target of record;
+3. restart the gateway (the hook imports the module at startup);
+4. after restart confirm the imported file path and version, not just install output;
+5. send one Weixin message and check the footer renders the bar;
+6. regenerate install-state (manage-install-state.py record-installed) so a later
+   restore validates the tree that is actually running.
+
+Roll back by restoring the previous plugin tree and restarting the gateway; the
+footer state file is additive and safe to keep or delete.
+
+### Four-platform result (2026-11-12, Asia/Shanghai)
+
+| Target | Environment | Result |
+| --- | --- | --- |
+| T1 container | Hermes gateway container, Python 3.13.5 | consistency OK; 13/13 pure regressions; 28/28 new cases; native v320 88/88 |
+| T2 Linux native | Ubuntu 22.04.1, Python 3.10.12 | consistency OK; 13/13 pure regressions; 28/28 new cases |
+| T3 WSL2 | Ubuntu 24.04 on Windows 11, kernel 6.6.87.2-microsoft-standard-WSL2, Python 3.12.3 | consistency OK; 13/13 pure regressions; 28/28 new cases |
+| T4 Windows native | Windows 11, Python 3.12.7 | 13/13 pure regressions; 28/28 new cases |
+
+Two portability defects were found and fixed by this run: the transport regression
+used asyncio.create_task(context=...), which is 3.11+, so the whole suite aborted on
+Ubuntu 22.04; and the private-mode assertion assumed POSIX permission bits, which
+Windows does not carry. Both are test-only fixes.

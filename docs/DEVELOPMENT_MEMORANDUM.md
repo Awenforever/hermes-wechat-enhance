@@ -1,6 +1,25 @@
 # Hermes WeChat Enhance — Development Memorandum
 
+## 2026-11-11 - Context bar capture (3.5.1)
+
+The footer progress bar is fed by one captured reading per chat. Three defects
+made it vanish: the reader dropped a persisted reading once it was six hours
+old; the writer pruned by the same TTL, so any chat finishing a turn erased the
+others; and the end-of-turn capture trusted a context_length field the turn
+result never carries, leaving only a warm-cache read that the first turn after
+a restart cannot satisfy. Capture now resolves the fill from the turn result and
+the context engine together, and the engine supplies the limit. A negative fill
+remains the compression sentinel that withdraws the indicator, which is the
+pre-existing contract and stays pinned by tests.
 ## 2026-10-25 — Queue-driven FIFO drain (3.5.0)
+
+Manual `/compress` and `/new` do not raise the compressor sentinel the automatic
+path uses: Core truncates the transcript and sets the persisted session entry
+reading to 0 instead, and evicts the agent cache. The capture therefore gates on
+that entry at turn start. 0 withdraws the bar, a positive value keeps it, and an
+entry that cannot be read (no store, not loaded, field missing) changes nothing -
+which is what keeps a restart from blanking the indicator.
+
 
 The durable queue, not a retry task, now owns delivery. `ensure_drainer` is
 called by enqueue, inbound handling, startup recovery and the worker itself, so
@@ -510,3 +529,28 @@ items, caption-plus-media semantics, failed media without a gap, and persistence
 across adapter restart. Tests that exercise only public `send_document` are not
 sufficient because runtime compatibility layers may replace that method; the
 physical `_send_file` boundary is the stable invariant.
+
+A turn that completes without a reading leaves the previous fill on screen. The
+footer therefore prefixes that leftover with `~`, so the operator can tell a
+current number from a stale one. The marker is keyed on "a turn ran and produced no
+reading", not on age: an idle conversation keeps the same context, so an old but
+unturned reading is still true and stays unmarked. The next successful capture, and
+any withdrawal, clear the mark.
+
+Hermes profiles are a ContextVar override of the home directory, never an
+os.environ mutation, because one process serves several profiles. Reading the
+environment therefore pointed every profile at the same state file. The bar state
+now resolves its home through hermes_constants.get_hermes_home(), remembers which
+profile it loaded for, and rebuilds the map when that changes. A profile with no
+override keeps the original path, so nothing migrates. The remaining assumption is
+one writer per home, which the gateway already guarantees by running one per home.
+
+Three later hardening passes removed the last conditional risks. The persisted
+SessionEntry reading is now a first-class fill source, because a gateway build may
+report no usage in the turn result while a provider fallback has already evicted
+the agent cache; the last known context window supplies the denominator, and a
+chat with no known window stays marked stale rather than inventing a ratio. Writers
+that share a home serialise on a lock file in addition to the atomic replace, so
+last-writer-wins cannot drop the other rows. The stale mark is written with the
+reading and restored on load, so a restart never presents a leftover as current;
+files written before the mark existed still load, unmarked.

@@ -36,7 +36,13 @@ async def main(root, adapter_type=fixtures.FakeAdapter):
     restored = PendingBubbleStore(ledger.path)
     assert restored.publisher_epoch == ledger.publisher_epoch
     assert restored.peek(adapter._account_id, 'peer')['transport_binding'] == binding
-    await asyncio.create_task(adapter._drain_pending('peer'), context=__import__('contextvars').Context())
+    # create_task(context=...) is 3.11+. This suite also runs on Ubuntu 22.04
+    # (Python 3.10), where the plugin claims support, so fall back instead of
+    # failing the whole regression run on one keyword.
+    if sys.version_info >= (3, 11):
+        await asyncio.create_task(adapter._drain_pending('peer'), context=__import__('contextvars').Context())
+    else:
+        await asyncio.create_task(adapter._drain_pending('peer'))
     assert len(adapter.sent) == 2 and ledger.count(adapter._account_id, 'peer') == 0
     for key in (binding,other):
         page = read(key)

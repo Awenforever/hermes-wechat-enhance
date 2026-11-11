@@ -12,6 +12,7 @@ import asyncio
 from contextlib import contextmanager, suppress
 import contextvars
 import functools
+import contextlib
 import hashlib
 import inspect
 import json
@@ -307,67 +308,348 @@ COOLDOWN_RESUME_JITTER_SECONDS = 0.05
 _CONTEXT_FILL: Dict[str, tuple[int, int, float]] = {}
 _CONTEXT_FILL_LOCK = threading.RLock()
 _CONTEXT_FILL_LOADED = False
+_CONTEXT_FILL_SCOPE: "Optional[str]" = None
+CONTEXT_FILL_MAX_CHATS = 200
 CONTEXT_BAR_CELLS = 8
 CONTEXT_BAR_FULL = "█"
 CONTEXT_BAR_BLANK = " "
 CONTEXT_BAR_PARTIALS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
 
 
+def _hermes_home_root() -> Path:
+    "Effective Hermes home for THIS context, not for the whole process."
+    # Hermes multiplexes profiles through a ContextVar
+    # (hermes_constants.set_hermes_home_override) and deliberately does not touch
+    # os.environ, which is shared by every thread. Reading the environment alone
+    # made every profile read and write the same state file.
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()).expanduser()
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+
+
+def _hermes_home_scope() -> str:
+    "Stable identity of the current profile home, for cache invalidation."
+    try:
+        from hermes_constants import get_hermes_home, hermes_home_key
+        return str(hermes_home_key(get_hermes_home()) or "")
+    except Exception:
+        return str(_hermes_home_root())
+
+
 def _context_fill_path() -> Path:
-    root = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    root = _hermes_home_root()
     return root / "plugin-data" / "hermes-wechat-enhance" / "context-fill.json"
+
+
+@contextlib.contextmanager
+def _state_file_lock(path: Path):
+    "Serialise writers that share one home, best effort and never fatal.",
+    # Atomic replace stops torn reads but not last-writer-wins between two writers,
+    # so a reader that has not loaded yet can still drop the other side rows.
+    # Core runs one gateway per home, so this is defence in depth: a failure to lock
+    # must degrade to the previous behaviour instead of losing the update.
+    handle = None
+    try:
+        import fcntl  # POSIX only; Windows keeps the atomic-replace guarantee
+    except Exception:
+        fcntl = None
+    try:
+        if fcntl is not None:
+            lock_path = path.with_name(path.name + ".lock")
+            handle = open(lock_path, "a+", encoding="utf-8")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    except Exception:
+        yield
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
 
 
 def _load_context_fill() -> None:
     """Restore the last-known per-chat fill so restarts keep the bar visible."""
-    global _CONTEXT_FILL_LOADED
+    global _CONTEXT_FILL_LOADED, _CONTEXT_FILL_SCOPE
+    scope = _hermes_home_scope()
     with _CONTEXT_FILL_LOCK:
-        if _CONTEXT_FILL_LOADED:
+        if _CONTEXT_FILL_LOADED and _CONTEXT_FILL_SCOPE == scope:
             return
         _CONTEXT_FILL_LOADED = True
+        _CONTEXT_FILL_SCOPE = scope
+        # Each profile owns its own file, so the map must be rebuilt when the
+        # scope changes; otherwise one profile reads another conversation into
+        # its own file on the next save.
+        _CONTEXT_FILL.clear()
         try:
             raw = json.loads(_context_fill_path().read_text(encoding="utf-8"))
-            cutoff = time.time() - TURN_MODEL_TTL_SECONDS
-            for chat, entry in (raw or {}).items():
-                used, limit, ts = (list(entry) + [0, 0, 0.0])[:3]
-                used, limit = int(used or 0), int(limit or 0)
-                if used > 0 and limit > 0 and float(ts or 0) >= cutoff:
-                    _CONTEXT_FILL[str(chat)] = (used, limit, float(ts))
         except Exception:
-            pass
+            raw = {}
+        if raw:
+            for chat, entry in (raw or {}).items():
+                try:
+                    used, limit, ts = (list(entry) + [0, 0, 0.0])[:3]
+                    used, limit = int(used or 0), int(limit or 0)
+                except (TypeError, ValueError):
+                    continue
+                # Age is not staleness of the reading: context fill does not decay
+                # while a chat is idle. Pruning by TTL here blanked the bar for any
+                # chat untouched for six hours before the restart, which is the
+                # opposite of what persisting the value is for.
+                if used > 0 and limit > 0:
+                    _CONTEXT_FILL[str(chat)] = (used, limit, float(ts))
+                    # The stale mark survives a restart: the reading it describes
+                    # did not become current just because the process restarted.
+                    stale_flag = 0
+                    try:
+                        extra = list(entry)[3:4]
+                        stale_flag = int(extra[0]) if extra else 0
+                    except (TypeError, ValueError):
+                        stale_flag = 0
+                    if stale_flag:
+                        _CONTEXT_FILL_STALE.add(str(chat))
 
 
 def _save_context_fill() -> None:
+    "Persist atomically: a torn file loses every chat reading at once."
     try:
         path = _context_fill_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with _CONTEXT_FILL_LOCK:
-            snapshot = {k: list(v) for k, v in _CONTEXT_FILL.items()}
-        path.write_text(json.dumps(snapshot), encoding="utf-8")
-        os.chmod(path, 0o600)
-    except Exception:
-        pass
+        with _CONTEXT_FILL_LOCK, _state_file_lock(path):
+            snapshot = {
+                k: list(v) + [1 if k in _CONTEXT_FILL_STALE else 0]
+                for k, v in _CONTEXT_FILL.items()
+            }
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(snapshot), encoding="utf-8")
+            try:
+                os.chmod(tmp, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp, path)
+    except Exception as exc:
+        logger.warning(
+            "Hermes WeChat Enhance: could not persist the context bar state (%r); "
+            "the footer keeps the in-memory reading", exc,
+        )
 
 
-def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> None:
+# Chats whose latest turn produced no reading. Age alone is not staleness: an
+# idle conversation keeps the same context, so the only thing worth telling the
+# operator is "this number is not from the turn you just had".
+_CONTEXT_FILL_STALE: set = set()
+
+
+def _set_context_fill_stale(chat_id: Any, stale: bool) -> None:
+    key = str(chat_id or "")
+    if not key:
+        return
+    with _CONTEXT_FILL_LOCK:
+        if stale:
+            _CONTEXT_FILL_STALE.add(key)
+        else:
+            _CONTEXT_FILL_STALE.discard(key)
+
+
+def context_bar_is_stale(chat_id: str) -> bool:
+    "True when the bar shows a value the latest turn could not refresh."
+    with _CONTEXT_FILL_LOCK:
+        return str(chat_id) in _CONTEXT_FILL_STALE
+
+
+_CONTEXT_FILL_WARNED: set = set()
+
+
+def _warn_context_fill_once(chat_id: str, reason: str) -> None:
+    """Report each chat's capture failure once per process.
+
+    Silence here is why "the bar disappeared" took three rounds to diagnose: the
+    capture returned early and nothing anywhere said so.
+    """
+    key = (chat_id, reason.split(":", 1)[0])
+    if key in _CONTEXT_FILL_WARNED:
+        return
+    _CONTEXT_FILL_WARNED.add(key)
+    # Peer ids are personal identifiers; every other log line in this module
+    # writes a digest, so this one must not be the exception.
+    peer = hashlib.sha256(chat_id.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    logger.warning(
+        "Hermes WeChat Enhance: context bar has no reading for peer=%s (%s); the "
+        "footer keeps the last known reading marked with ~ until a turn reports usage",
+        peer, reason,
+    )
+
+
+def _resolve_context_reading(result: Any, comp: Any):
+    "Return (used, limit) from the turn result and the context engine."
+    limit = 0
+    if isinstance(result, dict):
+        # A dict has no attributes: getattr() here would silently never see
+        # result['context_length'], which is exactly the turn where the cache
+        # was evicted by a provider fallback and the result is the only source.
+        try:
+            limit = int(result.get("context_length") or 0)
+        except (TypeError, ValueError):
+            limit = 0
+    if limit <= 0:
+        try:
+            limit = int(getattr(comp, "context_length", 0) or 0)
+        except (TypeError, ValueError):
+            limit = 0
+    if limit <= 0:
+        return None
+    candidates = []
+    if isinstance(result, dict):
+        candidates.append(result.get("last_prompt_tokens"))
+    candidates.append(getattr(comp, "last_real_prompt_tokens", 0))
+    candidates.append(getattr(comp, "last_prompt_tokens", 0))
+    for candidate in candidates:
+        try:
+            used = int(candidate or 0)
+        except (TypeError, ValueError):
+            continue
+        if used > 0:
+            return used, limit
+    return None
+
+def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> bool:
+    "Store one reading; True when a value was written."
+    # The map is loaded lazily for rendering. A process that captures before it
+    # ever renders would otherwise save a one-entry snapshot and delete every
+    # other chat reading on disk.
+    _load_context_fill()
     try:
         used_i = int(used or 0)
         limit_i = int(limit or 0)
     except (TypeError, ValueError):
-        return
+        return False
     if used_i <= 0 or limit_i <= 0:
-        return
+        return False
     with _CONTEXT_FILL_LOCK:
         _CONTEXT_FILL[str(chat_id)] = (used_i, limit_i, time.time())
         _prune_context_fill()
     _save_context_fill()
+    return True
 
+
+def _forget_context_fill(chat_id: str) -> bool:
+    "Withdraw one chat reading, in memory and on disk. True when one existed."
+    _load_context_fill()
+    with _CONTEXT_FILL_LOCK:
+        if str(chat_id) not in _CONTEXT_FILL:
+            _CONTEXT_FILL_STALE.discard(str(chat_id))
+            return False
+        _CONTEXT_FILL.pop(str(chat_id), None)
+        _CONTEXT_FILL_STALE.discard(str(chat_id))
+    _save_context_fill()
+    return True
 
 def _prune_context_fill() -> None:
-    cutoff = time.time() - TURN_MODEL_TTL_SECONDS
-    for key in [k for k, v in _CONTEXT_FILL.items() if v[2] < cutoff]:
+    "Bound the map by chat count. Age is never a reason to drop a reading."
+    overflow = len(_CONTEXT_FILL) - CONTEXT_FILL_MAX_CHATS
+    if overflow <= 0:
+        return
+    oldest = sorted(_CONTEXT_FILL.items(), key=lambda item: item[1][2])[:overflow]
+    for key, _entry in oldest:
         _CONTEXT_FILL.pop(key, None)
 
+
+def _capture_turn_context_fill(runner: Any, source: Any, session_key: Any, result: Any, chat_id: str) -> None:
+    "Record the fill for this turn, and say so once when no reading exists."
+    comp = _cached_context_engine(runner, session_key)
+    sentinel = 0
+    try:
+        sentinel = int(getattr(comp, "last_prompt_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        sentinel = 0
+    if sentinel < 0:
+        # Compression invalidated the reading. last_real_prompt_tokens still
+        # holds the pre-compression fill, so resolving it here would repaint
+        # the old ~90% bar on the very bubble that announced the compression.
+        # The turn-start path withdraws for the same reason; keep them identical.
+        _forget_context_fill(chat_id)
+        return
+    reading = _resolve_context_reading(result, comp)
+    if reading is not None and _remember_context_fill(chat_id, reading[0], reading[1]):
+        _set_context_fill_stale(chat_id, False)
+        return
+    # Hermes persists the real reading on the SessionEntry every turn, so the fill
+    # survives a build that reports no usage in the turn result AND a cold agent
+    # cache (a provider fallback evicts it). The context window rarely changes, so
+    # the last known limit is a safe denominator for that reading.
+    entry_tokens = _session_entry_prompt_tokens(runner, session_key)
+    if entry_tokens is not None and entry_tokens > 0:
+        limit = _known_context_limit(chat_id)
+        if limit and _remember_context_fill(chat_id, entry_tokens, limit):
+            _set_context_fill_stale(chat_id, False)
+            return
+    # The turn happened and produced no reading: what the bar shows is now a
+    # leftover from an earlier turn, which the operator cannot see from the glyphs.
+    _set_context_fill_stale(chat_id, True)
+    _warn_context_fill_once(str(chat_id), "no usable reading from the turn result, the engine or the session entry")
+
+
+def _known_context_limit(chat_id: str) -> int:
+    "Return the last known context window for this chat, or 0."
+    _load_context_fill()
+    with _CONTEXT_FILL_LOCK:
+        entry = _CONTEXT_FILL.get(str(chat_id))
+    if not entry:
+        return 0
+    try:
+        return int(entry[1] or 0)
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+def _cached_context_engine(runner: Any, session_key: Any) -> Any:
+    "Return the cached agent context engine, or None when it is not reachable."
+    try:
+        key = str(session_key or "")
+        cache = getattr(runner, "_agent_cache", None)
+        if not key or not cache:
+            return None
+        lock = getattr(runner, "_agent_cache_lock", None)
+        if lock is not None:
+            with lock:
+                entry = cache.get(key)
+        else:
+            entry = cache.get(key)
+        agent = entry[0] if isinstance(entry, (tuple, list)) and entry else entry
+        return getattr(agent, "context_compressor", None)
+    except Exception:
+        return None
+
+def _session_entry_prompt_tokens(runner: Any, session_key: Any) -> Any:
+    "Return the persisted session-entry reading, or None when unreachable."
+    # Core keeps this on the persisted SessionEntry: every completed turn writes
+    # the real reading (gateway/run_turn.py:1751), and /compress sets it to 0
+    # because the transcript was truncated (slash_commands_session.py:423,444,626).
+    # A restart restores the persisted value, so 0 means invalidated rather than
+    # lost. None means "cannot tell", which must never trigger a withdrawal.
+    try:
+        key = str(session_key or "")
+        if not key:
+            return None
+        store = getattr(runner, "session_store", None)
+        entries = getattr(store, "_entries", None)
+        if not isinstance(entries, dict):
+            return None
+        lock = getattr(store, "_lock", None)
+        if lock is not None:
+            with lock:
+                entry = entries.get(key)
+        else:
+            entry = entries.get(key)
+        if entry is None:
+            return None
+        value = getattr(entry, "last_prompt_tokens", None)
+        return None if value is None else int(value)
+    except Exception:
+        return None
 
 def _refresh_context_fill_from_cached_agent(runner: Any, source: Any, session_key: Optional[str] = None) -> None:
     """Seed the footer fill from the live cached agent BEFORE the turn runs.
@@ -385,6 +667,14 @@ def _refresh_context_fill_from_cached_agent(runner: Any, source: Any, session_ke
         session_key = str(session_key or getattr(source, "session_key", "") or "")
         if not chat_id or not session_key:
             return
+        entry_tokens = _session_entry_prompt_tokens(runner, session_key)
+        if entry_tokens is not None and entry_tokens <= 0:
+            # /compress truncated the transcript or /new reset the session. The
+            # stored reading describes a context that no longer exists, and the
+            # agent cache is cold in both cases, so this has to be decided before
+            # the cache lookup or the bar keeps the pre-reset fill.
+            _forget_context_fill(chat_id)
+            return
         cache = getattr(runner, "_agent_cache", None)
         if not cache:
             return
@@ -398,18 +688,23 @@ def _refresh_context_fill_from_cached_agent(runner: Any, source: Any, session_ke
         comp = getattr(agent, "context_compressor", None)
         if comp is None:
             return
-        used = getattr(comp, "last_prompt_tokens", 0)
-        if int(used or 0) < 0:
-            _load_context_fill()
-            with _CONTEXT_FILL_LOCK:
-                _CONTEXT_FILL.pop(chat_id, None)
-            _save_context_fill()
+        sentinel = 0
+        try:
+            sentinel = int(getattr(comp, "last_prompt_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            sentinel = 0
+        if sentinel < 0:
+            # Kept contract: a negative reading means the API usage is unknown
+            # (compression), and the indicator is withdrawn rather than showing
+            # a value the engine just invalidated. tests/test-context-fill-*
+            # pin this, so widening it is a product decision, not a bug fix.
+            _forget_context_fill(chat_id)
             return
-        _remember_context_fill(
-            chat_id,
-            used,
-            getattr(comp, "context_length", 0),
-        )
+        reading = _resolve_context_reading(None, comp)
+        if reading is None:
+            return
+        if _remember_context_fill(chat_id, reading[0], reading[1]):
+            _set_context_fill_stale(chat_id, False)
     except Exception:
         return
 
@@ -448,7 +743,14 @@ def _decorate_footer(chunk: str, count: int, model: str, chat_id: str) -> str:
     """
     footer = f"`{count}` `{model}`"
     bar = context_bar(chat_id)
-    if bar:
+    # A very low fill renders as blanks. Appending it would emit an empty
+    # inline-code span, which reads as a rendering glitch rather than as
+    # "nearly empty", so the bar is omitted until there is something to show.
+    if bar.strip():
+        if context_bar_is_stale(chat_id):
+            # Prefix, not a suffix: the eight cells keep their own width and the
+            # marker cannot be mistaken for a glyph inside the track.
+            bar = "~" + bar
         footer = f"{footer} `{bar}`"
     return f"{chunk}\n\n---\n\n{footer}"
 
@@ -1457,7 +1759,19 @@ def patch_gateway_runner(runner: Any) -> bool:
     original_resolve = getattr(runner, "_resolve_session_agent_runtime", None)
     original_run = getattr(runner, "_run_agent_inner", None)
     if not callable(original_resolve):
+        logger.warning(
+            "Hermes WeChat Enhance: gateway runner has no _resolve_session_agent_runtime; "
+            "model provenance and the context bar stay off for this runner"
+        )
         return False
+    if not callable(original_run):
+        # The model tag survives through _resolve_session_agent_runtime, so this
+        # only kills the per-turn boundaries (context fill). Failing silently here
+        # is what made the missing bar look like a rendering bug.
+        logger.warning(
+            "Hermes WeChat Enhance: gateway runner has no _run_agent_inner; "
+            "the context bar cannot capture usage on this runner (model tags still work)"
+        )
 
     @functools.wraps(original_resolve)
     def wrapped(*args: Any, **kwargs: Any):
@@ -1514,12 +1828,8 @@ def patch_gateway_runner(runner: Any) -> bool:
                 response = result.get("final_response") or result.get("response") or ""
                 response = _delivery_shaped_response(platform_obj, response)
                 _remember_model(chat_id, model, completed=True, response=response)
-                # The turn result carries the API-reported context fill and the
-                # resolved context-window limit; capture both for the footer bar.
-                _remember_context_fill(
-                    chat_id,
-                    result.get("last_prompt_tokens"),
-                    result.get("context_length"),
+                _capture_turn_context_fill(
+                    runner, source, call.get("session_key"), result, chat_id
                 )
             return result
 
