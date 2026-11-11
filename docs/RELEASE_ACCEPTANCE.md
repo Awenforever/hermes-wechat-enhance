@@ -555,7 +555,8 @@ Delta over 3.5.0, confined to the bubble footer:
 
 Regression: `scripts/test-context-fill-restart-persistence.py` (28 cases) fails
 on the 3.5.0 tree and passes here; it is registered in the CI required list.
-Four-platform acceptance has not been re-executed for 3.5.1. The delta does not
+Four-platform acceptance for 3.5.1 was executed on 2026-11-12 (see below).
+The previous statement that it had not been re-executed is superseded. The delta does not
 touch delivery, FIFO or dedup code, but it adds a call inside the turn boundary,
 so "cannot affect delivery" is a code-scope claim, not a measured one.
 
@@ -597,3 +598,16 @@ OK and changes nothing that runs. Pin the target explicitly:
 Roll back by restoring the previous plugin tree and restarting the gateway; the
 footer state file is additive and safe to keep or delete.
 
+### Four-platform result (2026-11-12, Asia/Shanghai)
+
+| Target | Environment | Result |
+| --- | --- | --- |
+| T1 container | Hermes gateway container, Python 3.13.5 | consistency OK; 13/13 pure regressions; 28/28 new cases; native v320 88/88 |
+| T2 Linux native | Ubuntu 22.04.1, Python 3.10.12 | consistency OK; 13/13 pure regressions; 28/28 new cases |
+| T3 WSL2 | Ubuntu 24.04 on Windows 11, kernel 6.6.87.2-microsoft-standard-WSL2, Python 3.12.3 | consistency OK; 13/13 pure regressions; 28/28 new cases |
+| T4 Windows native | Windows 11, Python 3.12.7 | 13/13 pure regressions; 28/28 new cases |
+
+Two portability defects were found and fixed by this run: the transport regression
+used asyncio.create_task(context=...), which is 3.11+, so the whole suite aborted on
+Ubuntu 22.04; and the private-mode assertion assumed POSIX permission bits, which
+Windows does not carry. Both are test-only fixes.
