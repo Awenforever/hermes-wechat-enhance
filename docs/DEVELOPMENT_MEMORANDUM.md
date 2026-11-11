@@ -544,3 +544,13 @@ now resolves its home through hermes_constants.get_hermes_home(), remembers whic
 profile it loaded for, and rebuilds the map when that changes. A profile with no
 override keeps the original path, so nothing migrates. The remaining assumption is
 one writer per home, which the gateway already guarantees by running one per home.
+
+Three later hardening passes removed the last conditional risks. The persisted
+SessionEntry reading is now a first-class fill source, because a gateway build may
+report no usage in the turn result while a provider fallback has already evicted
+the agent cache; the last known context window supplies the denominator, and a
+chat with no known window stays marked stale rather than inventing a ratio. Writers
+that share a home serialise on a lock file in addition to the atomic replace, so
+last-writer-wins cannot drop the other rows. The stale mark is written with the
+reading and restored on load, so a restart never presents a leftover as current;
+files written before the mark existed still load, unmarked.

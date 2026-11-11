@@ -12,6 +12,7 @@ import asyncio
 from contextlib import contextmanager, suppress
 import contextvars
 import functools
+import contextlib
 import hashlib
 import inspect
 import json
@@ -342,6 +343,34 @@ def _context_fill_path() -> Path:
     return root / "plugin-data" / "hermes-wechat-enhance" / "context-fill.json"
 
 
+@contextlib.contextmanager
+def _state_file_lock(path: Path):
+    "Serialise writers that share one home, best effort and never fatal.",
+    # Atomic replace stops torn reads but not last-writer-wins between two writers,
+    # so a reader that has not loaded yet can still drop the other side rows.
+    # Core runs one gateway per home, so this is defence in depth: a failure to lock
+    # must degrade to the previous behaviour instead of losing the update.
+    handle = None
+    try:
+        import fcntl  # POSIX only; Windows keeps the atomic-replace guarantee
+    except Exception:
+        fcntl = None
+    try:
+        if fcntl is not None:
+            lock_path = path.with_name(path.name + ".lock")
+            handle = open(lock_path, "a+", encoding="utf-8")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    except Exception:
+        yield
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
 def _load_context_fill() -> None:
     """Restore the last-known per-chat fill so restarts keep the bar visible."""
     global _CONTEXT_FILL_LOADED, _CONTEXT_FILL_SCOPE
@@ -372,6 +401,16 @@ def _load_context_fill() -> None:
                 # opposite of what persisting the value is for.
                 if used > 0 and limit > 0:
                     _CONTEXT_FILL[str(chat)] = (used, limit, float(ts))
+                    # The stale mark survives a restart: the reading it describes
+                    # did not become current just because the process restarted.
+                    stale_flag = 0
+                    try:
+                        extra = list(entry)[3:4]
+                        stale_flag = int(extra[0]) if extra else 0
+                    except (TypeError, ValueError):
+                        stale_flag = 0
+                    if stale_flag:
+                        _CONTEXT_FILL_STALE.add(str(chat))
 
 
 def _save_context_fill() -> None:
@@ -379,8 +418,11 @@ def _save_context_fill() -> None:
     try:
         path = _context_fill_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with _CONTEXT_FILL_LOCK:
-            snapshot = {k: list(v) for k, v in _CONTEXT_FILL.items()}
+        with _CONTEXT_FILL_LOCK, _state_file_lock(path):
+            snapshot = {
+                k: list(v) + [1 if k in _CONTEXT_FILL_STALE else 0]
+                for k, v in _CONTEXT_FILL.items()
+            }
             tmp = path.with_name(path.name + ".tmp")
             tmp.write_text(json.dumps(snapshot), encoding="utf-8")
             try:
@@ -534,10 +576,33 @@ def _capture_turn_context_fill(runner: Any, source: Any, session_key: Any, resul
     if reading is not None and _remember_context_fill(chat_id, reading[0], reading[1]):
         _set_context_fill_stale(chat_id, False)
         return
+    # Hermes persists the real reading on the SessionEntry every turn, so the fill
+    # survives a build that reports no usage in the turn result AND a cold agent
+    # cache (a provider fallback evicts it). The context window rarely changes, so
+    # the last known limit is a safe denominator for that reading.
+    entry_tokens = _session_entry_prompt_tokens(runner, session_key)
+    if entry_tokens is not None and entry_tokens > 0:
+        limit = _known_context_limit(chat_id)
+        if limit and _remember_context_fill(chat_id, entry_tokens, limit):
+            _set_context_fill_stale(chat_id, False)
+            return
     # The turn happened and produced no reading: what the bar shows is now a
     # leftover from an earlier turn, which the operator cannot see from the glyphs.
     _set_context_fill_stale(chat_id, True)
-    _warn_context_fill_once(str(chat_id), "no usable reading after the turn result and the cached engine")
+    _warn_context_fill_once(str(chat_id), "no usable reading from the turn result, the engine or the session entry")
+
+
+def _known_context_limit(chat_id: str) -> int:
+    "Return the last known context window for this chat, or 0."
+    _load_context_fill()
+    with _CONTEXT_FILL_LOCK:
+        entry = _CONTEXT_FILL.get(str(chat_id))
+    if not entry:
+        return 0
+    try:
+        return int(entry[1] or 0)
+    except (TypeError, ValueError, IndexError):
+        return 0
 
 
 def _cached_context_engine(runner: Any, session_key: Any) -> Any:

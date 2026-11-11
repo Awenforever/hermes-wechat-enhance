@@ -55,6 +55,9 @@ def reset():
         M._CONTEXT_FILL_STALE.clear()
     M._CONTEXT_FILL_SCOPE = None
     STATE.parent.mkdir(parents=True, exist_ok=True)
+    # Cases must not inherit the previous case state from disk either, now that a
+    # missing in-memory entry is reloaded on demand.
+    STATE.write_text("{}", encoding="utf-8")
 
 
 def bar_shape_ok(bar):
@@ -411,6 +414,86 @@ def case_default_profile_keeps_the_original_path():
     finally:
         _restore_profile()
 
+
+def case_session_entry_supplies_the_fill_when_engine_and_result_are_silent():
+    """Build reports no usage and a fallback evicted the cache: the entry still knows."""
+    reset()
+    assert M._remember_context_fill(CHAT, 400_000, 1_000_000)   # seeds the limit
+    entry = SimpleNamespace(last_prompt_tokens=750_000)
+    store = SimpleNamespace(_entries={"k": entry}, _lock=threading.Lock())
+    runner = SimpleNamespace(session_store=store, _agent_cache={},
+                             _agent_cache_lock=threading.Lock())
+    M._capture_turn_context_fill(runner, None, "k", {}, CHAT)
+    assert M._CONTEXT_FILL[CHAT][0] == 750_000, "the persisted entry is a source"
+    assert not _is_stale(CHAT)
+
+
+def case_entry_without_a_known_limit_stays_stale():
+    """No denominator anywhere: keep the old reading marked, never invent a ratio."""
+    reset()
+    entry = SimpleNamespace(last_prompt_tokens=750_000)
+    store = SimpleNamespace(_entries={"k": entry}, _lock=threading.Lock())
+    runner = SimpleNamespace(session_store=store, _agent_cache={},
+                             _agent_cache_lock=threading.Lock())
+    M._capture_turn_context_fill(runner, None, "k", {}, CHAT)
+    assert not M._CONTEXT_FILL, "no reading can be formed without a limit"
+    assert _is_stale(CHAT)
+
+
+def case_concurrent_writers_do_not_lose_rows():
+    """Two threads saving at once must leave a readable file with both chats."""
+    reset()
+    errors = []
+
+    def work(chat, used):
+        try:
+            for _ in range(40):
+                M._remember_context_fill(chat, used, 1_000_000)
+        except Exception as exc:  # noqa: BLE001 - the point is to surface it
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=work, args=(CHAT, 111_000)),
+               threading.Thread(target=work, args=(OTHER, 222_000))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, "a concurrent save must not raise: %s" % errors[:2]
+    persisted = json.loads(STATE.read_text(encoding="utf-8"))
+    assert str(CHAT) in persisted and str(OTHER) in persisted, "both rows survive"
+    leftovers = [x.name for x in STATE.parent.iterdir() if x.name.endswith(".tmp")]
+    assert not leftovers, "no torn temporary file is left behind"
+
+
+def case_the_stale_mark_survives_a_restart():
+    """A restart must not present a leftover reading as current."""
+    reset()
+    assert M._remember_context_fill(CHAT, 900_000, 1_000_000)
+    _set_stale(CHAT, True)
+    assert M._remember_context_fill(CHAT, 900_000, 1_000_000)  # force another save
+    persisted = json.loads(STATE.read_text(encoding="utf-8"))
+    assert len(persisted[str(CHAT)]) == 4, "the mark is stored with the reading"
+    assert int(persisted[str(CHAT)][3]) == 1
+
+    M._CONTEXT_FILL.clear()          # simulate a fresh process
+    if hasattr(M, "_CONTEXT_FILL_STALE"):
+        M._CONTEXT_FILL_STALE.clear()
+    M._CONTEXT_FILL_LOADED = False
+    M._CONTEXT_FILL_SCOPE = None
+    assert M.context_bar(CHAT).strip()
+    assert _is_stale(CHAT), "the mark comes back with the reading"
+
+
+def case_older_three_element_state_still_loads():
+    """Files written before the mark existed must keep working."""
+    reset()
+    STATE.write_text(json.dumps({CHAT: [500_000, 1_000_000, time.time()]}), encoding="utf-8")
+    M._CONTEXT_FILL.clear()
+    M._CONTEXT_FILL_LOADED = False
+    M._CONTEXT_FILL_SCOPE = None
+    assert M.context_bar(CHAT).strip()
+    assert not _is_stale(CHAT), "a legacy entry carries no mark"
+
 for case in (
     case_persisted_reading_survives_age,
     case_one_chat_cannot_evict_another,
@@ -435,7 +518,12 @@ for case in (
     case_an_idle_chat_keeps_its_reading_unmarked,
     case_two_profiles_keep_separate_state_files,
     case_default_profile_keeps_the_original_path,
+    case_session_entry_supplies_the_fill_when_engine_and_result_are_silent,
+    case_entry_without_a_known_limit_stays_stale,
+    case_concurrent_writers_do_not_lose_rows,
+    case_the_stale_mark_survives_a_restart,
+    case_older_three_element_state_still_loads,
 ):
     case()
 
-print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=23')
+print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=28')

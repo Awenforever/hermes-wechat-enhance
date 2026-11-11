@@ -529,6 +529,13 @@ Delta over 3.5.0, confined to the bubble footer:
 * the end-of-turn capture resolves the reading from the turn result and the
   context engine together, so the first turn after a gateway restart is
   captured instead of lost while the agent cache is still cold;
+* the persisted session entry is also a fill source, so a build that reports no
+  usage and a provider fallback that evicted the agent cache no longer lose the
+  reading; the last known context window supplies the denominator;
+* writers sharing one home serialise on a lock file (best effort, POSIX flock),
+  on top of the atomic replace, so last-writer-wins cannot drop the other rows;
+* the stale mark is persisted with the reading, so a restart cannot present a
+  leftover as current; older three-element state files still load unmarked;
 * each Hermes profile reads and writes its own state file: the home is resolved
   through the context-local override instead of the process environment, and the
   in-memory map is rebuilt when the profile changes, so one profile never writes
@@ -546,7 +553,7 @@ Delta over 3.5.0, confined to the bubble footer:
 * a capture with no reading logs once per chat with a peer digest, and an
   install that cannot wrap _run_agent_inner says so.
 
-Regression: `scripts/test-context-fill-restart-persistence.py` (23 cases) fails
+Regression: `scripts/test-context-fill-restart-persistence.py` (28 cases) fails
 on the 3.5.0 tree and passes here; it is registered in the CI required list.
 Four-platform acceptance has not been re-executed for 3.5.1. The delta does not
 touch delivery, FIFO or dedup code, but it adds a call inside the turn boundary,
