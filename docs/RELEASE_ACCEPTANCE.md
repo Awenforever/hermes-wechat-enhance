@@ -529,6 +529,10 @@ Delta over 3.5.0, confined to the bubble footer:
 * the end-of-turn capture resolves the reading from the turn result and the
   context engine together, so the first turn after a gateway restart is
   captured instead of lost while the agent cache is still cold;
+* a turn that completes without a reading marks the bar stale: the footer keeps
+  the last known fill with a ~ prefix instead of presenting it as current, and the
+  next successful capture clears the mark. Age alone is not staleness, because an
+  idle conversation keeps the same context;
 * `/compress` and `/new` invalidate the stored reading through the persisted
   session entry, so the bar no longer keeps the pre-reset fill; an entry that
   cannot be read leaves the stored reading untouched instead of blanking it;
@@ -538,7 +542,7 @@ Delta over 3.5.0, confined to the bubble footer:
 * a capture with no reading logs once per chat with a peer digest, and an
   install that cannot wrap _run_agent_inner says so.
 
-Regression: `scripts/test-context-fill-restart-persistence.py` (17 cases) fails
+Regression: `scripts/test-context-fill-restart-persistence.py` (21 cases) fails
 on the 3.5.0 tree and passes here; it is registered in the CI required list.
 Four-platform acceptance has not been re-executed for 3.5.1. The delta does not
 touch delivery, FIFO or dedup code, but it adds a call inside the turn boundary,

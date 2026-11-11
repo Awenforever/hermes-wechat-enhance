@@ -529,3 +529,10 @@ items, caption-plus-media semantics, failed media without a gap, and persistence
 across adapter restart. Tests that exercise only public `send_document` are not
 sufficient because runtime compatibility layers may replace that method; the
 physical `_send_file` boundary is the stable invariant.
+
+A turn that completes without a reading leaves the previous fill on screen. The
+footer therefore prefixes that leftover with `~`, so the operator can tell a
+current number from a stale one. The marker is keyed on "a turn ran and produced no
+reading", not on age: an idle conversation keeps the same context, so an old but
+unturned reading is still true and stays unmarked. The next successful capture, and
+any withdrawal, clear the mark.

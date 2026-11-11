@@ -51,6 +51,8 @@ def reset():
     M._CONTEXT_FILL_LOADED = False
     if hasattr(M, "_CONTEXT_FILL_WARNED"):
         M._CONTEXT_FILL_WARNED.clear()
+    if hasattr(M, "_CONTEXT_FILL_STALE"):
+        M._CONTEXT_FILL_STALE.clear()
     STATE.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -244,6 +246,16 @@ def case_compression_turn_withdraws_the_bar():
     assert str(CHAT) not in persisted
 
 
+
+def _set_stale(chat_id, stale):
+    fn = getattr(M, "_set_context_fill_stale", None)
+    if fn is not None:
+        fn(chat_id, stale)
+
+
+def _is_stale(chat_id):
+    fn = getattr(M, "context_bar_is_stale", None)
+    return bool(fn(chat_id)) if fn is not None else False
 def _runner_with_entry(tokens):
     """Runner whose persisted session entry reports a given reading."""
     entry = SimpleNamespace(last_prompt_tokens=tokens)
@@ -286,6 +298,61 @@ def case_unknown_entry_state_never_withdraws():
         M._refresh_context_fill_from_cached_agent(runner, source, "k")
         assert M.context_bar(CHAT).strip(), "an unknowable state must not blank the bar"
 
+
+def _cold_runner_without_reading():
+    comp = SimpleNamespace(last_prompt_tokens=0, last_real_prompt_tokens=0,
+                           context_length=1_000_000)
+    agent = SimpleNamespace(context_compressor=comp)
+    return SimpleNamespace(_agent_cache={"k": (agent, "sig")},
+                           _agent_cache_lock=threading.Lock())
+
+
+def case_a_turn_without_a_reading_marks_the_bar_stale():
+    """The bubble after a failed capture must not present an old number as current."""
+    reset()
+    assert M._remember_context_fill(CHAT, 900_000, 1_000_000)
+    _set_stale(CHAT, False)
+    footer = M._decorate_footer("body", 7, "synthetic-model", CHAT)
+    assert "~" not in footer, "a fresh reading carries no marker"
+    M._capture_turn_context_fill(_cold_runner_without_reading(), None, "k", {}, CHAT)
+    assert _is_stale(CHAT), "a turn with no reading marks the bar stale"
+    footer = M._decorate_footer("body", 8, "synthetic-model", CHAT)
+    assert "~" + M.context_bar(CHAT) in footer, "the leftover reading is marked"
+
+
+def case_a_successful_capture_clears_the_marker():
+    reset()
+    assert M._remember_context_fill(CHAT, 900_000, 1_000_000)
+    _set_stale(CHAT, True)
+    comp = SimpleNamespace(last_prompt_tokens=400_000, last_real_prompt_tokens=400_000,
+                           context_length=1_000_000)
+    agent = SimpleNamespace(context_compressor=comp)
+    runner = SimpleNamespace(_agent_cache={"k": (agent, "sig")},
+                             _agent_cache_lock=threading.Lock())
+    M._capture_turn_context_fill(runner, None, "k", {}, CHAT)
+    assert not _is_stale(CHAT), "a fresh reading clears the marker"
+    assert M._CONTEXT_FILL[CHAT][0] == 400_000
+
+
+def case_withdrawing_the_reading_also_clears_the_marker():
+    reset()
+    assert M._remember_context_fill(CHAT, 900_000, 1_000_000)
+    _set_stale(CHAT, True)
+    assert M._forget_context_fill(CHAT)
+    assert not _is_stale(CHAT), "nothing drawn means nothing to mark"
+
+
+def case_an_idle_chat_keeps_its_reading_unmarked():
+    """Age is not staleness: no turn ran, so the number is still the truth."""
+    reset()
+    STATE.write_text(json.dumps({CHAT: [900_000, 1_000_000, time.time() - 30 * 24 * 3600]}),
+                     encoding="utf-8")
+    M._CONTEXT_FILL.clear()
+    M._CONTEXT_FILL_LOADED = False
+    _set_stale(CHAT, False)
+    assert M.context_bar(CHAT).strip()
+    assert not _is_stale(CHAT), "an old but unturned reading needs no marker"
+
 for case in (
     case_persisted_reading_survives_age,
     case_one_chat_cannot_evict_another,
@@ -304,7 +371,11 @@ for case in (
     case_truncated_transcript_withdraws_the_stored_reading,
     case_restart_keeps_the_reading_when_the_entry_still_has_one,
     case_unknown_entry_state_never_withdraws,
+    case_a_turn_without_a_reading_marks_the_bar_stale,
+    case_a_successful_capture_clears_the_marker,
+    case_withdrawing_the_reading_also_clears_the_marker,
+    case_an_idle_chat_keeps_its_reading_unmarked,
 ):
     case()
 
-print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=17')
+print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=21')

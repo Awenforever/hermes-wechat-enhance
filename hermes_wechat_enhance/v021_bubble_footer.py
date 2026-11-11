@@ -366,6 +366,29 @@ def _save_context_fill() -> None:
         )
 
 
+# Chats whose latest turn produced no reading. Age alone is not staleness: an
+# idle conversation keeps the same context, so the only thing worth telling the
+# operator is "this number is not from the turn you just had".
+_CONTEXT_FILL_STALE: set = set()
+
+
+def _set_context_fill_stale(chat_id: Any, stale: bool) -> None:
+    key = str(chat_id or "")
+    if not key:
+        return
+    with _CONTEXT_FILL_LOCK:
+        if stale:
+            _CONTEXT_FILL_STALE.add(key)
+        else:
+            _CONTEXT_FILL_STALE.discard(key)
+
+
+def context_bar_is_stale(chat_id: str) -> bool:
+    "True when the bar shows a value the latest turn could not refresh."
+    with _CONTEXT_FILL_LOCK:
+        return str(chat_id) in _CONTEXT_FILL_STALE
+
+
 _CONTEXT_FILL_WARNED: set = set()
 
 
@@ -384,7 +407,7 @@ def _warn_context_fill_once(chat_id: str, reason: str) -> None:
     peer = hashlib.sha256(chat_id.encode("utf-8", "surrogatepass")).hexdigest()[:16]
     logger.warning(
         "Hermes WeChat Enhance: context bar has no reading for peer=%s (%s); the "
-        "footer omits the bar until a turn reports usage",
+        "footer keeps the last known reading marked with ~ until a turn reports usage",
         peer, reason,
     )
 
@@ -446,8 +469,10 @@ def _forget_context_fill(chat_id: str) -> bool:
     _load_context_fill()
     with _CONTEXT_FILL_LOCK:
         if str(chat_id) not in _CONTEXT_FILL:
+            _CONTEXT_FILL_STALE.discard(str(chat_id))
             return False
         _CONTEXT_FILL.pop(str(chat_id), None)
+        _CONTEXT_FILL_STALE.discard(str(chat_id))
     _save_context_fill()
     return True
 
@@ -478,7 +503,11 @@ def _capture_turn_context_fill(runner: Any, source: Any, session_key: Any, resul
         return
     reading = _resolve_context_reading(result, comp)
     if reading is not None and _remember_context_fill(chat_id, reading[0], reading[1]):
+        _set_context_fill_stale(chat_id, False)
         return
+    # The turn happened and produced no reading: what the bar shows is now a
+    # leftover from an earlier turn, which the operator cannot see from the glyphs.
+    _set_context_fill_stale(chat_id, True)
     _warn_context_fill_once(str(chat_id), "no usable reading after the turn result and the cached engine")
 
 
@@ -580,7 +609,8 @@ def _refresh_context_fill_from_cached_agent(runner: Any, source: Any, session_ke
         reading = _resolve_context_reading(None, comp)
         if reading is None:
             return
-        _remember_context_fill(chat_id, reading[0], reading[1])
+        if _remember_context_fill(chat_id, reading[0], reading[1]):
+            _set_context_fill_stale(chat_id, False)
     except Exception:
         return
 
@@ -623,6 +653,10 @@ def _decorate_footer(chunk: str, count: int, model: str, chat_id: str) -> str:
     # inline-code span, which reads as a rendering glitch rather than as
     # "nearly empty", so the bar is omitted until there is something to show.
     if bar.strip():
+        if context_bar_is_stale(chat_id):
+            # Prefix, not a suffix: the eight cells keep their own width and the
+            # marker cannot be mistaken for a glyph inside the track.
+            bar = "~" + bar
         footer = f"{footer} `{bar}`"
     return f"{chunk}\n\n---\n\n{footer}"
 
