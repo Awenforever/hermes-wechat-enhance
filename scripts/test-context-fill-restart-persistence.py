@@ -497,6 +497,15 @@ def case_older_three_element_state_still_loads():
     assert M.context_bar(CHAT).strip()
     assert not _is_stale(CHAT), "a legacy entry carries no mark"
 
+
+def case_runtime_status_identifies_the_loaded_package():
+    """A deploy is verifiable only if the live status names the loaded version."""
+    identity = M._package_identity()
+    assert identity.get("version"), "the manifest version must be reported"
+    assert identity.get("package_file", "").endswith("v021_bubble_footer.py")
+    assert Path(identity["package_file"]).is_file()
+    assert "V5" in M.MARKER, "the payload shape has its own marker"
+
 for case in (
     case_persisted_reading_survives_age,
     case_one_chat_cannot_evict_another,
@@ -526,7 +535,8 @@ for case in (
     case_concurrent_writers_do_not_lose_rows,
     case_the_stale_mark_survives_a_restart,
     case_older_three_element_state_still_loads,
+    case_runtime_status_identifies_the_loaded_package,
 ):
     case()
 
-print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=28')
+print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=29')

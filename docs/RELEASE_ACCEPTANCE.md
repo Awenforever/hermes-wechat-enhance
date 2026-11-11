@@ -611,3 +611,15 @@ Two portability defects were found and fixed by this run: the transport regressi
 used asyncio.create_task(context=...), which is 3.11+, so the whole suite aborted on
 Ubuntu 22.04; and the private-mode assertion assumed POSIX permission bits, which
 Windows does not carry. Both are test-only fixes.
+
+## Addendum 3.5.2 - runtime identity (2026-11-12, Asia/Shanghai)
+
+- 读者：维护者 / 生产操作者。用途：让运行中的进程自己说明加载了哪个版本。
+
+The startup marker alone could not distinguish two releases, and install output
+describes the tree on disk rather than the module the gateway imported. The
+runtime status now also records the manifest version and the package file path,
+and the marker moves to V5 so a status file written by this protocol is
+distinguishable from an older one.
+
+No delivery, FIFO or capture behaviour changed.
