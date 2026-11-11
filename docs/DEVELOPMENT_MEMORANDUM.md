@@ -13,6 +13,14 @@ remains the compression sentinel that withdraws the indicator, which is the
 pre-existing contract and stays pinned by tests.
 ## 2026-10-25 — Queue-driven FIFO drain (3.5.0)
 
+Manual `/compress` and `/new` do not raise the compressor sentinel the automatic
+path uses: Core truncates the transcript and sets the persisted session entry
+reading to 0 instead, and evicts the agent cache. The capture therefore gates on
+that entry at turn start. 0 withdraws the bar, a positive value keeps it, and an
+entry that cannot be read (no store, not loaded, field missing) changes nothing -
+which is what keeps a restart from blanking the indicator.
+
+
 The durable queue, not a retry task, now owns delivery. `ensure_drainer` is
 called by enqueue, inbound handling, startup recovery and the worker itself, so
 a dead worker is replaced without waiting for a lucky inbound message. While

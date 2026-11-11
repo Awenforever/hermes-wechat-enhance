@@ -243,6 +243,49 @@ def case_compression_turn_withdraws_the_bar():
     persisted = json.loads(STATE.read_text(encoding="utf-8"))
     assert str(CHAT) not in persisted
 
+
+def _runner_with_entry(tokens):
+    """Runner whose persisted session entry reports a given reading."""
+    entry = SimpleNamespace(last_prompt_tokens=tokens)
+    store = SimpleNamespace(_entries={"k": entry}, _lock=threading.Lock())
+    return SimpleNamespace(session_store=store, _agent_cache={}, _agent_cache_lock=threading.Lock())
+
+
+def case_truncated_transcript_withdraws_the_stored_reading():
+    """/compress sets the entry reading to 0; the bar described the old context."""
+    reset()
+    assert M._remember_context_fill(CHAT, 900_000, 1_000_000)
+    assert M.context_bar(CHAT).strip()
+    source = SimpleNamespace(chat_id=CHAT, platform=SimpleNamespace(value="weixin"))
+    M._refresh_context_fill_from_cached_agent(_runner_with_entry(0), source, "k")
+    assert not M.context_bar(CHAT).strip(), "a truncated transcript invalidates the reading"
+    persisted = json.loads(STATE.read_text(encoding="utf-8"))
+    assert str(CHAT) not in persisted, "the withdrawal must reach the disk"
+
+
+def case_restart_keeps_the_reading_when_the_entry_still_has_one():
+    """A restart restores a positive entry reading; that must not blank the bar."""
+    reset()
+    assert M._remember_context_fill(CHAT, 900_000, 1_000_000)
+    source = SimpleNamespace(chat_id=CHAT, platform=SimpleNamespace(value="weixin"))
+    M._refresh_context_fill_from_cached_agent(_runner_with_entry(900_000), source, "k")
+    assert M.context_bar(CHAT).strip(), "a valid entry reading keeps the bar"
+
+
+def case_unknown_entry_state_never_withdraws():
+    """No store, no entry, or no lock: fail open and keep what we have."""
+    reset()
+    assert M._remember_context_fill(CHAT, 900_000, 1_000_000)
+    source = SimpleNamespace(chat_id=CHAT, platform=SimpleNamespace(value="weixin"))
+    for runner in (
+        SimpleNamespace(),
+        SimpleNamespace(session_store=SimpleNamespace()),
+        SimpleNamespace(session_store=SimpleNamespace(_entries={}, _lock=threading.Lock())),
+        SimpleNamespace(session_store=SimpleNamespace(_entries={"k": SimpleNamespace()}, _lock=None)),
+    ):
+        M._refresh_context_fill_from_cached_agent(runner, source, "k")
+        assert M.context_bar(CHAT).strip(), "an unknowable state must not blank the bar"
+
 for case in (
     case_persisted_reading_survives_age,
     case_one_chat_cannot_evict_another,
@@ -258,7 +301,10 @@ for case in (
     case_near_zero_fill_is_not_an_empty_code_span,
     case_first_capture_merges_with_the_persisted_file,
     case_compression_turn_withdraws_the_bar,
+    case_truncated_transcript_withdraws_the_stored_reading,
+    case_restart_keeps_the_reading_when_the_entry_still_has_one,
+    case_unknown_entry_state_never_withdraws,
 ):
     case()
 
-print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=14')
+print('CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=17')

@@ -529,13 +529,16 @@ Delta over 3.5.0, confined to the bubble footer:
 * the end-of-turn capture resolves the reading from the turn result and the
   context engine together, so the first turn after a gateway restart is
   captured instead of lost while the agent cache is still cold;
+* `/compress` and `/new` invalidate the stored reading through the persisted
+  session entry, so the bar no longer keeps the pre-reset fill; an entry that
+  cannot be read leaves the stored reading untouched instead of blanking it;
 * a compression turn withdraws the bar from both the turn-start and the
   turn-end path, so the bubble announcing a compression never repaints the
   pre-compression fill;
 * a capture with no reading logs once per chat with a peer digest, and an
   install that cannot wrap _run_agent_inner says so.
 
-Regression: `scripts/test-context-fill-restart-persistence.py` (14 cases) fails
+Regression: `scripts/test-context-fill-restart-persistence.py` (17 cases) fails
 on the 3.5.0 tree and passes here; it is registered in the CI required list.
 Four-platform acceptance has not been re-executed for 3.5.1. The delta does not
 touch delivery, FIFO or dedup code, but it adds a call inside the turn boundary,
@@ -554,6 +557,7 @@ install-time warning covers the first two.
 | runner._agent_cache / _agent_cache_lock | key = session_key; value starts with the agent; synchronous lock | gateway/run.py:3493 |
 | agent.context_compressor | exposes context_length, last_prompt_tokens, last_real_prompt_tokens | agent/context_compressor.py:1865,2402 |
 | turn result keys | has last_prompt_tokens; has never carried context_length | agent/turn_finalizer.py:538-560 |
+| runner.session_store._entries[*] | persisted SessionEntry; last_prompt_tokens is the real reading after a turn and 0 after /compress | gateway/session.py:761,491; run_turn.py:1751; slash_commands_session.py:423,444,626 |
 
 Note: last_prompt_tokens = -1 is the Core compression sentinel meaning "unknown
 until the next API call". The plugin keeps its pre-existing contract of

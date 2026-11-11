@@ -441,12 +441,15 @@ def _remember_context_fill(chat_id: str, used: Any, limit: Any) -> bool:
     return True
 
 
-def _forget_context_fill(chat_id: str) -> None:
-    "Withdraw one chat reading, in memory and on disk."
+def _forget_context_fill(chat_id: str) -> bool:
+    "Withdraw one chat reading, in memory and on disk. True when one existed."
     _load_context_fill()
     with _CONTEXT_FILL_LOCK:
+        if str(chat_id) not in _CONTEXT_FILL:
+            return False
         _CONTEXT_FILL.pop(str(chat_id), None)
     _save_context_fill()
+    return True
 
 def _prune_context_fill() -> None:
     "Bound the map by chat count. Age is never a reason to drop a reading."
@@ -497,6 +500,34 @@ def _cached_context_engine(runner: Any, session_key: Any) -> Any:
     except Exception:
         return None
 
+def _session_entry_prompt_tokens(runner: Any, session_key: Any) -> Any:
+    "Return the persisted session-entry reading, or None when unreachable."
+    # Core keeps this on the persisted SessionEntry: every completed turn writes
+    # the real reading (gateway/run_turn.py:1751), and /compress sets it to 0
+    # because the transcript was truncated (slash_commands_session.py:423,444,626).
+    # A restart restores the persisted value, so 0 means invalidated rather than
+    # lost. None means "cannot tell", which must never trigger a withdrawal.
+    try:
+        key = str(session_key or "")
+        if not key:
+            return None
+        store = getattr(runner, "session_store", None)
+        entries = getattr(store, "_entries", None)
+        if not isinstance(entries, dict):
+            return None
+        lock = getattr(store, "_lock", None)
+        if lock is not None:
+            with lock:
+                entry = entries.get(key)
+        else:
+            entry = entries.get(key)
+        if entry is None:
+            return None
+        value = getattr(entry, "last_prompt_tokens", None)
+        return None if value is None else int(value)
+    except Exception:
+        return None
+
 def _refresh_context_fill_from_cached_agent(runner: Any, source: Any, session_key: Optional[str] = None) -> None:
     """Seed the footer fill from the live cached agent BEFORE the turn runs.
 
@@ -512,6 +543,14 @@ def _refresh_context_fill_from_cached_agent(runner: Any, source: Any, session_ke
         chat_id = str(getattr(source, "chat_id", "") or "")
         session_key = str(session_key or getattr(source, "session_key", "") or "")
         if not chat_id or not session_key:
+            return
+        entry_tokens = _session_entry_prompt_tokens(runner, session_key)
+        if entry_tokens is not None and entry_tokens <= 0:
+            # /compress truncated the transcript or /new reset the session. The
+            # stored reading describes a context that no longer exists, and the
+            # agent cache is cold in both cases, so this has to be decided before
+            # the cache lookup or the bar keeps the pre-reset fill.
+            _forget_context_fill(chat_id)
             return
         cache = getattr(runner, "_agent_cache", None)
         if not cache:
