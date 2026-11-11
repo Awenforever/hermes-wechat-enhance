@@ -186,8 +186,11 @@ def case_state_file_is_written_atomically():
     assert not leftovers, "a successful save leaves no temporary file behind"
     parsed = json.loads(STATE.read_text(encoding="utf-8"))
     assert str(CHAT) in parsed, "the file is valid JSON after the replace"
-    mode = oct(STATE.stat().st_mode & 0o777)
-    assert mode == "0o600", "the state file is private, mode=%s" % mode
+    # Windows does not carry POSIX permission bits, so the private-mode claim is
+    # only meaningful there; the atomicity claim above holds on both.
+    if os.name == "posix":
+        mode = oct(STATE.stat().st_mode & 0o777)
+        assert mode == "0o600", "the state file is private, mode=%s" % mode
 
 
 def case_one_corrupt_entry_keeps_the_others():
