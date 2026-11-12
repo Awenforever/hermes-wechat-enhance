@@ -623,3 +623,25 @@ and the marker moves to V5 so a status file written by this protocol is
 distinguishable from an older one.
 
 No delivery, FIFO or capture behaviour changed.
+
+### T3 WSL2 acceptance for 3.5.2 (2026-11-13, Asia/Shanghai)
+
+Environment: WSL2 `Ubuntu-24.04` on the operator host `desktop-kfscv8c-1`,
+kernel `6.6.87.2-microsoft-standard-WSL2`, Python 3.12.3; tree from tag
+`v3.5.2` (`c5b72898bdeed69a6e5d68e008fe522b817cd542`), checked out in a
+disposable WSL home so no production data is touched.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Distribution consistency | `scripts/check-consistency.sh` | `CURRENT_HERMES_DISTRIBUTION_CONSISTENCY_OK` |
+| Pure regressions | `scripts/run-regressions.py` | `ENHANCE_REGRESSION_PASS count=13 native=False` |
+| Context fill persistence | `scripts/test-context-fill-restart-persistence.py` | `CONTEXT_FILL_RESTART_PERSISTENCE_OK cases=29` |
+
+Two notes for the record:
+
+* the case count is **29** at `v3.5.2`, not the 28 recorded for 3.5.1: the 3.5.2
+  commit itself added a case to that script, so 28 is stale rather than
+  contradictory. The `28/28` cells in the 3.5.2 rows above were carried over
+  from the 3.5.1 record and should be read as 29 today.
+* T3 completes the four-platform set for 3.5.2: T1, T2 and T4 were recorded on
+  2026-11-12, T3 here.
