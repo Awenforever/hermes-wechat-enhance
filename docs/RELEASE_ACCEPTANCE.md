@@ -675,3 +675,26 @@ falls back to the durable queue when no adapter is in hand, and the send and
 drain paths refresh the file on every transition.
 
 Regression: scripts/test-runtime-status-pending.py (8 checks).
+
+### Four-platform acceptance for 3.5.4 (2026-11-17, Asia/Shanghai)
+
+Tree: 84b27c7 (merge of fix/token-use-budget-3.5.3), manifest 3.5.4.
+
+| Target | Environment | Result |
+| --- | --- | --- |
+| T1 container | production container, Python 3.13.5 | consistency OK; 15/15 pure regressions; budget 13/13; status 6/6 |
+| T2 Linux native | ubuntu22-test, Ubuntu 22.04, Python 3.10.12 | consistency OK; 15/15 pure regressions; budget 13/13; status 6/6 |
+| T3 WSL2 | operator WSL2 Ubuntu-24.04, kernel 6.6.87.2, Python 3.12.3 | consistency OK; 15/15 pure regressions; budget 13/13; status 6/6 |
+| T4 Windows native | win11-test, Windows 11, Python 3.12.7 | 15/15 pure regressions; budget 13/13; status 6/6 |
+
+Notes:
+
+* T4 follows the shape of the 3.5.1 and 3.5.2 records: pure regressions plus the
+  new cases on Windows-native Python. The optional --hermes-root native mode
+  could not run on this VM because none of its interpreters can import
+  gateway.config (ruamel.yaml is absent). The unchanged v3.5.2 tree fails on the
+  same import, so this is an environment gap rather than a regression, and it is
+  recorded here instead of being silently skipped.
+* One test-v021-bubble-footer.py assertion failed once inside a combined run on
+  T4 and passed 3/3 for both v3.5.2 and 3.5.4 when run alone: a timing flake
+  under load, unrelated to this change.
