@@ -562,3 +562,25 @@ marker is a protocol version, not a release version, so 3.5.0 and 3.5.1 shared i
 The runtime status now carries the manifest version and the resolved package file,
 which is what an operator should read after a restart; the marker moves to V5 to
 separate this payload shape from the earlier one.
+
+
+## 2026-11-17 - message:inbound accepts a rewrite decision
+
+The event previously offered two outcomes only: a plugin answers (handled) or
+stays silent. A plugin that owns context the agent needs - the email watchdog
+quoting a message body - could therefore answer itself but never reach the
+agent.
+
+The event now also accepts a rewrite decision: the inbound text is replaced and
+the turn continues to the agent, so tools and session history survive. The
+vocabulary matches the gateway command hook contract (deny | handled | rewrite,
+in gateway/run_inbound.py).
+
+Rules: a blank rewrite is ignored; an unknown decision falls through as before;
+handled keeps its previous behaviour; a handled from another plugin in the same
+event still wins the reply.
+
+Scope of the event itself: message:inbound is emitted here, by this plugin,
+when a Weixin message carries a quote reference or starts with an @ command.
+Hermes Core does not emit it, so every consumer of this event is, today,
+reachable only on Weixin and only while this plugin is installed.

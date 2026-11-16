@@ -698,3 +698,19 @@ Notes:
 * One test-v021-bubble-footer.py assertion failed once inside a combined run on
   T4 and passed 3/3 for both v3.5.2 and 3.5.4 when run alone: a timing flake
   under load, unrelated to this change.
+
+## Addendum 3.5.5 - inbound rewrite decision (2026-11-17, Asia/Shanghai)
+
+`message:inbound` could only be answered (`handled`) or ignored. A plugin
+that wants the agent to answer still had to drop its context, so a quote-
+and-ask flow could not read the cited document.
+
+The event now also accepts `{"decision": "rewrite", "message": "..."}`: the
+inbound text is replaced and the turn continues to the agent, keeping tools
+and session history. A blank rewrite is ignored; an unknown decision still
+falls through; `handled` keeps its old behaviour.
+
+First consumer: hermes-email-watchdog 0.22.7 `@原文` + question.
+
+Regression: scripts/test-inbound-rewrite.py (12 checks), registered in the
+CI required list.
