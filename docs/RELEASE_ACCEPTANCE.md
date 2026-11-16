@@ -645,3 +645,24 @@ Two notes for the record:
   from the 3.5.1 record and should be read as 29 today.
 * T3 completes the four-platform set for 3.5.2: T1, T2 and T4 were recorded on
   2026-11-12, T3 here.
+
+## Addendum 3.5.3 - Context Token use budget (2026-11-16, Asia/Shanghai)
+
+- Readers: maintainers / on-call. Purpose: record why ten-use enforcement exists.
+
+iLink accepts ten sends per Weixin Context Token. The footer counter already
+tracked usage per token, but nothing enforced the limit, and a rate-limited
+send was classified as transient. Production therefore retried an exhausted
+token eleven times over six minutes and delivered an eleventh numbered bubble
+(2026-11-16 12:54 local, delivered 13:00:06 after eleven attempts).
+
+The send, drain and media paths now consult the counter before sending. A
+bubble whose number would exceed `TOKEN_USE_BUDGET` (10) is queued instead of
+sent, the drain reports `token_blocked`, and the queue resumes on the next
+inbound message because every inbound carries a fresh token - `/continue`
+included. The resumed bubble is numbered from one under the new token.
+
+Regression: `scripts/test-token-use-budget.py` (13 checks) proves ten sends
+then a held eleventh, and a held bubble resuming at one after rotation; it is
+registered in the CI required list. The provenance fixture raises the budget
+to 100 locally because it deliberately exercises thirteen bubbles on one token.

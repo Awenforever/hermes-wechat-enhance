@@ -111,6 +111,10 @@ class FakeAdapter:
 
 
 async def main():
+    import hermes_wechat_enhance.v021_bubble_footer as _budget_module
+    # This file proves provenance across more than ten bubbles on one Context
+    # Token; the ten-use budget has its own dedicated regression test.
+    _budget_module.TOKEN_USE_BUDGET = 100
     with tempfile.TemporaryDirectory() as td:
         os.environ["HERMES_HOME"] = td
         gateway = types.ModuleType("gateway")
@@ -282,6 +286,11 @@ async def main():
         })
         result = await adapter.send("peer", "final answer")
         assert result.success
+        # This scenario proves model provenance across thirteen bubbles of one
+        # turn; the Context Token budget is covered by test-token-use-budget.py,
+        # so raise it here merely to keep the provenance chain on one token.
+        import hermes_wechat_enhance.v021_bubble_footer as _budget_module
+        _budget_module.TOKEN_USE_BUDGET = 100
         turn_bubbles = adapter.sent[before:]
         assert len(turn_bubbles) == 13
         assert turn_bubbles[0][1].endswith("`deepseek-flash`")

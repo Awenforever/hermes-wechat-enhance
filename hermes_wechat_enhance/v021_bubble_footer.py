@@ -293,6 +293,11 @@ MAX_TRANSIENT_DRAIN_RETRIES = 4  # first sustained-failure alert, not a stop
 DRAIN_PROBE_DELAY_SECONDS = 45.0  # cadence for errors outside the transient set
 DRAIN_REVIVE_DELAY_SECONDS = 2.0  # revive a dead worker soon after enqueue/inbound
 DRAIN_BACKOFF_CEILING_SECONDS = 60.0  # hard cap for every retry cadence
+# iLink accepts at most this many sends per Weixin Context Token. The send that
+# would exceed it is rejected, and retrying cannot fix it: only a fresh inbound
+# token (which every inbound message carries, /continue included) can. Counting
+# without enforcing this is how one token reached an eleventh send in production.
+TOKEN_USE_BUDGET = 10
 COOLDOWN_RESUME_JITTER_SECONDS = 0.05
 
 # Per-chat context-window fill captured from the turn result at the runner
@@ -896,6 +901,7 @@ def _token_fingerprint(context_token: Optional[str]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+_BUDGET_EXHAUSTED_RE = re.compile(r"context token budget exhausted", re.IGNORECASE)
 _SESSION_EXPIRED_RE = re.compile(
     r"(?:ret|errcode)\s*=\s*-14\b|session[ _-]?expired|context[ _-]?token[^.]{0,40}(?:expired|invalid)",
     re.IGNORECASE,
@@ -911,7 +917,18 @@ def _token_blocked_error(error: Any) -> bool:
     Only an explicit session expiry pauses the FIFO until a fresh inbound token.
     """
     text = str(error or "")
-    return bool(_SESSION_EXPIRED_RE.search(text))
+    return bool(_SESSION_EXPIRED_RE.search(text) or _BUDGET_EXHAUSTED_RE.search(text))
+
+
+def _budget_guard_reason(next_number: int) -> str:
+    """Reason to hold a bubble instead of sending it, or an empty string."""
+    try:
+        number = int(next_number)
+    except (TypeError, ValueError):
+        return ""
+    if number <= TOKEN_USE_BUDGET:
+        return ""
+    return "context token budget exhausted (%d used of %d)" % (number - 1, TOKEN_USE_BUDGET)
 
 
 def _transient_retry_delay(adapter: Any, error: Any, attempt: int) -> Optional[float]:
@@ -2280,6 +2297,22 @@ def patch_adapter(adapter: Any) -> bool:
             count, generation = await asyncio.to_thread(
                 store.preview, account_id, str(chat_id), context_token
             )
+            hold = _budget_guard_reason(count)
+            if hold:
+                # The token has no send left. Holding the bubble keeps both the
+                # content and the contract: the next inbound rotates the token, and
+                # the drain then numbers this bubble as the new token use one.
+                pending = await asyncio.to_thread(
+                    queue.enqueue, account_id, str(chat_id), client_id, chunk, model, hold,
+                    binding=_owned_transport_binding(_self, chat_id)
+                )
+                logger.warning(
+                    "Hermes WeChat Enhance: %s peer=%s pending=%d; holding until an inbound rotates the token",
+                    hold,
+                    hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
+                    pending,
+                )
+                return
             decorated = _decorate_footer(chunk, count, model, str(chat_id))
             try:
                 await original_send_text_chunk(
@@ -2379,6 +2412,9 @@ def patch_adapter(adapter: Any) -> bool:
             count, generation = await asyncio.to_thread(
                 store.preview, account_id, str(chat_id), context_token
             )
+            hold = _budget_guard_reason(count)
+            if hold:
+                raise RuntimeError(hold)
             message_id = await original_send_file(
                 chat_id,
                 path,
@@ -2409,6 +2445,20 @@ def patch_adapter(adapter: Any) -> bool:
                 count, generation = await asyncio.to_thread(
                     store.preview, account_id, str(chat_id), context_token
                 )
+                hold = _budget_guard_reason(count)
+                if hold:
+                    logger.warning(
+                        "Hermes WeChat Enhance: %s peer=%s; drain paused until an inbound rotates the token",
+                        hold,
+                        hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
+                    )
+                    return {
+                        "ok": False,
+                        "sent": sent,
+                        "pending": await asyncio.to_thread(queue.count, account_id, str(chat_id)),
+                        "token_blocked": True,
+                        "error": hold,
+                    }
                 decorated = _decorate_footer(item["chunk"], count, _safe_model(item["model"]), str(chat_id))
                 try:
                     await original_send_text_chunk(
