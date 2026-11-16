@@ -821,6 +821,20 @@ def normalize_weixin_inbound_reference(
     return {"text": "", "reference": {"present": False, "message_id": "", "text": "", "title": "", "type": None}}
 
 
+def _apply_inbound_rewrite(message: Dict[str, Any], text: str) -> bool:
+    """Replace the user text of an inbound message before core routes it."""
+    items = message.get("item_list")
+    if not isinstance(items, list) or not items:
+        message["item_list"] = [{"text": text}]
+        return True
+    for item in items:
+        if isinstance(item, dict) and "text" in item:
+            item["text"] = text
+            return True
+    items.insert(0, {"text": text})
+    return True
+
+
 async def _emit_inbound_action(adapter: Any, message: Dict[str, Any], normalized: Dict[str, Any]) -> bool:
     """Offer an authorized inbound message to independent optional plugins."""
     reference = normalized.get("reference") if isinstance(normalized.get("reference"), dict) else {}
@@ -856,8 +870,24 @@ async def _emit_inbound_action(adapter: Any, message: Dict[str, Any], normalized
             "reference": dict(reference),
         }
         results = await hooks.emit_collect("message:inbound", context)
+        rewritten = False
         for result in results:
-            if not isinstance(result, dict) or str(result.get("decision") or "").lower() != "handled":
+            if not isinstance(result, dict):
+                continue
+            decision = str(result.get("decision") or "").lower()
+            if decision == "rewrite":
+                # A plugin may replace the user text with one that carries its
+                # own context (an email body, a document) and still let the turn
+                # reach the agent, keeping tools and session history.
+                replacement = str(result.get("message") or "").strip()
+                if replacement and _apply_inbound_rewrite(message, replacement):
+                    rewritten = True
+                    logger.warning(
+                        "Hermes WeChat Enhance: inbound rewritten by %s before routing",
+                        str(result.get("source") or "plugin"),
+                    )
+                continue
+            if decision != "handled":
                 continue
             response = str(result.get("message") or "").strip()
             if response:
@@ -874,6 +904,8 @@ async def _emit_inbound_action(adapter: Any, message: Dict[str, Any], normalized
                     metadata=metadata,
                 )
             return True
+        if rewritten:
+            return False
     except Exception:
         logger.exception("Hermes WeChat Enhance: optional inbound action dispatch failed")
     return False
