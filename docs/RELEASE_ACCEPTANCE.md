@@ -666,3 +666,12 @@ Regression: `scripts/test-token-use-budget.py` (13 checks) proves ten sends
 then a held eleventh, and a held bubble resuming at one after rotation; it is
 registered in the CI required list. The provenance fixture raises the budget
 to 100 locally because it deliberately exercises thirteen bubbles on one token.
+
+## Addendum 3.5.4 - runtime status reports the durable queue (2026-11-16, Asia/Shanghai)
+
+A startup refresh ran before any adapter existed, so runtime-status.json
+reported pending_bubbles=0 while three bubbles sat on disk. The refresh now
+falls back to the durable queue when no adapter is in hand, and the send and
+drain paths refresh the file on every transition.
+
+Regression: scripts/test-runtime-status-pending.py (8 checks).

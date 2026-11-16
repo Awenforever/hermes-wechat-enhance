@@ -25,6 +25,7 @@ PURE = (
     'test-bg-rail-provenance.py',
     'test-context-fill-restart-persistence.py',
     'test-token-use-budget.py',
+    'test-runtime-status-pending.py',
 )
 NATIVE = ('test-v021-native-contract.py', 'test-v021-real-adapter.py',
           'test-fix-regressions-q1q2q5.py', 'test-fix-regressions-v320.py',

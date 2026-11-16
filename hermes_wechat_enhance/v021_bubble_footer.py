@@ -1995,6 +1995,11 @@ def _package_identity() -> Dict[str, str]:
     return {"version": version, "package_file": str(Path(__file__).resolve())}
 
 
+def refresh_queue_status(adapter: Any) -> None:
+    """Recompute the pending count for a single adapter, cheaply."""
+    refresh_runtime_status({"adapters": {"weixin": adapter}})
+
+
 def refresh_runtime_status(context: Optional[Dict[str, Any]] = None) -> None:
     """Refresh live queue observability after startup or an inbound drain."""
     path = _queue_path().parent / "runtime-status.json"
@@ -2009,6 +2014,12 @@ def refresh_runtime_status(context: Optional[Dict[str, Any]] = None) -> None:
         if queue is not None:
             with suppress(Exception):
                 total += int(queue.total())
+    if not adapters:
+        # No live adapter in hand (startup, or a caller that has none): read the
+        # durable queue instead of reporting a confident zero. A status file that
+        # says 0 while three bubbles sit on disk is worse than no status file.
+        with suppress(Exception):
+            total = int(PendingBubbleStore(_queue_path()).total())
     value["pending_bubbles"] = total
     value.update(_package_identity())
     value["recorded_at"] = time.time()
@@ -2293,6 +2304,7 @@ def patch_adapter(adapter: Any) -> bool:
                     delay=DRAIN_REVIVE_DELAY_SECONDS,
                     reason="enqueue-behind-backlog",
                 )
+                refresh_queue_status(_self)
                 return
             count, generation = await asyncio.to_thread(
                 store.preview, account_id, str(chat_id), context_token
@@ -2312,6 +2324,7 @@ def patch_adapter(adapter: Any) -> bool:
                     hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
                     pending,
                 )
+                refresh_queue_status(_self)
                 return
             decorated = _decorate_footer(chunk, count, model, str(chat_id))
             try:
@@ -2335,6 +2348,7 @@ def patch_adapter(adapter: Any) -> bool:
                 # Keep a worker pointed at the queue for every error except a
                 # dead session, which pauses until a fresh inbound token.  The
                 # bubble itself stays queued either way.
+                refresh_queue_status(_self)
                 schedule_retry(_self, str(chat_id), exc)
                 return
             await asyncio.to_thread(
@@ -2452,6 +2466,7 @@ def patch_adapter(adapter: Any) -> bool:
                         hold,
                         hashlib.sha256(str(chat_id).encode()).hexdigest()[:12],
                     )
+                    refresh_queue_status(_self)
                     return {
                         "ok": False,
                         "sent": sent,
@@ -2490,6 +2505,7 @@ def patch_adapter(adapter: Any) -> bool:
                     queued_seq=int(item['seq'])
                 )
                 sent += 1
+        refresh_queue_status(_self)
         return {"ok": True, "sent": sent, "pending": 0}
 
     async def recover_pending(_self: Any):
